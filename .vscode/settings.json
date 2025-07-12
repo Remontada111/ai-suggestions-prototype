@@ -1,0 +1,33 @@
+{
+  // ───── Editor behaviour ─────
+  "editor.formatOnSave": true,
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit"
+  },
+
+  // ───── Python settings ─────
+  "python.testing.pytestEnabled": true,
+  "python.analysis.typeCheckingMode": "basic",
+
+  // << tell VS Code which interpreter to use >>
+  "python.defaultInterpreterPath": "${workspaceFolder}/backend/.venv/Scripts/python.exe",
+
+  // << auto-activate that interpreter whenever a new terminal opens >>
+  "python.terminal.activateEnvironment": true,
+
+  // ───── File-tree cleanliness ─────
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.venv": true,
+    "**/node_modules": true
+  },
+
+  // ───── Tailwind IntelliSense ─────
+  "tailwindCSS.experimental.classRegex": [
+    "tw`([^`]*)",
+    "tw=\"([^\"]*)"
+  ],
+
+  // ───── Terminal profile ─────
+  "terminal.integrated.defaultProfile.windows": "Git Bash"
+}

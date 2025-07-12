@@ -1,0 +1,25 @@
+benchmarks: # ← GRUNDNIVÅER
+  ctr_base: 0.015 # 1,5 % typisk CTR
+  cpc_base: 0.78 # 0,78 $ per klick
+  roas_base: 3.1 # 3,1× pengar tillbaka
+  cpm_base: 12.0 # 12 $ per tusen impressions  ← NY! (för ditt cpm-fält)
+
+budget_decay: # ← LAGER 2-REGEL
+  per_20pct: 0.04 # varje +20 % spend → ROAS −4 %
+
+fatigue: # ← LAGER 3-REGEL
+  freq_threshold: 5 # efter 5 visningar/person …
+  ctr_drop: 0.04 # … sjunker CTR 4 % per extra visning
+
+time_profile: # ← LAGER 4-REGEL (timme & veckodag)
+  hour_ctr_lift:
+    "12": 1.08 # +8 % CTR vid lunch
+    "0": 0.85 # −15 % mitt i natten
+  weekday_roas_lift:
+    "6": 1.10 # lördag +10 %
+    "0": 0.95 # måndag −5 %
+
+campaign_days: # ← SÄRSKILDA DATUM
+  "2025-11-28": # Black Friday
+    roas_mul: 1.4 # ROAS +40 %
+    cpc_mul: 1.25 # CPC +25 %
