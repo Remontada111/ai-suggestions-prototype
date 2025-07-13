@@ -1,66 +1,99 @@
-import { FunctionComponent } from 'react';
-const Menu:FunctionComponent = () => {
-return (
-<div className="relative bg-gray-200 border-gray-100 border-solid border-r-[1px] box-border w-full h-[1024px] overflow-hidden flex flex-col items-start justify-between pt-6 px-6 pb-8 gap-0 text-left text-base text-whitesmoke font-open-sans">
-<div className="self-stretch flex flex-col items-start justify-start gap-11">
-<div className="flex flex-row items-center justify-start gap-3">
-<div className="w-14 relative rounded-2xl bg-mediumseagreen h-14" />
-<div className="flex flex-col items-start justify-center">
-<b className="w-[150px] relative inline-block">Duck UI</b>
-<div className="w-[150px] relative text-sm text-silver inline-block">Duckui@demo.com</div>
-</div>
-</div>
-<div className="w-[218px] rounded-2xl bg-gray-100 flex flex-col items-start justify-center p-4 box-border">
-<div className="w-[186px] h-6 flex flex-row items-center justify-start gap-4">
-<div className="w-6 relative h-6">
-<div className="absolute top-[3.25px] left-[3.25px] rounded-[50%] border-aquamarine border-solid border-[1.5px] box-border w-[15.5px] h-[15.5px]" />
-<img className="absolute top-[16px] left-[16px] w-[3.5px] h-[3.5px] object-contain" alt="" src="Vector 1280.svg" />
-</div>
-<div className="w-[146px] relative leading-[140%] inline-block shrink-0">Search...</div>
-</div>
-</div>
-<div className="flex flex-col items-start justify-start gap-6">
-<div className="rounded-lg flex flex-col items-start justify-start p-4">
-<div className="w-[186px] h-6 flex flex-row items-center justify-start gap-4">
-<div className="w-6 relative h-6">
-<img className="absolute h-[79.17%] w-9/12 top-[8.33%] right-[12.5%] bottom-[12.5%] left-[12.5%] max-w-full overflow-hidden max-h-full" alt="" src="Rectangle 2804.svg" />
-</div>
-<div className="relative leading-[140%]">Dashboard</div>
-</div>
-</div>
-<div className="rounded-lg flex flex-col items-start justify-start p-4">
-<div className="w-[186px] h-6 flex flex-row items-center justify-start gap-4">
-<div className="w-6 relative h-6 overflow-hidden shrink-0">
-<img className="absolute h-[83.33%] w-9/12 top-[8.33%] right-[12.5%] bottom-[8.33%] left-[12.5%] max-w-full overflow-hidden max-h-full" alt="" src="Icon.svg" />
-</div>
-<div className="relative leading-[140%]">Ad Optimizer</div>
-</div>
-</div>
-<div className="rounded-lg flex flex-col items-start justify-start p-4">
-<div className="w-[186px] h-6 flex flex-row items-center justify-start gap-4">
-<img className="w-6 relative h-6" alt="" src="chat_bubble.svg" />
-<div className="relative leading-[140%]">AI Assistant</div>
-</div>
-</div>
-<div className="rounded-lg flex flex-col items-start justify-start p-4">
-<div className="w-[186px] h-6 flex flex-row items-center justify-start gap-4">
-<div className="w-6 relative h-6">
-<img className="absolute top-[2px] left-[2px] w-5 h-5" alt="" src="Cicle.svg" />
-<img className="absolute top-[2px] left-[14px] rounded-[0.5px] w-2 h-2" alt="" src="Cicle.svg" />
-</div>
-<div className="relative leading-[140%]">Analytics</div>
-</div>
-</div>
-</div>
-</div>
-<div className="self-stretch flex flex-col items-start justify-start">
-<div className="rounded-lg flex flex-col items-start justify-start p-4">
-<div className="w-[186px] h-6 flex flex-row items-center justify-start gap-4">
-<img className="w-6 relative h-6" alt="" src="settings.svg" />
-<div className="relative leading-[140%]">Settings</div>
-</div>
-</div>
-</div>
-</div>);
+import {
+  BarChart3Icon,
+  HomeIcon,
+  MessageSquareIcon,
+  SearchIcon,
+  SettingsIcon,
+  ZapIcon,
+} from "lucide-react";
+import React from "react";
+// Update the import path below to the correct location of your Button component.
+// For example, if Button is in 'src/components/Button.tsx', use:
+import { Button } from "./button";
+// If you have a different path, adjust accordingly.
+
+const navigationItems = [
+  {
+    icon: HomeIcon,
+    label: "Dashboard",
+    href: "#",
+  },
+  {
+    icon: ZapIcon,
+    label: "Ad Optimizer",
+    href: "#",
+  },
+  {
+    icon: MessageSquareIcon,
+    label: "AI Assistant",
+    href: "#",
+  },
+  {
+    icon: BarChart3Icon,
+    label: "Analytics",
+    href: "#",
+  },
+];
+
+export const Menu: React.FC = () => {
+  return (
+    <nav
+      className="inline-flex flex-col h-[1024px] items-start justify-between pt-6 pb-8 px-6 bg-gray-shadesdark-gray border-r border-gray-shadesdark-shade"
+      data-model-id="429:260"
+    >
+      <div className="flex flex-col items-start gap-11 w-full">
+        <header className="inline-flex items-center gap-3">
+          <div className="w-14 h-14 bg-[#14ae5c] rounded-2xl" />
+          <div className="inline-flex flex-col items-start justify-center">
+            <h1 className="w-[150px] mt-[-1.00px] [font-family:'Open_Sans',Helvetica] font-bold text-gray-shadeslight-gray-2 text-base tracking-[0] leading-[normal]">
+              Duck UI
+            </h1>
+            <p className="w-[150px] [font-family:'Open_Sans',Helvetica] font-normal text-gray-shadeslight-gray-3 text-sm tracking-[0] leading-[normal]">
+              Duckui@demo.com
+            </p>
+          </div>
+        </header>
+
+        <div className="flex flex-col w-[218px] items-start justify-center gap-2.5 p-4 bg-gray-shadesdark-shade rounded-2xl">
+          <div className="flex w-[186px] h-6 items-center gap-4">
+            <SearchIcon className="w-6 h-6 text-gray-shadeslight-gray-2" />
+            <span className="w-[146px] [font-family:'Open_Sans',Helvetica] font-normal text-gray-shadeslight-gray-2 text-base tracking-[0] leading-[22.4px]">
+              SearchIcon...
+            </span>
+          </div>
+        </div>
+
+        <nav className="gap-6 inline-flex flex-col items-start">
+          {navigationItems.map((item, index) => (
+            <Button
+              key={index}
+              variant="ghost"
+              className="gap-2.5 p-4 rounded-lg inline-flex flex-col items-start h-auto hover:bg-gray-shadesdark-shade"
+            >
+              <div className="flex w-[186px] h-6 items-center gap-4">
+                <item.icon className="w-6 h-6 text-gray-shadeslight-gray-2" />
+                <span className="w-fit [font-family:'Open_Sans',Helvetica] font-normal text-gray-shadeslight-gray-2 text-base tracking-[0] leading-[22.4px] whitespace-nowrap">
+                  {item.label}
+                </span>
+              </div>
+            </Button>
+          ))}
+        </nav>
+      </div>
+
+      <div className="flex flex-col items-start gap-2 w-full">
+        <Button
+          variant="ghost"
+          className="gap-2.5 p-4 rounded-lg inline-flex flex-col items-start h-auto hover:bg-gray-shadesdark-shade"
+        >
+          <div className="flex w-[186px] h-6 items-center gap-4">
+            <SettingsIcon className="w-6 h-6 text-gray-shadeslight-gray-2" />
+            <span className="w-fit [font-family:'Open_Sans',Helvetica] font-normal text-gray-shadeslight-gray-2 text-base tracking-[0] leading-[22.4px] whitespace-nowrap">
+              SettingsIcon
+            </span>
+          </div>
+        </Button>
+      </div>
+    </nav>
+  );
 };
-export default Menu;

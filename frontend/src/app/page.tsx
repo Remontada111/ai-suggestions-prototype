@@ -1,7 +1,7 @@
 'use client';                           // Gör sidan till en klient-komponent – krävs eftersom Menu
                                         // innehåller interaktiva React-element (ikoner, ev. knappar).
 
-import Menu from './menu';   // <-- justera sökvägen om du lagt Menu.tsx på annat ställe
+import { Menu } from './menu';   // <-- justera sökvägen om du lagt Menu.tsx på annat ställe
 
 export default function Page() {
   return (

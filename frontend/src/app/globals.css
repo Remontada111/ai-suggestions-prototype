@@ -1,0 +1,128 @@
+/* globals.css – Tailwind v4-kompatibel */
+@import "tailwindcss/preflight";   /* ersätter @tailwind base */
+@import "tailwindcss/utilities";   /* ersätter @tailwind utilities */
+
+/* ---------- Utilities ---------- */
+@layer utilities {
+  .all-\[unset\] { all: unset; }
+}
+
+/* ---------- Design-tokens (neutrala färger) ---------- */
+:root {
+  --gray-shades-dark-gray: #09090a;
+  --gray-shades-dark-shade: #1f1f22;
+  --gray-shades-light-gray-1: #f5f5f5;
+  --gray-shades-light-gray-2: #efefef;
+  --gray-shades-light-gray-3: #c0bfbd;
+  --neutral-black: #000000;
+  --neutral-primary-purple: #c8bcf6;
+  --neutral-white: #ffffff;
+}
+
+/* ---------- Bas-layer: teman, layout & typografi ---------- */
+@layer base {
+  :root {
+    /* ---- Ljust tema ---- */
+    --background: 0 0% 100%;
+    --foreground: 222.2 47.4% 11.2%;
+
+    --muted: 210 40% 96.1%;
+    --muted-foreground: 215.4 16.3% 46.9%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222.2 47.4% 11.2%;
+
+    --border: 214.3 31.8% 91.4%;
+    --input: 214.3 31.8% 91.4%;
+
+    --card: transparent;
+    --card-foreground: 222.2 47.4% 11.2%;
+
+    --primary: 222.2 47.4% 11.2%;
+    --primary-foreground: 210 40% 98%;
+
+    --secondary: 210 40% 96.1%;
+    --secondary-foreground: 222.2 47.4% 11.2%;
+
+    --accent: 210 40% 96.1%;
+    --accent-foreground: 222.2 47.4% 11.2%;
+
+    --destructive: 0 100% 50%;
+    --destructive-foreground: 210 40% 98%;
+
+    --ring: 215 20.2% 65.1%;
+
+    --radius: 0.5rem;
+  }
+
+  /* ---- Mörkt tema ---- */
+  .dark {
+    --background: 224 71% 4%;
+    --foreground: 213 31% 91%;
+
+    --muted: 223 47% 11%;
+    --muted-foreground: 215.4 16.3% 56.9%;
+
+    --accent: 216 34% 17%;
+    --accent-foreground: 210 40% 98%;
+
+    --popover: 224 71% 4%;
+    --popover-foreground: 215 20.2% 65.1%;
+
+    --border: 216 34% 17%;
+    --input: 216 34% 17%;
+
+    --card: transparent;
+    --card-foreground: 213 31% 91%;
+
+    --primary: 210 40% 98%;
+    --primary-foreground: 222.2 47.4% 1.2%;
+
+    --secondary: 222.2 47.4% 11.2%;
+    --secondary-foreground: 210 40% 98%;
+
+    --destructive: 0 63% 31%;
+    --destructive-foreground: 210 40% 98%;
+
+    --ring: 216 34% 17%;
+
+    --radius: 0.5rem;
+  }
+
+  /* Globala element-regler */
+  *, ::before, ::after {
+    border-style: solid;
+    border-color: hsl(var(--border));
+  }
+
+  body {
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+/* ---------- Komponent-layer (valfritt) ---------- */
+@layer components {
+  .btn-primary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    padding-left: 1rem;
+    padding-right: 1rem;
+    padding-top: 0.5rem;
+    padding-bottom: 0.5rem;
+    border-radius: 0.5rem;
+    font-weight: 500;
+    color: #fff;
+    background-color: hsl(var(--primary));
+  }
+  .btn-primary:hover {
+    background-color: hsl(var(--primary) / 0.9);
+  }
+  .btn-primary:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px hsl(var(--ring));
+  }
+}
