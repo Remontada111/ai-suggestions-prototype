@@ -1,0 +1,51 @@
+
+
+services:
+  # ─ Redis (broker + result-backend) ───────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  # ─ Build once, reuse everywhere ─────────────────────────────────────────
+  backend:                         # bygger Dockerfile i ./backend
+    image: ai-backend:latest       # lokalt taggad bild som återanvänds
+    build:
+      context: ./backend
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend:/app/backend     # hot-reload kod
+    depends_on:
+      - redis
+
+  # ─ FastAPI-gateway (Uvicorn) ────────────────────────────────────────────
+  api:
+    image: ai-backend:latest       # återanvänder byggd bild
+    command: >
+      uvicorn backend.app.main:app
+      --host 0.0.0.0
+      --port 8000
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend:/app/backend
+    depends_on:
+      - redis
+
+  # ─ Celery-worker ────────────────────────────────────────────────────────
+  worker:
+    image: ai-backend:latest
+    command: >
+      celery -A backend.tasks.codegen worker
+      --loglevel=info
+      --concurrency=4
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend:/app/backend
+    depends_on:
+      - redis

@@ -1,0 +1,23 @@
+# ─ Web/API ─
+fastapi==0.115.14
+uvicorn[standard]==0.35.0
+
+# ─ Background-queue ─
+celery[redis]==5.5.3
+redis==5.2.1
+
+# ─ Git + HTTP ─
+GitPython==3.1.44
+requests==2.32.4
+python-dotenv==1.1.1
+
+# ─ AI / tokenisering ─
+openai==1.95.1
+tiktoken==0.9.0
+
+# ─ Diff & patch ─
+unidiff==0.7.5
+
+# ─ Komponent-scanner (valfritt men refereras i koden) ─
+tree-sitter==0.24.0
+tree-sitter-typescript==0.23.2

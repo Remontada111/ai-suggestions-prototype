@@ -1,0 +1,16 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "compile",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["run", "compile"],
+      "options": {
+        "cwd": "${workspaceFolder}/ai-codegen-extension"   // ← pekar på rätt paket
+      },
+      "problemMatcher": ["$tsc"],
+      "group": "build"
+    }
+  ]
+}

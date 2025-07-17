@@ -1,62 +1,83 @@
+"""AI-driven PR-bot – FastAPI gateway
+
+Tar emot Figma-payload, startar Celery-tasken *integrate_figma_node*
+och exponerar en polling-endpoint som lämnar tillbaka PR-URL när arbetet är klart.
+"""
+
+from __future__ import annotations
+
+# ── Standard- & tredjepartsbibliotek ───────────────────────────────────────
+import os
+from typing import TypedDict
+
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pathlib import Path
-import os, tempfile, json, requests
-from git import Repo
+from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI()
+# Celery-task
+from backend.tasks.codegen import integrate_figma_node
 
-GH_TOKEN     = os.environ["GH_TOKEN"]
-TARGET_REPO  = os.environ["TARGET_REPO"]     #  "danni/ai-suggestions-prototype"
-BASE_BRANCH  = os.getenv("BASE_BRANCH", "main")
+# ── Ladda miljövariabler ──────────────────────────────────────────────────
+load_dotenv(".env", override=True)
 
-# Remote-URL med inbäddat token  (HTTPS skonar brandväggar)
-REMOTE_URL = f"https://{GH_TOKEN}:x-oauth-basic@github.com/{TARGET_REPO}.git"
+GH_TOKEN: str | None = os.getenv("GH_TOKEN")
+FIGMA_TOKEN: str | None = os.getenv("FIGMA_TOKEN")
+TARGET_REPO: str | None = os.getenv("TARGET_REPO")  # t.ex. "myorg/myrepo"
+
+if not all([GH_TOKEN, FIGMA_TOKEN, TARGET_REPO]):
+    raise RuntimeError("GH_TOKEN, FIGMA_TOKEN och TARGET_REPO måste finnas i .env")
+
+# ── FastAPI-instans + CORS ────────────────────────────────────────────────
+app = FastAPI(title="AI PR-bot")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],      # begränsa vid behov i prod
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Typ-hjälp ─────────────────────────────────────────────────────────────
+class Payload(TypedDict):
+    fileKey: str
+    nodeId: str
 
 
+# ── POST /figma-hook ──────────────────────────────────────────────────────
 @app.post("/figma-hook")
-async def figma_hook(payload: dict):
+async def figma_hook(payload: Payload):
     """
-    Tar emot (just nu) valfri JSON → gör test-PR.
-    Senare ersätter vi detta med Figma-payload + LLM-kod.
+    Initierar Celery-jobbet *integrate_figma_node* och returnerar task-ID
+    som frontend kan polla via /task/{id}.
     """
-    # 1. Klona repo till temporär mapp
-    tmp = tempfile.mkdtemp()
-    repo = Repo.clone_from(REMOTE_URL, tmp, branch=BASE_BRANCH)
+    file_key = payload.get("fileKey")
+    node_id = payload.get("nodeId")
+    if not (file_key and node_id):
+        raise HTTPException(400, "Både fileKey och nodeId krävs")
 
-    # 2. Skapa en trivial fil så vi ser diff i PR:n
-    new_file = Path(tmp) / "ai_test.txt"
-    new_file.write_text("Hello from design-bot! 🎉")
+    task = integrate_figma_node.delay(file_key=file_key, node_id=node_id)
+    return {"task_id": task.id}
 
-    # 3. Ny gren + commit + push
-    branch_name = "ai/test-pr"
-    repo.git.checkout("-b", branch_name)
-    repo.git.add(new_file.as_posix())
-    repo.index.commit("chore(bot): test PR from design-bot")
-    repo.remote("origin").push(refspec=f"{branch_name}:{branch_name}")
 
-    # 4. Öppna Pull Request via GitHub REST
-    headers = {
-        "Authorization": f"token {GH_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
-    pr_resp = requests.post(
-        f"https://api.github.com/repos/{TARGET_REPO}/pulls",
-        headers=headers,
-        json={
-            "title": "feat: first test PR from design-bot",
-            "head": branch_name,
-            "base": BASE_BRANCH,
-            "body": "🚀 Kedjan Figma → Backend → GitHub fungerar!",
-        },
-        timeout=15,
-    )
+# ── GET /task/{task_id} ───────────────────────────────────────────────────
+@app.get("/task/{task_id}")
+async def task_status(task_id: str):
+    """
+    Returnerar Celery-status (PENDING, STARTED, SUCCESS, FAILURE …) och,
+    vid SUCCESS, PR-URL från task-resultatet.
+    """
+    result = integrate_figma_node.AsyncResult(task_id)
+    status: str = result.state
 
-    if pr_resp.status_code >= 300:
-        raise HTTPException(
-            status_code=500,
-            detail=f"GitHub PR-call misslyckades: {pr_resp.text}",
-        )
+    response: dict[str, str] = {"status": status}
 
-    pr_url = pr_resp.json()["html_url"]
-    print("✅ PR skapad:", pr_url)
-    return {"pr_url": pr_url}
+    if status == "SUCCESS":
+        # Tasken förväntas returnera t.ex. {"pr_url": "..."}
+        if isinstance(result.result, dict):
+            pr_url = result.result.get("pr_url")
+            if pr_url:
+                response["pr_url"] = pr_url
+    elif status == "FAILURE":
+        # Skicka med felmeddelande för enklare felsökning i UI
+        response["error"] = str(result.result)
+
+    return response

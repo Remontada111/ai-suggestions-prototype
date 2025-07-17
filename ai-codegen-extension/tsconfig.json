@@ -1,0 +1,23 @@
+{
+  // TypeScript-konfiguration för VS Code-extensionen
+  "compilerOptions": {
+    /* ------- Modul & utdata ------- */
+    "module": "commonjs",
+    "target": "ES2022",
+    "outDir": "dist",
+    "rootDir": "src",
+
+    /* ------- Typmiljö ------- */
+    "lib": ["ES2022"],
+    "types": ["node", "vscode"],   // ← gör att `import * as vscode …` kompilera utan klagomål
+
+    /* ------- Kvalitet & DX ------- */
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "sourceMap": true
+  },
+
+  /* Vilka källfiler som kompileras */
+  "include": ["src/extension.ts"]
+}

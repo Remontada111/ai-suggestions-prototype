@@ -1,0 +1,4 @@
+<button id="send">Send</button>
+<script>
+  document.getElementById("send").onclick = () => parent.postMessage({ pluginMessage: "send" }, "*");
+</script>
