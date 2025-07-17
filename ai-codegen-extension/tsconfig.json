@@ -1,23 +1,32 @@
-{
-  // TypeScript-konfiguration för VS Code-extensionen
+{ 
   "compilerOptions": {
-    /* ------- Modul & utdata ------- */
-    "module": "commonjs",
+    /* ------- Modulupplösning & alias ------- */
+    "rootDir": ".",                  // projektrot
+    "baseUrl": ".",                  // möjliggör "@/…"-alias
+    "paths": {
+      "@/*": ["src/*"]
+    },
+
+    /* ------- Target / ECMAScript-nivå ------- */
     "target": "ES2022",
-    "outDir": "dist",
-    "rootDir": "src",
+    "module": "ES2022",
+    "moduleResolution": "bundler",   // matchar Vite 5
+
+    /* ------- JSX / DOM ------- */
+    "jsx": "react-jsx",
+    "lib": ["ES2022", "DOM"],
 
     /* ------- Typmiljö ------- */
-    "lib": ["ES2022"],
-    "types": ["node", "vscode"],   // ← gör att `import * as vscode …` kompilera utan klagomål
+    "types": ["node", "vscode", "vite/client"],
 
     /* ------- Kvalitet & DX ------- */
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "sourceMap": true
+    "sourceMap": true,
+    "resolveJsonModule": true
   },
 
-  /* Vilka källfiler som kompileras */
-  "include": ["src/extension.ts"]
+  /* Filer som ingår i kompileringen */
+  "include": ["src/**/*", "webview/**/*", "global.d.ts"]
 }

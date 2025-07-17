@@ -1,108 +1,155 @@
+/* --------------------------------------------------------------------------
+ * VS Code-extension: AI Figma Codegen
+ * -------------------------------------------------------------------------- */
 import * as vscode from "vscode";
+import * as path from "node:path";
 
+/* --------- Konstanter --------- */
 const VIEW_TYPE = "aiFigmaCodegen.panel";
+const BACKEND_URL = "http://localhost:8000/figma-hook";
 
-/**
- * Håller referens till aktuell panel så vi kan återanvända den
- * (i stället för att försöka hitta den via Tab-API:t).
- */
+/* Håller aktuell panel så vi kan återanvända den */
 let currentPanel: vscode.WebviewPanel | undefined;
 
-/**
- * Öppnar (eller fokuserar) sidopanelen och injicerar
- * fileKey + nodeId. HTML-stubben ersätts i steg 3.
- */
-function openAiPanel(
+/* --------------------------------------------------------------------------
+ * Hjälpfunktion: starta Celery-tasken och få taskId
+ * -------------------------------------------------------------------------- */
+async function startTask(fileKey: string, nodeId: string): Promise<string> {
+  const res = await fetch(BACKEND_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ fileKey, nodeId }),
+  });
+  if (!res.ok) {
+    throw new Error(`Backend error ${res.status}: ${await res.text()}`);
+  }
+  const { task_id } = (await res.json()) as { task_id: string };
+  return task_id;
+}
+
+/* --------------------------------------------------------------------------
+ * Skapar eller fokuserar panelen
+ * -------------------------------------------------------------------------- */
+async function showAiPanel(
   context: vscode.ExtensionContext,
   fileKey: string,
   nodeId: string,
 ) {
-  if (currentPanel) {
-    // Panel finns redan: uppdatera UI + fokusera
-    currentPanel.webview.html = getHtmlStub(fileKey, nodeId);
-    currentPanel.reveal(vscode.ViewColumn.Two);
+  /* 1. Starta Celery-tasken */
+  let taskId = "unknown";
+  try {
+    taskId = await startTask(fileKey, nodeId);
+  } catch (err) {
+    vscode.window.showErrorMessage(
+      `Kunde inte starta AI-pipen: ${(err as Error).message}`,
+    );
     return;
   }
 
-  // Skapa ny panel
-  const panel = vscode.window.createWebviewPanel(
-    VIEW_TYPE,
-    "AI Figma Codegen",
-    vscode.ViewColumn.Two,
-    {
-      enableScripts: true,
-      retainContextWhenHidden: true,
-    },
+  /* 2. Återanvänd befintlig panel eller skapa ny */
+  if (currentPanel) {
+    currentPanel.reveal(vscode.ViewColumn.Two);
+  } else {
+    currentPanel = vscode.window.createWebviewPanel(
+      VIEW_TYPE,
+      "AI Figma Codegen",
+      vscode.ViewColumn.Two,
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true,
+      },
+    );
+
+    /* Rensa referensen när panelen stängs */
+    currentPanel.onDidDispose(
+      () => {
+        currentPanel = undefined;
+      },
+      null,
+      context.subscriptions,
+    );
+
+    /* Lyssna på meddelanden från webviewen */
+    currentPanel.webview.onDidReceiveMessage(async (msg) => {
+      if (msg.cmd === "openPR") {
+        vscode.env.openExternal(vscode.Uri.parse(msg.url));
+      } else if (msg.cmd === "chat") {
+        // TODO: skicka msg.text till backend/chat-endpoint vid steg 4
+        vscode.window.showInformationMessage(`Chat-instruktion skickad: ${msg.text}`);
+      }
+    });
+  }
+
+  /* 3. Ladda HTML */
+  currentPanel.webview.html = getHtml(
+    currentPanel.webview,
+    context.extensionUri,
   );
 
-  // Spara referens + städa när stängd
-  currentPanel = panel;
-  panel.onDidDispose(
-    () => {
-      currentPanel = undefined;
-    },
-    null,
-    context.subscriptions,
-  );
-
-  panel.webview.html = getHtmlStub(fileKey, nodeId);
+  /* 4. Skicka init-data till webviewen */
+  currentPanel.webview.postMessage({ type: "init", taskId });
 }
 
-/** Tillfällig HTML-stub – ersätts i steg 3 av riktig React-webview */
-function getHtmlStub(fileKey: string, nodeId: string): string {
+/* --------------------------------------------------------------------------
+ * HTML-skelett som laddar bundeln från dist-webview/
+ * -------------------------------------------------------------------------- */
+function getHtml(webview: vscode.Webview, extUri: vscode.Uri): string {
+  const scriptUri = webview.asWebviewUri(
+    vscode.Uri.joinPath(extUri, "dist-webview", "main.js"),
+  );
+  const styleUri = webview.asWebviewUri(
+    vscode.Uri.joinPath(extUri, "dist-webview", "tailwind.css"),
+  );
+
   return /* html */ `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta
-    http-equiv="Content-Security-Policy"
-    content="default-src 'none'; img-src data:; style-src 'unsafe-inline';"
-  />
-  <title>AI Figma Codegen</title>
-</head>
-<body style="font-family:sans-serif; padding:2rem; line-height:1.4;">
-  <h2>🎨 Figma → VS Code</h2>
-  <p>fileKey: <code>${fileKey}</code></p>
-  <p>nodeId&nbsp;: <code>${nodeId}</code></p>
-  <p style="margin-top:2rem; color:#999;">
-    (Detta är en temporär panel. React-webview kommer i nästa steg.)
-  </p>
-</body>
+<html lang="sv">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy"
+      content="default-src 'none';
+               img-src ${webview.cspSource} https:;
+               script-src ${webview.cspSource};
+               style-src ${webview.cspSource};">
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="${styleUri}">
+    <title>AI Figma Codegen</title>
+  </head>
+  <body class="bg-background text-foreground">
+    <div id="root"></div>
+    <script type="module" src="${scriptUri}"></script>
+  </body>
 </html>`;
 }
 
+/* --------------------------------------------------------------------------
+ * Extension-livcykel
+ * -------------------------------------------------------------------------- */
 export function activate(context: vscode.ExtensionContext) {
-  /** Manuellt test-kommando (utan Figma) */
-  const openPanelCmd = vscode.commands.registerCommand(
-    "ai-figma-codegen.openPanel",
-    () => openAiPanel(context, "demoFileKey", "demoNodeId"),
+  /* manuellt testkommando */
+  context.subscriptions.push(
+    vscode.commands.registerCommand("ai-figma-codegen.openPanel", () =>
+      showAiPanel(context, "demoFileKey", "demoNodeId"),
+    ),
   );
 
-  /**
-   * Tar emot vscode://crnolic.ai-figma-codegen/figma?... URI från Figma-pluginen.
-   * Exempel:
-   *   vscode://crnolic.ai-figma-codegen/figma?fileKey=ABC123&nodeId=45%3A67
-   */
-  const uriHandler = vscode.window.registerUriHandler({
-    handleUri(uri: vscode.Uri) {
-      // uri.path kommer ofta med ledande "/" — normalisera
-      const path = uri.path.replace(/^\/+/, "");
-      if (path === "figma") {
-        const qs = new URLSearchParams(uri.query ?? "");
-        const fileKey = qs.get("fileKey") || "unknown-file";
-        const nodeId = qs.get("nodeId") || "unknown-node";
-        openAiPanel(context, fileKey, nodeId);
-      } else {
-        vscode.window.showWarningMessage(
-          `Okänt uri-path '${uri.path}' (förväntade /figma).`,
-        );
-      }
-    },
-  });
-
-  context.subscriptions.push(openPanelCmd, uriHandler);
+  /* URI-handler från Figma-pluginen */
+  context.subscriptions.push(
+    vscode.window.registerUriHandler({
+      async handleUri(uri) {
+        const pathPart = uri.path.replace(/^\/+/, "");
+        if (pathPart !== "figma") {
+          vscode.window.showWarningMessage(`Okänt uri-path '${uri.path}'.`);
+          return;
+        }
+        const qs = new URLSearchParams(uri.query);
+        const fileKey = qs.get("fileKey") ?? "unknown-file";
+        const nodeId = qs.get("nodeId") ?? "unknown-node";
+        await showAiPanel(context, fileKey, nodeId);
+      },
+    }),
+  );
 }
 
 export function deactivate() {
-  /* inget att städa än */
+  /* inget särskilt */
 }
