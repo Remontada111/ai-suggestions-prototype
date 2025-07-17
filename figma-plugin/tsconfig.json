@@ -3,20 +3,19 @@
     "target": "ES2020",
     "module": "ES2020",
 
-    /* ✱ Viktigt: DOM-biblioteket tas bort → inga kollisioner */
+    /* DOM tas bort → inga 'console'/'fetch'-krockar */
     "lib": ["ES2020"],
 
-    /* Figma-typningarna laddas in */
+    /* Figma-API-typerna */
     "types": ["@figma/plugin-typings"],
 
-    /* Output direkt i samma mapp (code.js) */
-    "outDir": ".",
-
-    /* Rekommenderade flaggor */
     "strict": true,
     "skipLibCheck": false,
     "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true
+
+    
   },
-  "include": ["code.ts"]
+
+  /* ⚠️  Viktigt: INGEN 'exclude'-rad! */
+  "include": ["**/*.ts"]
 }
