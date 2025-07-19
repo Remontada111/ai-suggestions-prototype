@@ -3,7 +3,8 @@
   "api": "1.0.0",
   "main": "code.js",
   "ui": "ui.html",
-  "editorType": ["figma", "dev"],
-   "capabilities": ["inspect"],
+  "editorType": ["figma"],
+  "capabilities": ["inspect"],
+   "permissions": ["openurl"],
   "enablePrivatePluginApi": true
 }

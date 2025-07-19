@@ -4,7 +4,7 @@
   "publisher": "crnolic",
   "version": "0.0.1",
   "engines": {
-    "vscode": "^1.90.0"
+    "vscode": "^1.102.0"
   },
   "categories": [
     "Other"
@@ -33,7 +33,7 @@
     "@types/react-dom": "^19.1.6",
     "@types/vscode": "^1.102.0",
     "@vitejs/plugin-react": "^4.6.0",
-    "@vscode/vsce": "^3.0.0",
+    "@vscode/vsce": "^3.6.0",
     "autoprefixer": "^10.4.21",
     "postcss": "^8.5.6",
     "tailwindcss": "^4.1.11",

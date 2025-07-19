@@ -1,22 +1,21 @@
-{ 
+{
   "compilerOptions": {
-    /* ------- Modulupplösning & alias ------- */
-    "rootDir": ".",                  // projektrot
-    "baseUrl": ".",                  // möjliggör "@/…"-alias
-    "paths": {
-      "@/*": ["src/*"]
-    },
+    /* ------- Projektstruktur ------- */
+    "rootDir": "src",
+    "outDir": "dist",
+    "baseUrl": ".",
+    "paths": { "@/*": ["src/*"] },
 
-    /* ------- Target / ECMAScript-nivå ------- */
-    "target": "ES2022",
-    "module": "ES2022",
-    "moduleResolution": "bundler",   // matchar Vite 5
+    /* ------- Target / Modul ------- */
+    "target": "ES2018",
+    "module": "commonjs",
+    "moduleResolution": "node",
 
     /* ------- JSX / DOM ------- */
     "jsx": "react-jsx",
-    "lib": ["ES2022", "DOM"],
+    "lib": ["ES2018", "DOM"],
 
-    /* ------- Typmiljö ------- */
+    /* ------- Typ-miljö ------- */
     "types": ["node", "vscode", "vite/client"],
 
     /* ------- Kvalitet & DX ------- */
@@ -27,6 +26,5 @@
     "resolveJsonModule": true
   },
 
-  /* Filer som ingår i kompileringen */
-  "include": ["src/**/*", "webview/**/*", "global.d.ts"]
+  "include": ["src/**/*", "src/webview/**/*", "global.d.ts"]
 }
