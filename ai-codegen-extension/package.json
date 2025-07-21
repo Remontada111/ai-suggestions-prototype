@@ -2,31 +2,44 @@
   "name": "ai-figma-codegen",
   "displayName": "AI Figma Codegen",
   "publisher": "crnolic",
-  "version": "0.0.1",
+  "version": "0.0.2",
+  "description": "Förhandsvisa och importera Figma-komponenter direkt i VS Code.",
   "engines": {
     "vscode": "^1.102.0"
   },
-  "categories": [
-    "Other"
-  ],
-  "activationEvents": [
-    "onUri"
-  ],
+  "categories": ["Other"],
+  "activationEvents": ["onUri"],
+
+  
+  "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
         "command": "ai-figma-codegen.openPanel",
         "title": "AI Figma Codegen: Open Panel"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "AI Figma Codegen",
+      "properties": {
+        "aiFigmaCodegen.figmaToken": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Din Figma Personal Access Token (Account → Settings → Developer tokens)."
+        }
+      }
+    }
   },
-  "main": "./dist/extension.js",
+
+  
   "scripts": {
     "compile": "tsc -p .",
     "build:webview": "vite build --config vite.webview.config.ts",
-    "watch:webview": "vite build --watch --config vite.webview.config.ts",
-    "package": "vsce package"
+    "prepackage": "npm run compile && npm run build:webview",
+    "package": "vsce package --no-dependencies"
   },
+
+ 
   "devDependencies": {
     "@types/node": "^24.0.14",
     "@types/react": "^19.1.8",
@@ -40,12 +53,14 @@
     "typescript": "^5.5.0",
     "vite": "^5.2.0"
   },
+
+  
   "dependencies": {
     "@tanstack/react-query": "^5.83.0",
     "clsx": "^2.1.1",
+    "dotenv": "^17.2.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "strip-ansi": "^7.1.0",
     "unidiff": "^1.0.4",
     "zustand": "^5.0.6"
   }
