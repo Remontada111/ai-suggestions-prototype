@@ -1,4 +1,9 @@
 {
+	"name": "figma-plugin",
+	"version": "0.1.0",
+	"engines": {
+    "vscode": "^1.102.0"
+  },
 	"devDependencies": {
 		"@figma/plugin-typings": "^1.115.0"
 	},

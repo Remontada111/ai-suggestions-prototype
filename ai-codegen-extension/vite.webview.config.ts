@@ -4,13 +4,32 @@ import react from "@vitejs/plugin-react";
 import { fileURLToPath, URL } from "node:url";
 
 export default defineConfig({
-  plugins: [react()],
+  // 1️⃣ Roten för Vite – här ligger index.html och main.tsx
+  root: fileURLToPath(new URL("./src/webview", import.meta.url)),
+
+  // 2️⃣ Viktigt för webviews – relativa URLs
+  base: "./",
+
+  plugins: [
+    react(),
+  ],
+
   resolve: {
-    alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
+    // Alias '@' → projektets 'src'-mapp
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+    },
   },
+
   build: {
-    outDir: "dist-webview",
-    emptyOutDir: false,
-    rollupOptions: { input: "src/webview/main.tsx" },
+    // Ut-mappen för din webview-bundle
+    outDir: fileURLToPath(new URL("./dist-webview", import.meta.url)),
+    emptyOutDir: true,         // rensa vid varje build
+    assetsDir: "assets",       // JS/CSS hamnar under dist-webview/assets
+
+    rollupOptions: {
+      // Input är din HTML-mall som pekar på main.tsx
+      input: fileURLToPath(new URL("./src/webview/index.html", import.meta.url)),
+    },
   },
 });
