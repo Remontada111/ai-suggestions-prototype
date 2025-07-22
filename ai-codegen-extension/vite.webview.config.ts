@@ -11,6 +11,6 @@ export default defineConfig({
   build: {
     outDir: "dist-webview",
     emptyOutDir: false,
-    rollupOptions: { input: "webview/main.tsx" },
+    rollupOptions: { input: "src/webview/main.tsx" },
   },
 });

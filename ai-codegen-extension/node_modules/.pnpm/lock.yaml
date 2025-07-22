@@ -23,6 +23,9 @@ importers:
       react-dom:
         specifier: ^19.1.0
         version: 19.1.0(react@19.1.0)
+      strip-ansi:
+        specifier: ^7.1.0
+        version: 7.1.0
       unidiff:
         specifier: ^1.0.4
         version: 1.0.4
