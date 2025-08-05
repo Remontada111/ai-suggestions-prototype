@@ -11,9 +11,9 @@ dotenv.config();
 console.log("🔌 Extension activate laddas");
 
 /* -------- Konstanter -------- */
-const VIEW_TYPE    = "aiFigmaCodegen.panel";
-const BACKEND_URL  = "http://localhost:8000/figma-hook";
-const FIGMA_TOKEN  = process.env.AI_FIGMA_TOKEN;
+const VIEW_TYPE   = "aiFigmaCodegen.panel";
+const BACKEND_URL = "http://localhost:8000/figma-hook";
+const FIGMA_TOKEN = process.env.AI_FIGMA_TOKEN;
 console.log("🔑 FIGMA_TOKEN:", FIGMA_TOKEN ? "[redigerat]" : "saknas!");
 
 let currentPanel: vscode.WebviewPanel | undefined;
@@ -26,17 +26,19 @@ function getWebviewHtml(
   context: vscode.ExtensionContext,
   webview: vscode.Webview
 ): string {
-  const distDir   = path.join(context.extensionPath, "dist-webview");
-  const htmlPath  = path.join(distDir, "index.html");
-  let html        = fs.readFileSync(htmlPath, "utf8");
+  const distDir  = path.join(context.extensionPath, "dist-webview");
+  const htmlPath = path.join(distDir, "index.html");
+  let html       = fs.readFileSync(htmlPath, "utf8");
 
-  // Ersätt varje src/href som inte är absolut URL (https:) mot webview URI
+  // Ersätt varje src/href som inte är absolut URL mot webview URI
   html = html.replace(/(src|href)="([^"]+)"/g, (_m, attr, value) => {
     if (/^(https?:)?\/\//.test(value)) {
       // Låt externa länkar vara som de är
       return `${attr}="${value}"`;
     }
-    const assetOnDisk = vscode.Uri.file(path.join(distDir, value.replace(/^\.\//, "")));
+    // Ta bort inledande "/" eller "./"
+    const cleaned = value.replace(/^\/+/, "").replace(/^\.\//, "");
+    const assetOnDisk = vscode.Uri.file(path.join(distDir, cleaned));
     const webviewUri  = webview.asWebviewUri(assetOnDisk);
     return `${attr}="${webviewUri}"`;
   });
@@ -105,13 +107,13 @@ async function showPanel(
       }
     );
     currentPanel.onDidDispose(() => (currentPanel = undefined));
-
-    // 3) Injicera HTML + bundlade assets
-    currentPanel.webview.html = getWebviewHtml(context, currentPanel.webview);
   } else {
     console.log("🔄 showPanel: återanvänder befintlig panel");
     currentPanel.reveal(vscode.ViewColumn.Two);
   }
+
+  // 3) Injicera HTML + bundlade assets (alltid, även vid återanvändning)
+  currentPanel.webview.html = getWebviewHtml(context, currentPanel.webview);
 
   // 4) Lyssna på meddelanden från webview
   currentPanel.webview.onDidReceiveMessage((msg) => {
@@ -162,3 +164,4 @@ export function activate(context: vscode.ExtensionContext) {
 export function deactivate() {
   console.log("🔌 deactivate: extension stängs ner");
 }
+

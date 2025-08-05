@@ -4,32 +4,41 @@ import react from "@vitejs/plugin-react";
 import { fileURLToPath, URL } from "node:url";
 
 export default defineConfig({
-  // 1️⃣ Roten för Vite – här ligger index.html och main.tsx
+  /* 1️⃣  Projektets root = där index.html & main.tsx ligger */
   root: fileURLToPath(new URL("./src/webview", import.meta.url)),
 
-  // 2️⃣ Viktigt för webviews – relativa URLs
+  /* 2️⃣  Viktigt för VS Code‑webview: relativa länkar */
   base: "./",
 
-  plugins: [
-    react(),
-  ],
+  plugins: [react()],
 
   resolve: {
-    // Alias '@' → projektets 'src'-mapp
+    /* Alias så "@/…" pekar på src/ */
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),
     },
   },
 
   build: {
-    // Ut-mappen för din webview-bundle
+    /* Var bundle‑filerna hamnar */
     outDir: fileURLToPath(new URL("./dist-webview", import.meta.url)),
-    emptyOutDir: true,         // rensa vid varje build
-    assetsDir: "assets",       // JS/CSS hamnar under dist-webview/assets
+    emptyOutDir: true,   // rensa vid varje build
+    assetsDir: ".",      // lägg allt direkt i dist‑roten
+
+    cssCodeSplit: true,  // extrahera Tailwind till egen fil
 
     rollupOptions: {
-      // Input är din HTML-mall som pekar på main.tsx
-      input: fileURLToPath(new URL("./src/webview/index.html", import.meta.url)),
+      /* HTML‑entry som refererar ./main.tsx */
+      input: fileURLToPath(
+        new URL("./src/webview/index.html", import.meta.url)
+      ),
+
+      /* 🔑  Skriv ut EXAKT main.js / tailwind.css (inga hash) */
+      output: {
+        entryFileNames: "main.js",
+        assetFileNames: (assetInfo) =>
+          assetInfo.name?.endsWith(".css") ? "tailwind.css" : assetInfo.name!,
+      },
     },
   },
 });

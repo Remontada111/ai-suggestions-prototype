@@ -1,9 +1,7 @@
 /* ai-codegen-extension/webview/main.tsx
-   ------------------------------------------------------------
-   React-panel för AI Figma Codegen-extensionen
-   * Lägger till "live preview"‑stöd för en vald Figma‑komponent
-   * Instrumenterad med console.log för felsökning
-*/
+   --------------------------------------------------------------------------
+   React-panel för AI Figma Codegen-extensionen – med extra debug-loggar
+   -------------------------------------------------------------------------- */
 
 /// <reference types="vite/client" />
 
@@ -32,7 +30,7 @@ interface InitMessage {
   taskId?: string;
   fileKey: string;
   nodeId: string;
-  token: string; // Figma‑PAT, skickas från extension.ts
+  token: string; // Figma-PAT, skickas från extension.ts
 }
 
 interface FigmaImageApiRes {
@@ -47,64 +45,76 @@ interface TaskRes {
 }
 
 /* ------------------------------------------------------- */
-/* 🌐  VS Code WebView‑API                                 */
+/* 🌐  VS Code WebView-API                                 */
 /* ------------------------------------------------------- */
 const vscode = acquireVsCodeApi();
 const queryClient = new QueryClient();
 
+console.log("🛠 main.tsx loaded – vscode API acquired");
+
 /* ------------------------------------------------------- */
-/* 🔗 Hook: Hämta Figma‑bild                               */
+/* 🔗 Hook: Hämta Figma-bild                               */
 /* ------------------------------------------------------- */
 function useFigmaImage(
   fileKey: string | null,
   nodeId: string | null,
   token: string | null
 ) {
+  console.log("🔧 useFigmaImage invoked", {
+    fileKey,
+    nodeId,
+    hasToken: !!token,
+  });
+
   return useQuery<string>({
     enabled: !!fileKey && !!nodeId && !!token,
     queryKey: ["figma-image", fileKey, nodeId],
-    staleTime: 1000 * 60 * 60,             // 1 h
-    gcTime: 1000 * 60 * 60 * 24,           // 24 h
+    staleTime: 1000 * 60 * 60, // 1 h
+    gcTime: 1000 * 60 * 60 * 24, // 24 h
     retry: 1,
     queryFn: async () => {
-      console.log("🔍 useFigmaImage: hämtar bild från Figma API", { fileKey, nodeId });
       const url = `https://api.figma.com/v1/images/${fileKey}?ids=${nodeId}&format=png&scale=2`;
+      console.log("🔍 useFigmaImage.queryFn: fetching", {
+        url,
+        tokenPreview: token ? token.slice(0, 6) + "…" : "<undefined>",
+      });
       const res = await fetch(url, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) {
-        console.error("❌ Figma API error:", res.status);
+        console.error("❌ Figma API error", res.status, await res.text());
         throw new Error(`Figma API returned ${res.status}`);
       }
       const data = (await res.json()) as FigmaImageApiRes;
       const imgUrl = data.images[nodeId!];
       if (!imgUrl) {
-        console.error("❌ Inget image URL returnerades", data.err);
+        console.error("❌ No image URL returned", data.err);
         throw new Error(data.err ?? "No image returned");
       }
-      console.log("✅ useFigmaImage: fick URL", imgUrl);
+      console.log("✅ useFigmaImage: received URL", imgUrl);
       return imgUrl;
     },
   });
 }
 
 /* ------------------------------------------------------- */
-/* 🏗  Befintlig hook: Polla Celery‑task                   */
+/* 🏗  Befintlig hook: Polla Celery-task                   */
 /* ------------------------------------------------------- */
 function useTask(taskId: string | null) {
+  console.log("🔧 useTask invoked", { taskId });
   return useQuery<TaskRes>({
     enabled: !!taskId,
     queryKey: ["task", taskId],
     queryFn: async () => {
-      console.log("📡 useTask: pollar backend för taskId", taskId);
+      console.log("📡 useTask.queryFn: polling backend", { taskId });
       const r = await fetch(`http://localhost:8000/task/${taskId}`);
       if (!r.ok) {
         const text = await r.text();
-        console.error("❌ Backend task error:", text);
+        console.error("❌ Backend task error", r.status, text);
         throw new Error(text);
       }
       const json = (await r.json()) as TaskRes;
-      console.log("✅ useTask: fick status", json.status);
+      console.log("✅ useTask: status", json.status);
       return json;
     },
     refetchInterval: 1500,
@@ -116,7 +126,7 @@ function useTask(taskId: string | null) {
 /* 🖼️  Huvudkomponent                                     */
 /* ------------------------------------------------------- */
 const AiPanel: React.FC = () => {
-  console.log("🚀 AiPanel: render start");
+  console.log("🚀 AiPanel render start");
   const [taskId, setTaskId] = useState<string | null>(null);
   const [figmaInfo, setFigmaInfo] = useState<{
     fileKey: string | null;
@@ -124,11 +134,11 @@ const AiPanel: React.FC = () => {
     token: string | null;
   }>({ fileKey: null, nodeId: null, token: null });
 
-  /* Init‑lyssnare från extension.ts */
+  /* Init-lyssnare från extension.ts */
   useEffect(() => {
-    console.log("🔌 AiPanel: sätter upp message-listener");
+    console.log("🔌 AiPanel: setting up message listener");
     function listener(e: MessageEvent<InitMessage>) {
-      console.log("📨 AiPanel: message mottaget", e.data);
+      console.log("📨 AiPanel: message received", e.data);
       if (e.data?.type === "init") {
         setTaskId(e.data.taskId ?? null);
         setFigmaInfo({
@@ -140,30 +150,27 @@ const AiPanel: React.FC = () => {
     }
     window.addEventListener("message", listener);
     return () => {
-      console.log("🧹 AiPanel: tar bort message-listener");
+      console.log("🧹 AiPanel: removing message listener");
       window.removeEventListener("message", listener);
     };
   }, []);
 
-  /* Figma‑bildförhandsvisning */
+  /* Figma-bildförhandsvisning */
   const {
     data: figmaUrl,
     isLoading: figmaLoading,
     isError: figmaError,
     error: figmaErr,
-  } = useFigmaImage(
-    figmaInfo.fileKey,
-    figmaInfo.nodeId,
-    figmaInfo.token
-  );
+  } = useFigmaImage(figmaInfo.fileKey, figmaInfo.nodeId, figmaInfo.token);
 
-  /* Task‑pollning */
+  /* Task-pollning */
   const {
     data: taskData,
     isLoading: taskLoading,
     isError: taskError,
     error: taskErr,
   } = useTask(taskId);
+
   const [chat, setChat] = useState("");
 
   /* Globala felhanterare */
@@ -176,24 +183,37 @@ const AiPanel: React.FC = () => {
     });
   }, []);
 
+  /* Render-debug */
+  console.log("🎨 Render state", {
+    figmaLoading,
+    figmaError,
+    figmaUrl,
+    taskLoading,
+    taskError,
+    taskData,
+  });
+
   return (
     <div className="p-4 space-y-4 bg-background text-foreground">
       {/* ---------- Figma Preview ---------- */}
       <Card>
         <CardHeader>
-          <CardTitle>Figma‑förhandsvisning</CardTitle>
+          <CardTitle>Figma-förhandsvisning</CardTitle>
         </CardHeader>
         <CardContent>
+          {!figmaInfo.token && (
+            <p className="text-destructive">
+              ⚠️ Ingen Figma-token mottagen – kontrollera AI_FIGMA_TOKEN.
+            </p>
+          )}
           {figmaLoading && <p>Laddar …</p>}
           {figmaError && (
-            <p className="text-destructive">{
-              (figmaErr as Error).message
-            }</p>
+            <p className="text-destructive">{(figmaErr as Error).message}</p>
           )}
           {figmaUrl && (
             <img
-              src={figmaUrl! /* non-null assertion */}
-              alt="Vald Figma‑komponent"
+              src={figmaUrl!}
+              alt="Vald Figma-komponent"
               className="w-full rounded-md shadow"
               loading="lazy"
             />
@@ -201,15 +221,13 @@ const AiPanel: React.FC = () => {
         </CardContent>
       </Card>
 
-      {/* ---------- AI‑taskstatus ---------- */}
+      {/* ---------- AI-taskstatus ---------- */}
       {!taskId ? (
         <p>⏳ Initierar panel …</p>
       ) : taskLoading ? (
-        <p>⏳ Startar AI‑pipen …</p>
+        <p>⏳ Startar AI-pipen …</p>
       ) : taskError ? (
-        <p className="text-destructive">{
-          (taskErr as Error).message
-        }</p>
+        <p className="text-destructive">{(taskErr as Error).message}</p>
       ) : (
         <>
           <Card>
@@ -229,9 +247,7 @@ const AiPanel: React.FC = () => {
           {taskData!.pr_url && (
             <Button
               className="w-full"
-              onClick={() =>
-                vscode.postMessage({ cmd: "openPR", url: taskData!.pr_url })
-              }
+              onClick={() => vscode.postMessage({ cmd: "openPR", url: taskData!.pr_url })}
             >
               📦 Öppna Pull Request
             </Button>
@@ -265,10 +281,10 @@ const AiPanel: React.FC = () => {
 /* ------------------------------------------------------- */
 /* 🚀  Bootstrap                                           */
 /* ------------------------------------------------------- */
-console.log("✅ main.tsx: laddar React-root");
+console.log("✅ main.tsx: mounting React root");
 createRoot(document.getElementById("root")!).render(
   <QueryClientProvider client={queryClient}>
     <AiPanel />
-  </QueryClientProvider>,
+  </QueryClientProvider>
 );
-console.log("✅ main.tsx: React‑root laddad");
+console.log("✅ main.tsx: React-root mounted");

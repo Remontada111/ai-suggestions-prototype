@@ -1,28 +1,39 @@
+# ./docker-compose.yml
+version: "3.9"
 
+###############################################################################
+#  AI Codegen – full utvecklings‑stack
+#  • Redis                   –  Celery broker + result‑backend
+#  • ai-backend (base)       –  Byggs en gång, återanvänds av API & Worker
+#  • api                     –  FastAPI gateway (Uvicorn)
+#  • worker                  –  Celery‑worker för genererings‑jobb
+#  • devcontainer            –  Node/TypeScript‑miljö för VS Code‑Dev Container
+###############################################################################
 
 services:
-  # ─ Redis (broker + result-backend) ───────────────────────────────────────
+  # ───────────────────────────── Redis ────────────────────────────────────── #
   redis:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
       - "6379:6379"
 
-  # ─ Build once, reuse everywhere ─────────────────────────────────────────
-  backend:                         # bygger Dockerfile i ./backend
-    image: ai-backend:latest       # lokalt taggad bild som återanvänds
+  # ─────────────── Bas‑bild (Python + deps) byggs en gång ─────────────────── #
+  backend:
+    image: ai-backend:latest        # taggas lokalt → återanvänds
     build:
       context: ./backend
     env_file:
-      - ./backend/.env
+      - ./backend/.env              # gemensamma secrets/nycklar
     volumes:
-      - ./backend:/app/backend     # hot-reload kod
+      - ./backend:/app/backend      # hot‑reload kod under utveckling
+    restart: unless-stopped
     depends_on:
       - redis
 
-  # ─ FastAPI-gateway (Uvicorn) ────────────────────────────────────────────
+  # ────────────────────────── FastAPI gateway ─────────────────────────────── #
   api:
-    image: ai-backend:latest       # återanvänder byggd bild
+    image: ai-backend:latest        # samma lager som "backend"
     command: >
       uvicorn backend.app.main:app
       --host 0.0.0.0
@@ -32,11 +43,12 @@ services:
     env_file:
       - ./backend/.env
     volumes:
-      - ./backend:/app/backend
+      - ./backend:/app/backend      # live‑kod i containern
+    restart: unless-stopped
     depends_on:
       - redis
 
-  # ─ Celery-worker ────────────────────────────────────────────────────────
+  # ───────────────────────── Celery‑worker ────────────────────────────────── #
   worker:
     image: ai-backend:latest
     command: >
@@ -47,5 +59,30 @@ services:
       - ./backend/.env
     volumes:
       - ./backend:/app/backend
+    restart: unless-stopped
     depends_on:
       - redis
+
+  # ───────────── VS Code Dev Container (Node + TS + PNPM/NPM) ─────────────── #
+  devcontainer:
+    image: mcr.microsoft.com/devcontainers/typescript-node:20
+    # Behåll processen vid liv – VS Code injicerar sin server när du öppnar
+    command: sleep infinity
+    volumes:
+      # 1️⃣  Extension‑koden mountas så allt du sparar på värden syns direkt
+      - ./:/workspaces/ai-codegen-extension:cached
+      # 2️⃣  Node‑moduler cachas per‑container
+      - node_modules:/workspaces/ai-codegen-extension/node_modules
+    working_dir: /workspaces/ai-codegen-extension
+    # Exponera ev. dev‑portar (vite dev‑server, storybook etc.)
+    ports:
+      - "3000:3000"   # exempelport, ta bort om onödig
+    environment:
+      - TZ=Europe/Stockholm
+    depends_on:
+      - api           # om din React‑dev‑server behöver API:t
+    # Ingen restart‑policy: containern startas bara när VS Code ber om den
+
+# ───────────────────────────── Volymer ───────────────────────────────────── #
+volumes:
+  node_modules:
