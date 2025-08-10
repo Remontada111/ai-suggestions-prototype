@@ -17,6 +17,9 @@ from fastapi.middleware.cors import CORSMiddleware
 # Celery-task
 from backend.tasks.codegen import integrate_figma_node
 
+# [NY] Analyze-router (Steg 2 – Analys)
+from backend.app.routes import analyze
+
 # ── Ladda miljövariabler ──────────────────────────────────────────────────
 load_dotenv(".env", override=True)
 
@@ -35,6 +38,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# [NY] Inkludera Analyze-routern
+app.include_router(analyze.router)
 
 # ── Typ-hjälp ─────────────────────────────────────────────────────────────
 class Payload(TypedDict):

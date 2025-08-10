@@ -35,120 +35,211 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
-/* --------------------------------------------------------------------------
- * VS Code-extension: AI Figma Codegen
- * -------------------------------------------------------------------------- */
 const vscode = __importStar(require("vscode"));
-/* --------- Konstanter --------- */
-const VIEW_TYPE = "aiFigmaCodegen.panel";
-const BACKEND_URL = "http://localhost:8000/figma-hook";
-/* Håller aktuell panel så vi kan återanvända den */
+const path = __importStar(require("node:path"));
+const fs = __importStar(require("node:fs"));
+const detector_1 = require("./detector");
+const runner_1 = require("./runner");
+// [NY] – analyspipeline
+const analyzeClient_1 = require("./analyzeClient");
 let currentPanel;
-/* --------------------------------------------------------------------------
- * Hjälpfunktion: starta Celery-tasken och få taskId
- * -------------------------------------------------------------------------- */
-async function startTask(fileKey, nodeId) {
-    const res = await fetch(BACKEND_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fileKey, nodeId }),
-    });
-    if (!res.ok) {
-        throw new Error(`Backend error ${res.status}: ${await res.text()}`);
-    }
-    const { task_id } = (await res.json());
-    return task_id;
-}
-/* --------------------------------------------------------------------------
- * Skapar eller fokuserar panelen
- * -------------------------------------------------------------------------- */
-async function showAiPanel(context, fileKey, nodeId) {
-    /* 1. Starta Celery-tasken */
-    let taskId = "unknown";
-    try {
-        taskId = await startTask(fileKey, nodeId);
-    }
-    catch (err) {
-        vscode.window.showErrorMessage(`Kunde inte starta AI-pipen: ${err.message}`);
-        return;
-    }
-    /* 2. Återanvänd befintlig panel eller skapa ny */
-    if (currentPanel) {
-        currentPanel.reveal(vscode.ViewColumn.Two);
-    }
-    else {
-        currentPanel = vscode.window.createWebviewPanel(VIEW_TYPE, "AI Figma Codegen", vscode.ViewColumn.Two, {
-            enableScripts: true,
-            retainContextWhenHidden: true,
-        });
-        /* Rensa referensen när panelen stängs */
-        currentPanel.onDidDispose(() => {
-            currentPanel = undefined;
-        }, null, context.subscriptions);
-        /* Lyssna på meddelanden från webviewen */
-        currentPanel.webview.onDidReceiveMessage(async (msg) => {
-            if (msg.cmd === "openPR") {
-                vscode.env.openExternal(vscode.Uri.parse(msg.url));
-            }
-            else if (msg.cmd === "chat") {
-                // TODO: skicka msg.text till backend/chat-endpoint vid steg 4
-                vscode.window.showInformationMessage(`Chat-instruktion skickad: ${msg.text}`);
-            }
-        });
-    }
-    /* 3. Ladda HTML */
-    currentPanel.webview.html = getHtml(currentPanel.webview, context.extensionUri);
-    /* 4. Skicka init-data till webviewen */
-    currentPanel.webview.postMessage({ type: "init", taskId });
-}
-/* --------------------------------------------------------------------------
- * HTML-skelett som laddar bundeln från dist-webview/
- * -------------------------------------------------------------------------- */
-function getHtml(webview, extUri) {
-    const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(extUri, "dist-webview", "main.js"));
-    const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(extUri, "dist-webview", "tailwind.css"));
-    return /* html */ `<!DOCTYPE html>
-<html lang="sv">
-  <head>
-    <meta charset="UTF-8" />
-    <meta http-equiv="Content-Security-Policy"
-      content="default-src 'none';
-               img-src ${webview.cspSource} https:;
-               script-src ${webview.cspSource};
-               style-src ${webview.cspSource};">
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <link rel="stylesheet" href="${styleUri}">
-    <title>AI Figma Codegen</title>
-  </head>
-  <body class="bg-background text-foreground">
-    <div id="root"></div>
-    <script type="module" src="${scriptUri}"></script>
-  </body>
-</html>`;
-}
-/* --------------------------------------------------------------------------
- * Extension-livcykel
- * -------------------------------------------------------------------------- */
-function activate(context) {
-    /* manuellt testkommando */
-    context.subscriptions.push(vscode.commands.registerCommand("ai-figma-codegen.openPanel", () => showAiPanel(context, "demoFileKey", "demoNodeId")));
-    /* URI-handler från Figma-pluginen */
-    context.subscriptions.push(vscode.window.registerUriHandler({
-        async handleUri(uri) {
-            var _a, _b;
-            const pathPart = uri.path.replace(/^\/+/, "");
-            if (pathPart !== "figma") {
-                vscode.window.showWarningMessage(`Okänt uri-path '${uri.path}'.`);
+async function activate(context) {
+    const cmd = vscode.commands.registerCommand("ai-figma-codegen.scanAndPreview", async () => {
+        try {
+            // Exkludera extensionens egen mapp så den inte föreslås som kandidat
+            const exclude = [context.extensionPath];
+            const candidates = await (0, detector_1.detectProjects)(exclude);
+            if (!candidates.length) {
+                vscode.window.showWarningMessage("Hittade inga kandidater (dev/start/serve eller index.html).");
                 return;
             }
-            const qs = new URLSearchParams(uri.query);
-            const fileKey = (_a = qs.get("fileKey")) !== null && _a !== void 0 ? _a : "unknown-file";
-            const nodeId = (_b = qs.get("nodeId")) !== null && _b !== void 0 ? _b : "unknown-node";
-            await showAiPanel(context, fileKey, nodeId);
-        },
-    }));
+            const items = candidates.slice(0, 12).map((c) => {
+                var _a;
+                return ({
+                    label: c.pkgName ? `${c.pkgName}` : path.basename(c.dir),
+                    description: `${c.framework} • ${(_a = c.devCmd) !== null && _a !== void 0 ? _a : "static/ephemeral"}`,
+                    detail: `${c.dir}`,
+                    candidate: c,
+                });
+            });
+            const pick = items.length === 1
+                ? items[0]
+                : await vscode.window.showQuickPick(items, { placeHolder: "Välj projekt att förhandsvisa" });
+            if (!pick)
+                return;
+            // Bekräfta körning om vi har ett dev-kommando
+            if (pick.candidate.devCmd) {
+                const ok = await vscode.window.showInformationMessage(`Starta dev-server:\n${pick.candidate.devCmd}\ni\n${pick.detail}?`, { modal: true }, "Starta");
+                if (ok !== "Starta")
+                    return;
+            }
+            // Starta dev-server eller gå till fallback
+            const { externalUrl } = await startOrFallback(pick.candidate);
+            // Öppna/återanvänd webview
+            if (!currentPanel) {
+                currentPanel = vscode.window.createWebviewPanel("aiFigmaCodegen.panel", "🎯 Project Preview", vscode.ViewColumn.Two, {
+                    enableScripts: true,
+                    retainContextWhenHidden: true,
+                    // Viktigt: tillåt lastning av filer från dist-webview
+                    localResourceRoots: [vscode.Uri.file(path.join(context.extensionPath, "dist-webview"))],
+                });
+                currentPanel.onDidDispose(() => (currentPanel = undefined));
+            }
+            else {
+                currentPanel.reveal(vscode.ViewColumn.Two);
+            }
+            // Ladda din byggda webview (dist-webview/index.html) och injicera CSP
+            currentPanel.webview.html = getWebviewHtml(context, currentPanel.webview);
+            // Skicka dev-URL till webview (din React-webview lyssnar på window.message)
+            currentPanel.webview.postMessage({ type: "devurl", url: externalUrl });
+            // [NY] Starta analysen för vald projektrot (local_paths-läge)
+            // Skickar status/resultat till webview via postMessage (analysis/*)
+            (0, analyzeClient_1.runProjectAnalysis)(currentPanel, (0, analyzeClient_1.buildDefaultLocalManifest)(pick.candidate.dir)).catch((err) => {
+                vscode.window.showWarningMessage(`Analysmisslyckande: ${(err === null || err === void 0 ? void 0 : err.message) || String(err)}`);
+            });
+            vscode.window.showInformationMessage(`Preview igång: ${externalUrl}`);
+        }
+        catch (err) {
+            vscode.window.showErrorMessage(`Scan & Preview misslyckades: ${err.message}`);
+        }
+    });
+    context.subscriptions.push(cmd);
 }
-function deactivate() {
-    /* inget särskilt */
+function deactivate() { }
+/** Försök starta dev-server; om devCmd saknas – försök ephemeral Vite eller static server */
+async function startOrFallback(c) {
+    // 1) dev-script
+    if (c.devCmd) {
+        const { externalUrl } = await (0, runner_1.runDevServer)(c.devCmd, c.dir);
+        return { externalUrl };
+    }
+    // 2) Ephemeral Vite om index.html verkar använda ES-moduler
+    const indexPath = fs.existsSync(path.join(c.dir, "index.html"))
+        ? path.join(c.dir, "index.html")
+        : path.join(c.dir, "public", "index.html");
+    let usesModules = false;
+    if (fs.existsSync(indexPath)) {
+        const html = fs.readFileSync(indexPath, "utf8");
+        usesModules =
+            /type\s*=\s*["']module["']/.test(html) || /<script[^>]+src="\/?src\//.test(html);
+    }
+    if (usesModules) {
+        // Kräver vite via npx (hämtas automatiskt om ej lokalt installerat)
+        const { externalUrl } = await (0, runner_1.runDevServer)(`npx -y vite`, c.dir);
+        return { externalUrl };
+    }
+    // 3) Enkel static server (dev-läge). Alternativ: "python -m http.server 5500"
+    const { externalUrl } = await (0, runner_1.runDevServer)(`npx -y http-server -p 5500`, c.dir);
+    return { externalUrl };
+}
+/** Läs dist-webview/index.html, reskriv asset-URL:er och injicera CSP för iframe (localhost) */
+function getWebviewHtml(context, webview) {
+    const distDir = path.join(context.extensionPath, "dist-webview");
+    const htmlPath = path.join(distDir, "index.html");
+    let html = "";
+    try {
+        html = fs.readFileSync(htmlPath, "utf8");
+    }
+    catch (e) {
+        // Fallback – minimal HTML om build saknas
+        return basicFallbackHtml(webview);
+    }
+    // Reskriv lokala src/href till webview-resurser
+    html = html.replace(/(src|href)="([^"]+)"/g, (_m, attr, value) => {
+        // Hoppa över absoluta URL:er (http/https), data: och inlined anchors
+        if (/^(https?:)?\/\//.test(value) || value.startsWith("data:") || value.startsWith("#")) {
+            return `${attr}="${value}"`;
+        }
+        const cleaned = value.replace(/^\/+/, "").replace(/^\.\//, "");
+        const onDisk = vscode.Uri.file(path.join(distDir, cleaned));
+        const asWebview = webview.asWebviewUri(onDisk);
+        return `${attr}="${asWebview}"`;
+    });
+    // Injektera CSP så webview tillåter iframes samt anslutningar till backend
+    const cspSource = webview.cspSource;
+    html = html.replace("<head>", `<head>
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'none';
+  img-src https: data:;
+  style-src 'unsafe-inline' ${cspSource};
+  script-src ${cspSource};
+  connect-src ${cspSource} http://localhost:* https://api.figma.com http://localhost:8000;
+  frame-src http://localhost:* https://*;
+">
+`);
+    return html;
+}
+/** Minimal fallback HTML om dist-webview saknas vid utveckling */
+function basicFallbackHtml(webview) {
+    const cspSource = webview.cspSource;
+    return /* html */ `<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'none';
+  img-src https: data:;
+  style-src 'unsafe-inline' ${cspSource};
+  script-src ${cspSource};
+  connect-src ${cspSource} http://localhost:* https://api.figma.com http://localhost:8000;
+  frame-src http://localhost:* https://*;">
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Project Preview (fallback)</title>
+<style>
+  :root {
+    --bg: var(--vscode-sideBar-background);
+    --fg: var(--vscode-foreground);
+    --border: color-mix(in srgb, var(--vscode-foreground) 20%, var(--vscode-sideBar-background) 80%);
+    --card: var(--vscode-editorWidget-background);
+  }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.4 ui-sans-serif,system-ui; }
+  .wrap { padding: 10px; }
+  .mini {
+    margin: 6px auto 0;
+    width: 100%;
+    max-width: 340px;
+    height: 240px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    background: var(--card);
+  }
+  iframe { display:block; width:100%; height:100%; border:0; }
+  .url { margin-top: 6px; opacity:.8; word-break: break-all; }
+  .panel { margin-top: 12px; padding: 8px; border: 1px solid var(--border); border-radius: 10px; }
+  .muted { opacity: .75; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="mini"><iframe id="preview" sandbox="allow-scripts allow-forms allow-same-origin"></iframe></div>
+    <div class="url" id="info">Waiting for devurl…</div>
+    <div class="panel" id="analysis">Waiting for analysis…</div>
+  </div>
+<script>
+  const iframe = document.getElementById('preview');
+  const info = document.getElementById('info');
+  const analysis = document.getElementById('analysis');
+  function renderStatus(s){ analysis.textContent = 'Analys: ' + (s?.status || s); }
+  function renderError(msg){ analysis.innerHTML = '<span class="muted">Fel:</span> ' + (msg||'Okänt fel'); }
+  function renderResult(model){
+    analysis.innerHTML = '';
+    const h = document.createElement('div'); h.innerHTML = '<b>Project Summary</b>';
+    const p = document.createElement('pre'); p.style.whiteSpace='pre-wrap'; p.textContent = JSON.stringify({
+      manager:model.manager, framework:model.framework,
+      entryPoints:model.entryPoints, routing:model.routing, components:model.components?.length, injections:model.injectionPoints?.length
+    }, null, 2);
+    analysis.appendChild(h); analysis.appendChild(p);
+  }
+  window.addEventListener('message', (e) => {
+    const msg = e.data;
+    if (msg?.type === 'devurl') { iframe.src = msg.url; info.textContent = msg.url; }
+    if (msg?.type === 'analysis/status') { renderStatus(msg.payload); }
+    if (msg?.type === 'analysis/error') { renderError(msg.payload); }
+    if (msg?.type === 'analysis/result') { renderResult(msg.payload); }
+  });
+</script>
+</body>
+</html>`;
 }
 //# sourceMappingURL=extension.js.map

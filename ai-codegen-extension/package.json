@@ -14,13 +14,15 @@
     "onUri"
   ],
   "main": "./dist/extension.js",
-
-  
   "contributes": {
     "commands": [
       {
         "command": "ai-figma-codegen.openPanel",
         "title": "AI Figma Codegen: Open Panel"
+      },
+      {
+        "command": "ai-figma-codegen.scanAndPreview",
+        "title": "AI Figma Codegen: Scan & Preview"
       }
     ],
     "configuration": {
@@ -34,24 +36,19 @@
       }
     }
   },
-
-  
   "scripts": {
-   
-    "compile":      "tsc -p .",
-    "watch":        "tsc -p . -w",
-
-   
-    "dev:webview":  "vite build --watch --config vite.webview.config.ts",
-    "build:webview":"vite build --config vite.webview.config.ts",
-
-    "dev":          "npm-run-all --parallel watch dev:webview",
-    "prepackage":   "npm run compile && npm run build:webview",
-    "package":      "vsce package --no-dependencies"
+    "compile": "tsc -p .",
+    "watch": "tsc -p . -w",
+    "dev:webview": "vite build --watch --config vite.webview.config.ts",
+    "build:webview": "vite build --config vite.webview.config.ts",
+    "dev": "npm-run-all --parallel watch dev:webview",
+    "prepackage": "npm run compile && npm run build:webview",
+    "package": "vsce package --no-dependencies",
+    "tw": "tailwindcss",
+    "tw:dev": "tailwindcss -i ./src/index.css -o ./dist/style.css --watch"
   },
-
- 
   "devDependencies": {
+    "@tailwindcss/cli": "^4.1.11",
     "@types/node": "^24.0.14",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
@@ -59,14 +56,12 @@
     "@vitejs/plugin-react": "^4.6.0",
     "@vscode/vsce": "^3.6.0",
     "autoprefixer": "^10.4.21",
-    "npm-run-all": "^4.1.7",
+    "npm-run-all": "^4.1.5",
     "postcss": "^8.5.6",
     "tailwindcss": "^4.1.11",
     "typescript": "^5.5.0",
     "vite": "^5.2.0"
   },
-
-  
   "dependencies": {
     "@tanstack/react-query": "^5.83.0",
     "clsx": "^2.1.1",

@@ -1,0 +1,179 @@
+@import "tailwindcss/preflight";
+@tailwind utilities;
+@reference "tailwindcss";   /* gör core-utilities tillgängliga för @apply */
+
+/* ─────────────────────────────────────────────── */
+/*  THEME – Mappa till VS Code tokens              */
+/* ─────────────────────────────────────────────── */
+:root {
+  color-scheme: light dark;
+
+  /* VS Code tokens → egna variabler */
+  --background: var(--vscode-sideBar-background);
+  --foreground: var(--vscode-foreground);
+  --card: var(--vscode-editorWidget-background);
+  --card-foreground: var(--vscode-editorWidget-foreground);
+  --border: color-mix(in srgb, var(--vscode-foreground) 14%, var(--vscode-sideBar-background) 86%);
+  --muted: color-mix(in srgb, var(--vscode-sideBar-background) 92%, var(--vscode-foreground) 8%);
+  --destructive: var(--vscode-errorForeground);
+  --overlay: color-mix(in srgb, var(--vscode-editor-background) 30%, black 70%); /* mörk bakgrund vid zoom */
+
+  /* Preview-dimension (kompakt) */
+  --preview-width: 220px;  /* liten, “inte alls stor” */
+  --preview-max-height: 160px;
+}
+
+/* Tailwind/shadcn utility hooks */
+.bg-background { background-color: var(--background) !important; }
+.text-foreground { color: var(--foreground) !important; }
+.bg-muted { background-color: var(--muted) !important; }
+.text-destructive { color: var(--destructive) !important; }
+
+/* Panel-root: låt innehåll börja högt upp och centrera horisontellt */
+.panel-root {
+  display: grid;
+  grid-auto-rows: min-content;
+  row-gap: .5rem;
+}
+
+/* ─────────────────────────────────────────────── */
+/*  Kompakt Figma-preview                          */
+/* ─────────────────────────────────────────────── */
+
+/* Wrapper som centrerar horisontellt och ligger högt upp */
+.preview-shell {
+  display: grid;
+  justify-content: center;   /* horisontellt centrerad */
+  align-content: start;      /* högt upp i panelen */
+  padding: .5rem .75rem 0 .75rem;
+}
+
+/* Grid-kortet: liten yta med finmaskigt rutnät */
+.preview-grid {
+  position: relative;
+  width: 100%;
+  max-width: var(--preview-width);
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background-color: var(--card);
+  padding: 8px;
+  cursor: default;
+  transition: box-shadow .2s ease, transform .2s ease, border-color .2s ease;
+  user-select: none;
+  overflow: hidden;
+
+  /* finmaskigt rutnät (12px) tonat mot temat */
+  background-image:
+    linear-gradient(0deg,
+      transparent 24%,
+      color-mix(in srgb, var(--vscode-foreground) 8%, transparent) 25%,
+      color-mix(in srgb, var(--vscode-foreground) 8%, transparent) 26%,
+      transparent 27%,
+      transparent 74%,
+      color-mix(in srgb, var(--vscode-foreground) 8%, transparent) 75%,
+      color-mix(in srgb, var(--vscode-foreground) 8%, transparent) 76%,
+      transparent 77%
+    ),
+    linear-gradient(90deg,
+      transparent 24%,
+      color-mix(in srgb, var(--vscode-foreground) 8%, transparent) 25%,
+      color-mix(in srgb, var(--vscode-foreground) 8%, transparent) 26%,
+      transparent 27%,
+      transparent 74%,
+      color-mix(in srgb, var(--vscode-foreground) 8%, transparent) 75%,
+      color-mix(in srgb, var(--vscode-foreground) 8%, transparent) 76%,
+      transparent 77%
+    );
+  background-size: 12px 12px;
+}
+
+.preview-grid.is-ready {
+  cursor: zoom-in;
+}
+.preview-grid:is(:hover, :focus-visible) {
+  border-color: color-mix(in srgb, var(--vscode-foreground) 24%, var(--vscode-sideBar-background) 76%);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--vscode-foreground) 10%, transparent);
+  transform: translateY(-1px);
+}
+
+/* Bilden: skarp, kontrollerad storlek */
+.figma-img {
+  @apply block h-auto object-contain transition-opacity duration-300 ease-out;
+  max-width: 100%;
+  max-height: var(--preview-max-height);
+  aspect-ratio: auto;
+
+  /* högkvalitetsinterpolering (inte “crisp-edges”) */
+  image-rendering: auto;
+  -ms-interpolation-mode: bicubic;
+
+  /* prestanda-hints */
+  content-visibility: auto;
+  contain-intrinsic-size: 320px 240px;
+}
+
+.figma-clickable { cursor: zoom-in; }
+
+/* ─────────────────────────────────────────────── */
+/*  Lightbox / zoomläge                            */
+/* ─────────────────────────────────────────────── */
+.figma-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--overlay, rgba(0,0,0,.7));
+  z-index: 9999;
+  animation: overlay-fade .15s ease-out;
+}
+
+.figma-modal {
+  position: absolute;
+  inset: 50% auto auto 50%;
+  transform: translate(-50%, -50%) scale(1);
+  max-width: min(92vw, 1100px);
+  max-height: 92vh;
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--card);
+  box-shadow:
+    0 10px 30px rgba(0,0,0,.35),
+    0 2px 10px rgba(0,0,0,.25);
+  animation: modal-pop .18s ease-out;
+}
+
+.figma-modal-img {
+  display: block;
+  max-width: 100%;
+  max-height: 92vh;
+  object-fit: contain;
+  image-rendering: auto;      /* bibehåll skärpa i zoom */
+}
+
+.figma-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--card) 80%, black 20%);
+  color: var(--foreground);
+  border-radius: 9999px;
+  display: grid;
+  place-items: center;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: .9;
+  transition: transform .15s ease, opacity .15s ease, background .15s ease;
+}
+.figma-close:hover { opacity: 1; transform: scale(1.05); }
+.figma-close:active { transform: scale(.98); }
+
+/* animationer */
+@keyframes overlay-fade {
+  from { opacity: 0; } to { opacity: 1; }
+}
+@keyframes modal-pop {
+  from { opacity: 0; transform: translate(-50%, -50%) scale(.98); }
+  to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}

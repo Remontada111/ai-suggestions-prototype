@@ -1,26 +1,27 @@
-# ---------- 1. Basimage ----------------------------------------------------
-FROM python:3.13-slim
+# backend/Dockerfile
+FROM python:3.12-slim
 
-# ---------- 2. Miljövariabler ---------------------------------------------
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# ---------- 3. System­beroenden -------------------------------------------
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends git build-essential curl \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/*
 
-# ---------- 4. Python-paket -----------------------------------------------
-COPY requirements.txt ./requirements.txt       
-RUN pip install --upgrade pip \
-    && pip install -r requirements.txt
+# Skapa venv i bilden
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
 
-# ---------- 5. Applikations-kod -------------------------------------------
-COPY . /app/backend/                
+# ⬇️ Observera: vi är redan inne i build-contexten "backend/"
+COPY requirements.txt ./requirements.txt
+RUN pip install -U pip && pip install -r requirements.txt
 
-# Lägg repo-roten i Python-sökvägen
+# Kopiera hela backend-koden in i bilden
+COPY . /app/backend
+
+# Samma importväg som lokalt
 ENV PYTHONPATH="/app:${PYTHONPATH}"
-
-WORKDIR /app                      
+WORKDIR /app
