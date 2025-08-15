@@ -1,9 +1,10 @@
-/* ai-codegen-extension/webview/main.tsx
+/* ai-codegen-extension/webview/main.tsx 
    --------------------------------------------------------------------------
    React-panel för AI Figma Codegen – kompakt preview, centrerad, lightbox-
    toggle med mörknad bakgrund och stäng-kryss. Hög DPI även i zoomläge.
    + Mini-preview av användarens dev-server under Figma-kortet.
    + [NY] Project Summary från backend-analys.
+   + [NY] Kandidat-förslag med “Acceptera förhandsvisning”.
    -------------------------------------------------------------------------- */
 
 /// <reference types="vite/client" />
@@ -44,6 +45,18 @@ interface InitMessage {
 interface DevUrlMessage {
   type: "devurl";
   url: string;
+}
+
+interface CandidateProposal {
+  label: string;
+  description: string;
+  dir: string;
+  launchCmd?: string;
+}
+
+interface CandidateProposalMessage {
+  type: "candidate-proposal";
+  payload: CandidateProposal;
 }
 
 interface FigmaImageApiRes {
@@ -137,9 +150,12 @@ const AiPanel: React.FC = () => {
   // Mini-preview URL från extension (dev-servern)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
+  // [NY] Kandidat-förslag
+  const [proposal, setProposal] = useState<CandidateProposal | null>(null);
+
   useEffect(() => {
-    const listener = (e: MessageEvent<InitMessage | DevUrlMessage | any>) => {
-      const msg = e.data as InitMessage | DevUrlMessage | any;
+    const listener = (e: MessageEvent<InitMessage | DevUrlMessage | CandidateProposalMessage | any>) => {
+      const msg = e.data as InitMessage | DevUrlMessage | CandidateProposalMessage | any;
       if (!msg || typeof msg !== "object") return;
 
       if ((msg as InitMessage).type === "init") {
@@ -154,6 +170,12 @@ const AiPanel: React.FC = () => {
       if ((msg as DevUrlMessage).type === "devurl") {
         const m = msg as DevUrlMessage;
         if (typeof m.url === "string") setPreviewUrl(m.url);
+        return;
+      }
+
+      if ((msg as CandidateProposalMessage).type === "candidate-proposal") {
+        const m = msg as CandidateProposalMessage;
+        if (m?.payload) setProposal(m.payload);
         return;
       }
 
@@ -258,6 +280,40 @@ const AiPanel: React.FC = () => {
           )}
         </div>
       </div>
+
+      {/* ————— [NY] Föreslagen kandidat (Acceptera) ————— */}
+      {proposal && (
+        <div className="px-4 mt-3">
+          <Card>
+            <CardHeader>
+              <CardTitle>Föreslagen förhandsvisning</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-sm mb-2">
+                <b>{proposal.label}</b><br />
+                <span className="opacity-80">{proposal.description}</span><br />
+                <span className="opacity-60">{proposal.dir}</span>
+              </p>
+              <div className="flex gap-2">
+                <Button
+                  onClick={() => {
+                    vscode.postMessage({ cmd: "acceptCandidate" });
+                    setProposal(null); // dölj rutan när vi startar
+                  }}
+                >
+                  Starta förhandsvisning
+                </Button>
+                <Button
+                  className="btn-secondary"
+                  onClick={() => setProposal(null)}
+                >
+                  Avbryt
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
 
       {/* ————— Mini-preview av hela projektet (iframe) ————— */}
       {previewUrl && (

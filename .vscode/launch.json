@@ -3,16 +3,40 @@
   "configurations": [
     {
       "name": "Run Extension",
-      "type": "extensionHost",          // ← nyckeln: talar om att detta är en VS Code-extension
+      "type": "extensionHost",
       "request": "launch",
       "runtimeExecutable": "${execPath}",
-      "args": [
-        "--extensionDevelopmentPath=${workspaceFolder}"
-      ],
-      "preLaunchTask": "compile",       // kör vårt tsc-skript först
-      "outFiles": [
-        "${workspaceFolder}/dist/**/*.js"
-      ]
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+      "preLaunchTask": "compile",
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"]
+    },
+    {
+      "name": "API (Uvicorn)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["backend.app.main:app", "--reload", "--host", "0.0.0.0", "--port", "8000"],
+      "envFile": "${workspaceFolder}/backend/.env",
+      "env": { "PYTHONPATH": "${workspaceFolder}" },
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Worker (Celery)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "celery",
+      "args": ["-A", "backend.tasks.codegen", "worker", "--loglevel=info", "--concurrency=4"],
+      "envFile": "${workspaceFolder}/backend/.env",
+      "env": { "PYTHONPATH": "${workspaceFolder}" },
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ],
+  "compounds": [
+    {
+      "name": "API + Worker",
+      "configurations": ["Run Extension"]
     }
   ]
 }

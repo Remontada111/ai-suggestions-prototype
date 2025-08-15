@@ -35,6 +35,9 @@ if not FIGMA_TOKEN:
 
 app = Celery("codegen", broker=BROKER_URL, backend=RESULT_BACKEND)
 
+# ✅ Exportera en tydligt typad alias som andra moduler kan importera
+celery_app: Celery = app
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -168,3 +171,6 @@ def integrate_figma_node(*, file_key: str, node_id: str) -> Dict[str, str]:
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+__all__ = ["app", "celery_app", "integrate_figma_node"]

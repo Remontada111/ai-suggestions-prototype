@@ -7,10 +7,54 @@
       "command": "pnpm",
       "args": ["run", "compile"],
       "options": {
-        "cwd": "${workspaceFolder}/ai-codegen-extension"   // ← pekar på rätt paket
+        "cwd": "${workspaceFolder}/ai-codegen-extension"
       },
       "problemMatcher": ["$tsc"],
       "group": "build"
+    },
+
+    {
+      "label": "backend: pip install",
+      "type": "process",
+      "command": "${config:python.defaultInterpreterPath}",
+      "args": ["-m", "pip", "install", "-r", "backend/requirements.txt"]
+    },
+    {
+      "label": "backend: API (Uvicorn)",
+      "type": "process",
+      "command": "${config:python.defaultInterpreterPath}",
+      "args": ["-m", "uvicorn", "backend.app.main:app", "--reload", "--host", "0.0.0.0", "--port", "8000"],
+      "options": {
+        "env": { "PYTHONPATH": "${workspaceFolder}" }
+      }
+    },
+    {
+      "label": "backend: Worker (Celery)",
+      "type": "process",
+      "command": "${config:python.defaultInterpreterPath}",
+      "args": ["-m", "celery", "-A", "backend.tasks.codegen", "worker", "--loglevel=info", "--concurrency=4"],
+      "options": {
+        "env": { "PYTHONPATH": "${workspaceFolder}" }
+      }
+    },
+
+    {
+      "label": "docker: redis up",
+      "type": "shell",
+      "command": "docker",
+      "args": ["compose", "up", "-d", "redis"]
+    },
+    {
+      "label": "docker: backend rebuild",
+      "type": "shell",
+      "command": "docker",
+      "args": ["compose", "build", "--no-cache", "backend"]
+    },
+    {
+      "label": "docker: stack up (backend+api+worker)",
+      "type": "shell",
+      "command": "docker",
+      "args": ["compose", "up", "-d", "backend", "api", "worker"]
     }
   ]
 }

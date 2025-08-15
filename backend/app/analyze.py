@@ -1,23 +1,27 @@
 from __future__ import annotations
 
 # backend/app/routes/analyze.py
-from typing import List, Literal, Optional, Dict, Any
-from pydantic import BaseModel, Field, root_validator, validator
+
+from typing import List, Literal, Optional, Dict, Any, cast
+
+from pydantic import BaseModel, Field, model_validator
 from fastapi import APIRouter, HTTPException
+from celery import Celery
+from celery import current_app as celery_current_app
 from celery.result import AsyncResult
 
 # För att återanvända befintlig Celery-app utan att röra existerande filer:
-# Vi försöker först importera en namngiven instans från er pipeline, annars faller vi tillbaka till current_app.
-from celery import current_app as celery_current_app
-
+# Försök importera en namngiven instans från pipeline, annars fall tillbaka till current_app.
 try:
-    # Vanlig konvention i liknande repo:n
-    from backend.tasks.codegen import celery_app as celery_app  # type: ignore
+    from backend.tasks.codegen import celery_app as imported_celery_app  # typ: Celery
 except Exception:  # pragma: no cover - defensiv fallback
     try:
-        from backend.tasks.codegen import app as celery_app  # type: ignore
+        from backend.tasks.codegen import app as imported_celery_app  # typ: Celery
     except Exception:  # pragma: no cover
-        celery_app = celery_current_app  # sista utväg
+        imported_celery_app = celery_current_app  # sista utväg
+
+# Hjälp Pylance förstå typen tydligt
+celery_app: Celery = cast(Celery, imported_celery_app)
 
 router = APIRouter(prefix="/analyze", tags=["analyze"])
 
@@ -46,17 +50,14 @@ class AnalyzeManifest(BaseModel):
 
     ignored_dirs: List[str] = Field(default_factory=lambda: DEFAULT_IGNORED_DIRS.copy())
 
-    @root_validator
-    def _validate_mode_fields(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        mode = values.get("mode")
-        root_path = values.get("root_path")
-        files = values.get("files")
-        if mode == "local_paths" and not root_path:
+    @model_validator(mode="after")
+    def _validate_mode_fields(self) -> "AnalyzeManifest":
+        if self.mode == "local_paths" and not self.root_path:
             raise ValueError("root_path krävs för mode=local_paths")
-        if mode == "streamed_files":
-            if not files or len(files) == 0:
+        if self.mode == "streamed_files":
+            if not self.files or len(self.files) == 0:
                 raise ValueError("files krävs och får inte vara tom för mode=streamed_files")
-        return values
+        return self
 
 class AnalyzeStartResponse(BaseModel):
     task_id: str
@@ -74,7 +75,10 @@ def start_analysis(manifest: AnalyzeManifest):
     Startar asynkron projektanalys. Returnerar Celery task_id.
     """
     try:
-        task = celery_app.send_task("backend.tasks.analyze.analyze_project", args=[manifest.dict()])
+        task = celery_app.send_task(
+            "backend.tasks.analyze.analyze_project",
+            args=[manifest.model_dump()]  # pydantic v2
+        )
     except Exception as e:  # pragma: no cover - robust felhantering
         raise HTTPException(status_code=500, detail=f"Kunde inte queue:a analyze_task: {e}")
     return AnalyzeStartResponse(task_id=task.id)

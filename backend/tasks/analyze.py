@@ -1,12 +1,9 @@
-from __future__ import annotations
-
 # backend/tasks/analyze.py
 #
-# Celery-task som analyserar ett frontend-projekt och returnerar en project_model.
-# Beroenden: endast standardbibliotek + (valfritt/installerat) tree-sitter för framtida utökning.
-# Nuvarande implementation använder robusta regex-heuristiker (snabba, inga extra deps).
-#
-# Viktigt: Återanvänd befintlig Celery-instans.
+# Fördjupad projektanalys: identifiera manager/ramverk, entry points,
+# styling, routing, komponenter, @inject, samt körbarhetsledtrådar (runHints)
+# från scripts, config och .env. Heuristiker – snabba, utan extra tunga deps.
+from __future__ import annotations
 
 import os
 import json
@@ -15,20 +12,11 @@ import re
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional, Iterable
 
-from celery import current_app as celery_current_app
-
-try:
-    # Primär källa (existerande pipeline)
-    from backend.tasks.codegen import celery_app as celery_app  # type: ignore
-except Exception:
-    try:
-        from backend.tasks.codegen import app as celery_app  # type: ignore
-    except Exception:  # pragma: no cover
-        celery_app = celery_current_app  # fallback
+from celery import shared_task
 
 # ======== Konstanter / Heuristiker =========
-TEXT_EXTS = {".js", ".jsx", ".ts", ".tsx", ".json", ".css", ".scss", ".sass", ".html", ".md"}
-SRC_DIR_HINTS = {"src", "app", "pages", "components"}
+TEXT_EXTS = {".js", ".jsx", ".ts", ".tsx", ".json", ".css", ".scss", ".sass", ".html", ".md", ".mjs", ".cjs"}
+SRC_DIR_HINTS = {"src", "app", "pages", "components", "public"}
 
 # Regexp för komponenter
 RE_EXPORT_DEFAULT_FN = re.compile(r"export\s+default\s+function\s+([A-Za-z0-9_]+)\s*\(([^)]*)\)", re.MULTILINE)
@@ -50,436 +38,426 @@ IGNORED_DIRS_DEFAULT = [
     ".git", "coverage", ".venv", "venv", "__pycache__", "dist-webview",
 ]
 
+CONFIG_NAMES = [
+    "vite.config.ts", "vite.config.js", "vite.config.mjs", "vite.config.cjs",
+    "next.config.js", "next.config.mjs", "next.config.ts",
+    "svelte.config.js", "svelte.config.mjs", "svelte.config.ts",
+    "nuxt.config.ts", "nuxt.config.js", "nuxt.config.mjs",
+    "remix.config.js", "remix.config.mjs", "remix.config.ts",
+    "solid.config.ts", "solid.config.js",
+    "astro.config.mjs", "astro.config.ts", "astro.config.js",
+    "angular.json", "webpack.config.js", "webpack.dev.js", "webpack.dev.mjs",
+    "storybook.config.js", "main.ts", "main.js"
+]
+
 # ======== Hjälpfunktioner =========
 
 def _read_text(path: Path, max_bytes: int) -> Tuple[str, bool]:
-    """
-    Läser textfil upp till max_bytes. Returnerar (text, was_truncated).
-    Binära eller för stora filer ignoreras säkert via felhantering.
-    """
-    try:
-        b = path.read_bytes()
-    except Exception:
-        return ("", False)
-    truncated = False
-    if len(b) > max_bytes:
-        b = b[:max_bytes]
-        truncated = True
-    try:
-        return (b.decode("utf-8", errors="ignore"), truncated)
-    except Exception:
-        return ("", truncated)
+  try:
+    b = path.read_bytes()
+  except Exception:
+    return ("", False)
+  truncated = False
+  if len(b) > max_bytes:
+    b = b[:max_bytes]
+    truncated = True
+  try:
+    return (b.decode("utf-8", errors="ignore"), truncated)
+  except Exception:
+    return ("", truncated)
 
 def _detect_manager_and_scripts(pkg_json: Dict[str, Any], project_root: Path) -> Tuple[str, Dict[str, str]]:
-    scripts = pkg_json.get("scripts", {}) if isinstance(pkg_json, dict) else {}
-    manager = "unknown"
-    if (project_root / "pnpm-lock.yaml").exists():
-        manager = "pnpm"
-    elif (project_root / "yarn.lock").exists():
-        manager = "yarn"
-    elif (project_root / "bun.lockb").exists():
-        manager = "bun"
-    elif (project_root / "package-lock.json").exists():
-        manager = "npm"
-    return manager, scripts
+  scripts = pkg_json.get("scripts", {}) if isinstance(pkg_json, dict) else {}
+  manager = "unknown"
+  if (project_root / "pnpm-lock.yaml").exists(): manager = "pnpm"
+  elif (project_root / "yarn.lock").exists():    manager = "yarn"
+  elif (project_root / "bun.lockb").exists():    manager = "bun"
+  elif (project_root / "package-lock.json").exists(): manager = "npm"
+  return manager, scripts
 
-def _detect_framework(pkg_json: Dict[str, Any]) -> str:
-    deps = {}
-    for k in ("dependencies", "devDependencies", "peerDependencies"):
-        v = pkg_json.get(k)
-        if isinstance(v, dict):
-            deps.update(v)
-    deps_lower = {k.lower(): v for k, v in deps.items()}
+def _detect_configs(root: Path) -> List[str]:
+  hits = []
+  for n in CONFIG_NAMES:
+    if (root / n).exists(): hits.append(n)
+  return hits
 
-    if "next" in deps_lower:
-        return "next"
-    if "react" in deps_lower:
-        return "react"
-    if "vite" in deps_lower and "react" in deps_lower:
-        return "react"
-    if "svelte" in deps_lower or "@sveltejs/kit" in deps_lower:
-        return "svelte"
-    if "vue" in deps_lower or "nuxt" in deps_lower:
-        return "vue"
-    return "unknown"
+def _detect_framework(pkg_json: Dict[str, Any], config_hits: List[str], root: Path) -> str:
+  deps = {}
+  for k in ("dependencies", "devDependencies", "peerDependencies"):
+    v = pkg_json.get(k)
+    if isinstance(v, dict):
+      deps.update(v)
+  deps_lower = {k.lower(): v for k, v in deps.items()}
+
+  if "next" in deps_lower or any(c.startswith("next.config") for c in config_hits): return "next"
+  if "@sveltejs/kit" in deps_lower or any(c.startswith("svelte.config") for c in config_hits): return "sveltekit"
+  if "vite" in deps_lower: return "vite"
+  if "vue" in deps_lower or "nuxt" in deps_lower or any(c.startswith("nuxt.config") for c in config_hits): return "vue"
+  if "@angular/core" in deps_lower or "angular.json" in config_hits: return "angular"
+  if "remix" in deps_lower or "@remix-run/dev" in deps_lower or any(c.startswith("remix.config") for c in config_hits): return "remix"
+  if "solid-start" in deps_lower or any(c.startswith("solid.config") for c in config_hits): return "solid"
+  if "astro" in deps_lower or any(c.startswith("astro.config") for c in config_hits): return "astro"
+  if "react" in deps_lower: return "react"
+  return "unknown"
 
 def _find_entry_points(root: Path) -> Dict[str, Any]:
-    patterns = [
-        "index.html",
-        "public/index.html",
-        "src/main.tsx", "src/main.ts", "src/main.jsx", "src/main.js",
-        "src/App.tsx", "src/App.ts", "src/App.jsx", "src/App.js",
-        "pages/_app.tsx", "pages/_app.jsx",
-        "app/layout.tsx", "app/layout.jsx"
-    ]
-    found = []
-    for p in patterns:
-        f = root / p
-        if f.exists():
-            found.append(p)
-    return {
-        "html": [p for p in found if p.endswith(".html")],
-        "mainFiles": [p for p in found if "/main." in p or p.endswith("main.js") or p.endswith("main.ts") or p.endswith("main.tsx") or p.endswith("main.jsx")],
-        "appFiles": [p for p in found if "App." in p or p.endswith("_app.tsx") or p.endswith("_app.jsx") or p.endswith("layout.tsx") or p.endswith("layout.jsx")],
-        "next": {
-            "appDir": (root / "app").exists(),
-            "pagesDir": (root / "pages").exists()
-        }
+  # HTML (var som helst i toppnivå eller i public/)
+  html_candidates: List[str] = []
+  for rel in ["index.html", "public/index.html"]:
+    if (root / rel).exists(): html_candidates.append(rel)
+  # fallback: första *.html i root/public/src/app
+  for base in [root, root / "public", root / "app", root / "src"]:
+    try:
+      for p in base.iterdir():
+        if p.is_file() and p.suffix.lower() == ".html":
+          rel = str(p.relative_to(root)).replace("\\", "/")
+          if rel not in html_candidates:
+            html_candidates.append(rel)
+    except Exception:
+      pass
+
+  patterns = [
+    "src/main.tsx", "src/main.ts", "src/main.jsx", "src/main.js",
+    "src/App.tsx", "src/App.ts", "src/App.jsx", "src/App.js",
+    "pages/_app.tsx", "pages/_app.jsx",
+    "app/layout.tsx", "app/layout.jsx"
+  ]
+  found = []
+  for p in patterns:
+    if (root / p).exists(): found.append(p)
+
+  return {
+    "html": html_candidates,
+    "mainFiles": [p for p in found if "/main." in p or p.endswith(("main.js", "main.ts", "main.tsx", "main.jsx"))],
+    "appFiles": [p for p in found if "App." in p or p.endswith(("_app.tsx", "_app.jsx", "layout.tsx", "layout.jsx"))],
+    "next": {
+      "appDir": (root / "app").exists(),
+      "pagesDir": (root / "pages").exists()
     }
+  }
 
 def _detect_styling(root: Path, pkg_json: Dict[str, Any], files_iter: Iterable[Tuple[str, str]]) -> Dict[str, Any]:
-    # Tailwind
-    tailwind_present = False
-    tailwind_config = None
-    for cfg in ("tailwind.config.js", "tailwind.config.cjs", "tailwind.config.ts"):
-        if (root / cfg).exists():
-            tailwind_present = True
-            tailwind_config = cfg
-            break
-    deps = {}
-    for k in ("dependencies", "devDependencies"):
-        v = pkg_json.get(k)
-        if isinstance(v, dict):
-            deps.update(v)
-    if "tailwindcss" in (k.lower() for k in deps.keys()):
-        tailwind_present = True
+  # Tailwind
+  tailwind_present = False
+  tailwind_config = None
+  for cfg in ("tailwind.config.js", "tailwind.config.cjs", "tailwind.config.ts"):
+    if (root / cfg).exists():
+      tailwind_present = True
+      tailwind_config = cfg
+      break
+  deps = {}
+  for k in ("dependencies", "devDependencies"):
+    v = pkg_json.get(k)
+    if isinstance(v, dict):
+      deps.update(v)
+  if "tailwindcss" in (k.lower() for k in deps.keys()): tailwind_present = True
 
-    # UI-libs primärt via importspår i källor (snabb heuristik) + deps
-    ui_libs = set()
-    known_ui_markers = [
-        "@mui/material", "@material-ui/core", "styled-components",
-        "antd", "@chakra-ui/react", "@radix-ui", "shadcn/ui", "class-variance-authority",
-        "tailwind-merge", "lucide-react", "@headlessui/react"
-    ]
-    # Snabb skanning av ett urval av källor
-    hit_budget = 0
-    for rel, text in files_iter:
-        if hit_budget > 200:  # begränsa CPU
-            break
-        hit = False
-        for marker in known_ui_markers:
-            if marker in text:
-                ui_libs.add(marker)
-                hit = True
-        if not tailwind_present and RE_TW_CLASSNAME.search(text):
-            tailwind_present = True
-        if hit:
-            hit_budget += 1
+  ui_libs = set()
+  known_ui_markers = [
+    "@mui/material", "@material-ui/core", "styled-components",
+    "antd", "@chakra-ui/react", "@radix-ui", "shadcn/ui", "class-variance-authority",
+    "tailwind-merge", "lucide-react", "@headlessui/react"
+  ]
+  hit_budget = 0
+  for rel, text in files_iter:
+    if hit_budget > 200: break
+    hit = False
+    for marker in known_ui_markers:
+      if marker in text:
+        ui_libs.add(marker)
+        hit = True
+    if not tailwind_present and re.search(RE_TW_CLASSNAME, text):
+      tailwind_present = True
+    if hit: hit_budget += 1
 
-    return {
-        "tailwind": {"present": tailwind_present, "configPath": tailwind_config},
-        "uiLibs": sorted(ui_libs)
-    }
+  return {
+    "tailwind": {"present": tailwind_present, "configPath": tailwind_config},
+    "uiLibs": sorted(ui_libs)
+  }
 
 def _routeify_next_path(rel: str) -> Optional[str]:
-    # Konvertera Next pages/app-fil till route-path
-    # Ignorera specialsidor
-    if any(seg.startswith("_") for seg in Path(rel).parts):
-        return None
-    if "/api/" in rel.replace("\\", "/"):
-        return None
-    p = rel
-    p = re.sub(r"\.(tsx|ts|jsx|js)$", "", p)
-    p = p.replace("\\", "/")
-    p = p.replace("pages", "").replace("app", "")
-    if p.endswith("/index"):
-        p = p[:-len("/index")]
-    p = p or "/"
-    # [id] -> :id
-    p = re.sub(r"\[([A-Za-z0-9_]+)\]", r":\1", p)
-    if not p.startswith("/"):
-        p = "/" + p
-    return p
+  if any(seg.startswith("_") for seg in Path(rel).parts): return None
+  if "/api/" in rel.replace("\\", "/"): return None
+  p = rel
+  p = re.sub(r"\.(tsx|ts|jsx|js)$", "", p)
+  p = p.replace("\\", "/")
+  p = p.replace("pages", "").replace("app", "")
+  if p.endswith("/index"): p = p[:-len("/index")]
+  p = p or "/"
+  p = re.sub(r"\[([A-Za-z0-9_]+)\]", r":\1", p)
+  if not p.startswith("/"): p = "/" + p
+  return p
 
 def _detect_routing(root: Path, pkg_json: Dict[str, Any], files_map: Dict[str, str]) -> Dict[str, Any]:
-    framework = _detect_framework(pkg_json)
-    routes: List[Dict[str, str]] = []
-    rtype = "none"
+  framework = _detect_framework(pkg_json, _detect_configs(root), root)
+  routes: List[Dict[str, str]] = []
+  rtype = "none"
 
-    if framework == "next" or (root / "pages").exists() or (root / "app").exists():
-        rtype = "next"
-        # Indexera pages/ och app/ endast under projektroten
-        for base in ("pages", "app"):
-            base_dir = root / base
-            if base_dir.exists():
-                for f in base_dir.rglob("*.*"):
-                    if f.is_file() and f.suffix in {".tsx", ".ts", ".jsx", ".js"}:
-                        rel = str(f.relative_to(root)).replace("\\", "/")
-                        rp = _routeify_next_path(rel)
-                        if rp:
-                            routes.append({"path": rp, "file": rel, "source": base})
-        return {"type": rtype, "routes": routes, "count": len(routes)}
+  if framework == "next" or (root / "pages").exists() or (root / "app").exists():
+    rtype = "next"
+    for base in ("pages", "app"):
+      base_dir = root / base
+      if base_dir.exists():
+        for f in base_dir.rglob("*.*"):
+          if f.is_file() and f.suffix in {".tsx", ".ts", ".jsx", ".js"}:
+            rel = str(f.relative_to(root)).replace("\\", "/")
+            rp = _routeify_next_path(rel)
+            if rp:
+              routes.append({"path": rp, "file": rel, "source": base})
+    return {"type": rtype, "routes": routes, "count": len(routes)}
 
-    # React Router — leta efter imports + <Route path="...">
-    rr_hits = 0
+  rr_hits = 0
+  for _rel, text in files_map.items():
+    if RE_ROUTE_IMPORT.search(text): rr_hits += 1
+  if rr_hits:
+    rtype = "react-router"
     for rel, text in files_map.items():
-        if RE_ROUTE_IMPORT.search(text):
-            rr_hits += 1
-    if rr_hits:
-        rtype = "react-router"
-        for rel, text in files_map.items():
-            for m in RE_ROUTE_TAG.finditer(text):
-                routes.append({"path": m.group(1), "file": rel, "source": "react-router"})
-        # De-dupe
-        uniq = {}
-        for r in routes:
-            key = (r["path"], r["file"])
-            uniq[key] = r
-        routes = list(uniq.values())
-        return {"type": rtype, "routes": routes, "count": len(routes)}
+      for m in RE_ROUTE_TAG.finditer(text):
+        routes.append({"path": m.group(1), "file": rel, "source": "react-router"})
+    uniq = {}
+    for r in routes:
+      key = (r["path"], r["file"])
+      uniq[key] = r
+    routes = list(uniq.values())
+    return {"type": rtype, "routes": routes, "count": len(routes)}
 
-    return {"type": "none", "routes": [], "count": 0}
+  return {"type": "none", "routes": [], "count": 0}
 
-def _detect_components(files_map: Dict[str, str]) -> List[Dict[str, Any]]:
-    comps: List[Dict[str, Any]] = []
-    for rel, text in files_map.items():
-        # Snabbfilter: har filen JSX?
-        if not (RE_JSX_TAG.search(text) or RE_RETURNS_JSX.search(text)):
-            continue
+def _detect_run_candidates(scripts: Dict[str, str], manager: str, framework: str, config_hits: List[str], root: Path) -> List[Dict[str, Any]]:
+  out: List[Dict[str, Any]] = []
+  def pref(): return "pnpm" if manager=="pnpm" else "yarn" if manager=="yarn" else "bun" if manager=="bun" else "npm run"
+  for name, val in (scripts or {}).items():
+    if re.search(r"\b(next|vite|nuxt|svelte-kit|remix|solid-start|astro|webpack(-dev-server)?|ng\s+serve|storybook|expo)\b", val, re.I):
+      out.append({"script": name, "cmd": f"{pref()} {name}", "source": "package.json"})
+  def push(cmd: str, why: str): out.append({"cmd": cmd, "source": why})
+  if any(c.startswith("vite.config") for c in config_hits): push("npx -y vite", "vite.config.*")
+  if framework == "next" or any(c.startswith("next.config") for c in config_hits): push("npx -y next dev", "next")
+  if framework == "sveltekit" or any(c.startswith("svelte.config") for c in config_hits): push("npx -y vite", "sveltekit")
+  if framework == "nuxt" or any(c.startswith("nuxt.config") for c in config_hits): push("npx -y nuxi dev", "nuxt")
+  if framework == "remix" or any(c.startswith("remix.config") for c in config_hits): push("npx -y remix dev", "remix")
+  if framework == "solid" or any(c.startswith("solid.config") for c in config_hits): push("npx -y solid-start dev", "solid-start")
+  if framework == "astro" or any(c.startswith("astro.config") for c in config_hits): push("npx -y astro dev", "astro")
+  if "angular.json" in config_hits: push("npx -y ng serve", "angular.json")
+  if any(c.startswith("webpack") for c in config_hits): push("npx -y webpack serve", "webpack config")
+  # Static server om HTML hittas
+  entry = _find_entry_points(root)
+  if entry.get("html"):
+    push("npx -y http-server -p 0", f"static ({entry['html'][0]})")
+  # Unika
+  seen = set()
+  uniq: List[Dict[str, Any]] = []
+  for it in out:
+    k = json.dumps(it, sort_keys=True)
+    if k not in seen:
+      seen.add(k)
+      uniq.append(it)
+  return uniq
 
-        def _mk(name: str, export_type: str, params: str, kind: str) -> Dict[str, Any]:
-            has_props = bool(params and (("props" in params) or ("{" in params)))
-            # försök plocka ut prop-namn från destrukturering
-            prop_names: List[str] = []
-            if "{" in params and "}" in params:
-                inside = params.split("{", 1)[1].split("}", 1)[0]
-                # enkla tokens
-                for t in inside.split(","):
-                    t = t.strip()
-                    if t and ":" not in t and "=" not in t and "..." not in t:
-                        prop_names.append(re.sub(r"\s.*$", "", t))
-            uses_tw = bool(RE_TW_CLASSNAME.search(text))
-            return {
-                "name": name,
-                "file": rel,
-                "export": export_type,
-                "kind": kind,
-                "hasProps": has_props,
-                "propNames": prop_names[:8],
-                "usesTailwind": uses_tw,
-            }
-
-        # default function
-        for m in RE_EXPORT_DEFAULT_FN.finditer(text):
-            comps.append(_mk(m.group(1), "default", m.group(2), "function"))
-
-        # named function
-        for m in RE_EXPORT_NAMED_FN.finditer(text):
-            comps.append(_mk(m.group(1), "named", m.group(2), "function"))
-
-        # const components (default eller named)
-        for m in RE_EXPORT_CONST.finditer(text):
-            comps.append(_mk(m.group(1), "named", m.group(2), "const"))
-
-        # anonymous default arrow
-        for m in RE_EXPORT_DEFAULT_ARROW.finditer(text):
-            # använd filnamn som namn
-            base = Path(rel).stem
-            name = f"{base}DefaultExport"
-            comps.append(_mk(name, "default", m.group(1), "const"))
-    # De-dupe per (file,name,export)
-    seen = set()
-    unique: List[Dict[str, Any]] = []
-    for c in comps:
-        key = (c["file"], c["name"], c["export"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(c)
-    return unique
-
-def _find_injection_points(files_map: Dict[str, str]) -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
-    for rel, text in files_map.items():
-        for i, line in enumerate(text.splitlines(), start=1):
-            m = RE_INJECT_TAG.search(line)
-            if m:
-                items.append({"file": rel, "line": i, "tag": m.group(1)})
-    return items
+def _parse_env_ports(root: Path, max_bytes: int) -> List[Dict[str, Any]]:
+  ports: List[Dict[str, Any]] = []
+  for name in [".env", ".env.local", ".env.development", ".env.dev", ".envrc"]:
+    fp = root / name
+    if fp.exists():
+      t, _ = _read_text(fp, max_bytes)
+      for m in re.finditer(r"^(PORT|VITE_PORT|STORYBOOK_PORT)\s*=\s*(\d{2,5})\b", t, re.MULTILINE):
+        ports.append({"key": m.group(1), "port": int(m.group(2)), "file": str(fp.name)})
+  return ports
 
 def _iter_local_files(root: Path, include: Optional[List[str]], exclude: Optional[List[str]], ignored_dirs: List[str]) -> Iterable[Path]:
-    """
-    Effektiv och portabel directory-walk med ignore-lista (utan att räkna bort symbolic links).
-    """
-    ignored = set(ignored_dirs or [])
-    for dirpath, dirnames, filenames in os.walk(root):
-        # Filtrera bort ignorerade kataloger in-place (för effektivitet)
-        dirnames[:] = [d for d in dirnames if d not in ignored and not d.startswith(".git")]
-        for fn in filenames:
-            yield Path(dirpath) / fn
+  ignored = set(ignored_dirs or [])
+  for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in ignored and not d.startswith(".git")]
+    for fn in filenames:
+      yield Path(dirpath) / fn
 
 def _match_globs(path: Path, root: Path, include: Optional[List[str]], exclude: Optional[List[str]]) -> bool:
-    from fnmatch import fnmatch
-    rel = str(path.relative_to(root)).replace("\\", "/")
-    if exclude:
-        for g in exclude:
-            if fnmatch(rel, g):
-                return False
-    if include:
-        return any(fnmatch(rel, g) for g in include)
-    # default: inkludera textfiler och relevanta mappar
-    if path.suffix.lower() in TEXT_EXTS:
-        return True
-    # prioritera källträd
-    if any(seg in SRC_DIR_HINTS for seg in Path(rel).parts) and path.suffix.lower() in {".js", ".jsx", ".ts", ".tsx", ".html", ".css"}:
-        return True
-    return False
+  from fnmatch import fnmatch
+  rel = str(path.relative_to(root)).replace("\\", "/")
+  if exclude:
+    for g in exclude:
+      if fnmatch(rel, g): return False
+  if include:
+    return any(fnmatch(rel, g) for g in include)
+  if path.suffix.lower() in TEXT_EXTS: return True
+  if any(seg in SRC_DIR_HINTS for seg in Path(rel).parts) and path.suffix.lower() in {".js", ".jsx", ".ts", ".tsx", ".html", ".css"}: return True
+  return False
 
 def _collect_files_local(manifest: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, Any], List[str]]:
-    root = Path(manifest["root_path"]).expanduser().resolve()
-    include = manifest.get("include") or None
-    exclude = (manifest.get("exclude") or []) + [f"{d}/**" for d in manifest.get("ignored_dirs", IGNORED_DIRS_DEFAULT)]
-    max_files = int(manifest.get("max_files", 2000))
-    max_file_bytes = int(manifest.get("max_file_bytes", 300_000))
+  root = Path(manifest["root_path"]).expanduser().resolve()
+  include = manifest.get("include") or None
+  exclude = (manifest.get("exclude") or []) + [f"{d}/**" for d in manifest.get("ignored_dirs", IGNORED_DIRS_DEFAULT)]
+  max_files = int(manifest.get("max_files", 2000))
+  max_file_bytes = int(manifest.get("max_file_bytes", 300_000))
 
-    files_map: Dict[str, str] = {}
-    limits = {"maxFileBytes": max_file_bytes, "maxFiles": max_files, "filesScanned": 0, "bytesScanned": 0, "truncated": 0, "ignored": list(set(IGNORED_DIRS_DEFAULT))}
-    warnings: List[str] = []
+  files_map: Dict[str, str] = {}
+  limits = {"maxFileBytes": max_file_bytes, "maxFiles": max_files, "filesScanned": 0, "bytesScanned": 0, "truncated": 0, "ignored": list(set(IGNORED_DIRS_DEFAULT))}
+  warnings: List[str] = []
 
-    # package.json läses separat (om finns)
-    pkg = {}
-    pkg_path = root / "package.json"
-    if pkg_path.exists():
-        txt, trunc = _read_text(pkg_path, max_file_bytes)
-        try:
-            pkg = json.loads(txt) if txt else {}
-        except Exception:
-            warnings.append("Kunde inte parsa package.json")
+  pkg = {}
+  pkg_path = root / "package.json"
+  if pkg_path.exists():
+    txt, _ = _read_text(pkg_path, max_file_bytes)
+    try: pkg = json.loads(txt) if txt else {}
+    except Exception: warnings.append("Kunde inte parsa package.json")
 
-    count = 0
-    for p in _iter_local_files(root, include, exclude, manifest.get("ignored_dirs", IGNORED_DIRS_DEFAULT)):
-        if count >= max_files:
-            warnings.append(f"Avbröt skanning: nådde max_files={max_files}")
-            break
-        if not _match_globs(p, root, include, exclude):
-            continue
-        # hoppa binärer/okända stora filer
-        if p.suffix.lower() not in TEXT_EXTS and p.name != "package.json":
-            continue
-        rel = str(p.relative_to(root)).replace("\\", "/")
-        text, truncated = _read_text(p, max_file_bytes)
-        if text == "" and p.name != "package.json":
-            continue
-        files_map[rel] = text
-        count += 1
-        limits["filesScanned"] = count
-        limits["bytesScanned"] += min(max_file_bytes, len(text.encode("utf-8", errors="ignore")))
-        if truncated:
-            limits["truncated"] += 1
+  count = 0
+  for p in _iter_local_files(root, include, exclude, manifest.get("ignored_dirs", IGNORED_DIRS_DEFAULT)):
+    if count >= max_files:
+      warnings.append(f"Avbröt skanning: nådde max_files={max_files}")
+      break
+    if not _match_globs(p, root, include, exclude): continue
+    if p.suffix.lower() not in TEXT_EXTS and p.name != "package.json": continue
+    rel = str(p.relative_to(root)).replace("\\", "/")
+    text, truncated = _read_text(p, max_file_bytes)
+    if text == "" and p.name != "package.json": continue
+    files_map[rel] = text
+    count += 1
+    limits["filesScanned"] = count
+    limits["bytesScanned"] += min(max_file_bytes, len(text.encode("utf-8", errors="ignore")))
+    if truncated: limits["truncated"] += 1
 
-    return files_map, {"pkg": pkg, "root": str(root)}, warnings
+  return files_map, {"pkg": pkg, "root": str(root)}, warnings
 
 def _collect_files_streamed(manifest: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, Any], List[str]]:
-    files_map: Dict[str, str] = {}
-    max_files = int(manifest.get("max_files", 2000))
-    max_file_bytes = int(manifest.get("max_file_bytes", 300_000))
-    limits = {"maxFileBytes": max_file_bytes, "maxFiles": max_files, "filesScanned": 0, "bytesScanned": 0, "truncated": 0, "ignored": list(set(IGNORED_DIRS_DEFAULT))}
-    warnings: List[str] = []
-    root = Path(manifest.get("root_path") or ".").resolve()
+  files_map: Dict[str, str] = {}
+  max_files = int(manifest.get("max_files", 2000))
+  max_file_bytes = int(manifest.get("max_file_bytes", 300_000))
+  limits = {"maxFileBytes": max_file_bytes, "maxFiles": max_files, "filesScanned": 0, "bytesScanned": 0, "truncated": 0, "ignored": list(set(IGNORED_DIRS_DEFAULT))}
+  warnings: List[str] = []
+  root = Path(manifest.get("root_path") or ".").resolve()
 
-    files = manifest.get("files") or []
-    if len(files) > max_files:
-        files = files[:max_files]
-        warnings.append(f"Beskar strömmade filer till max_files={max_files}")
+  files = manifest.get("files") or []
+  if len(files) > max_files:
+    files = files[:max_files]
+    warnings.append(f"Beskar strömmade filer till max_files={max_files}")
 
-    for f in files:
-        rel = f.get("path")
-        b64 = f.get("content_b64") or ""
-        try:
-            raw = base64.b64decode(b64)
-        except Exception:
-            continue
-        if len(raw) > max_file_bytes:
-            raw = raw[:max_file_bytes]
-            limits["truncated"] += 1
-        text = raw.decode("utf-8", errors="ignore")
-        files_map[rel] = text
-        limits["filesScanned"] += 1
-        limits["bytesScanned"] += len(raw)
+  for f in files:
+    rel = f.get("path")
+    b64 = f.get("content_b64") or ""
+    try: raw = base64.b64decode(b64)
+    except Exception: continue
+    if len(raw) > max_file_bytes:
+      raw = raw[:max_file_bytes]
+      limits["truncated"] += 1
+    text = raw.decode("utf-8", errors="ignore")
+    files_map[rel] = text
+    limits["filesScanned"] += 1
+    limits["bytesScanned"] += len(raw)
 
-    # extrahera package.json om närvarande
-    pkg = {}
-    if "package.json" in files_map:
-        try:
-            pkg = json.loads(files_map["package.json"])
-        except Exception:
-            warnings.append("Kunde inte parsa package.json (streamed)")
+  pkg = {}
+  if "package.json" in files_map:
+    try: pkg = json.loads(files_map["package.json"])
+    except Exception: warnings.append("Kunde inte parsa package.json (streamed)")
 
-    return files_map, {"pkg": pkg, "root": str(root)}, warnings
+  return files_map, {"pkg": pkg, "root": str(root)}, warnings
 
 def _to_iterable(files_map: Dict[str, str]) -> Iterable[Tuple[str, str]]:
-    for k, v in files_map.items():
-        yield k, v
+  for k, v in files_map.items(): yield k, v
 
 # ======== Celery Task =========
 
-@celery_app.task(name="backend.tasks.analyze.analyze_project", bind=True)
+@shared_task(name="backend.tasks.analyze.analyze_project", bind=True)
 def analyze_project(self, manifest: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Kör analys och returnerar {"project_model": {...}}.
-    """
-    mode = manifest.get("mode")
-    max_file_bytes = int(manifest.get("max_file_bytes", 300_000))
-    max_files = int(manifest.get("max_files", 2000))
+  mode = manifest.get("mode")
+  max_file_bytes = int(manifest.get("max_file_bytes", 300_000))
+  max_files = int(manifest.get("max_files", 2000))
 
-    if mode not in ("local_paths", "streamed_files"):
-        raise ValueError("Ogiltigt mode, använd 'local_paths' eller 'streamed_files'")
+  if mode not in ("local_paths", "streamed_files"):
+    raise ValueError("Ogiltigt mode, använd 'local_paths' eller 'streamed_files'")
 
-    if mode == "local_paths":
-        files_map, env, warns = _collect_files_local(manifest)
-        project_root = Path(env["root"])
-        pkg = env.get("pkg") or {}
-    else:
-        files_map, env, warns = _collect_files_streamed(manifest)
-        project_root = Path(env["root"])
-        pkg = env.get("pkg") or {}
+  if mode == "local_paths":
+    files_map, env, warns = _collect_files_local(manifest)
+  else:
+    files_map, env, warns = _collect_files_streamed(manifest)
 
-    # Manager/Framework/Scripts
-    manager, scripts = _detect_manager_and_scripts(pkg, project_root)
-    framework = _detect_framework(pkg)
+  project_root = Path(env["root"])
+  pkg = env.get("pkg") or {}
 
-    # Entry points
-    entry_points = _find_entry_points(project_root)
+  manager, scripts = _detect_manager_and_scripts(pkg, project_root)
+  config_hits = _detect_configs(project_root)
+  framework = _detect_framework(pkg, config_hits, project_root)
+  entry_points = _find_entry_points(project_root)
+  styling = _detect_styling(project_root, pkg, _to_iterable(files_map))
+  routing = _detect_routing(project_root, pkg, files_map)
 
-    # Styling
-    styling = _detect_styling(project_root, pkg, _to_iterable(files_map))
+  code_files = {rel: txt for rel, txt in files_map.items() if Path(rel).suffix.lower() in {".js", ".jsx", ".ts", ".tsx"}}
+  # komponentdetektering
+  comps: List[Dict[str, Any]] = []
+  for rel, text in code_files.items():
+    if not (RE_JSX_TAG.search(text) or RE_RETURNS_JSX.search(text)): continue
+    def _mk(name: str, export_type: str, params: str, kind: str) -> Dict[str, Any]:
+      has_props = bool(params and (("props" in params) or ("{" in params)))
+      prop_names: List[str] = []
+      if "{" in params and "}" in params:
+        inside = params.split("{", 1)[1].split("}", 1)[0]
+        for t in inside.split(","):
+          t = t.strip()
+          if t and ":" not in t and "=" not in t and "..." not in t:
+            prop_names.append(re.sub(r"\s.*$", "", t))
+      uses_tw = bool(RE_TW_CLASSNAME.search(text))
+      return {"name": name, "file": rel, "export": export_type, "kind": kind, "hasProps": has_props, "propNames": prop_names[:8], "usesTailwind": uses_tw}
+    for m in RE_EXPORT_DEFAULT_FN.finditer(text): comps.append(_mk(m.group(1), "default", m.group(2), "function"))
+    for m in RE_EXPORT_NAMED_FN.finditer(text):   comps.append(_mk(m.group(1), "named", m.group(2), "function"))
+    for m in RE_EXPORT_CONST.finditer(text):      comps.append(_mk(m.group(1), "named", m.group(2), "const"))
+    for m in RE_EXPORT_DEFAULT_ARROW.finditer(text):
+      base = Path(rel).stem
+      name = f"{base}DefaultExport"
+      comps.append(_mk(name, "default", m.group(1), "const"))
 
-    # Routing
-    routing = _detect_routing(project_root, pkg, files_map)
+  seen = set()
+  unique: List[Dict[str, Any]] = []
+  for c in comps:
+    key = (c["file"], c["name"], c["export"])
+    if key not in seen:
+      seen.add(key)
+      unique.append(c)
+  components = unique
 
-    # Komponenter
-    # Skanna endast JS/TS(X)
-    code_files = {rel: txt for rel, txt in files_map.items() if Path(rel).suffix.lower() in {".js", ".jsx", ".ts", ".tsx"}}
-    components = _detect_components(code_files)
+  inj_files = {rel: txt for rel, txt in files_map.items() if Path(rel).suffix.lower() in {".js", ".jsx", ".ts", ".tsx", ".html"}}
+  injection_points: List[Dict[str, Any]] = []
+  for rel, text in inj_files.items():
+    for i, line in enumerate(text.splitlines(), start=1):
+      m = RE_INJECT_TAG.search(line)
+      if m:
+        injection_points.append({"file": rel, "line": i, "tag": m.group(1)})
 
-    # Injection points
-    # Sök i .js/.ts/.tsx/.jsx/.html för att tillåta injektion i HTML också
-    inj_files = {rel: txt for rel, txt in files_map.items() if Path(rel).suffix.lower() in {".js", ".jsx", ".ts", ".tsx", ".html"}}
-    injection_points = _find_injection_points(inj_files)
+  limits = {
+    "maxFileBytes": max_file_bytes,
+    "maxFiles": max_files,
+    "filesScanned": len(files_map),
+    "bytesScanned": sum(len(v.encode("utf-8", errors="ignore")) for v in files_map.values()),
+    "truncated": 0,
+    "ignored": IGNORED_DIRS_DEFAULT,
+  }
 
-    limits = {
-        "maxFileBytes": max_file_bytes,
-        "maxFiles": max_files,
-        "filesScanned": len(files_map),
-        "bytesScanned": sum(len(v.encode("utf-8", errors="ignore")) for v in files_map.values()),
-        "truncated": 0,  # beräknas redan i collectors men icke-kritiskt att dubbelräkna
-        "ignored": IGNORED_DIRS_DEFAULT,
+  warnings = list(warns)
+  if framework == "unknown":
+    warnings.append("Kunde inte med säkerhet fastställa ramverk (ovanligt projekt eller saknade deps/config).")
+
+  # Körbarhetsledtrådar
+  run_candidates = _detect_run_candidates(scripts, manager, framework, config_hits, project_root)
+  env_ports = _parse_env_ports(project_root, max_file_bytes)
+
+  # Prefererad HTML (om finns)
+  preferred_html = entry_points["html"][0] if entry_points.get("html") else None
+
+  project_model: Dict[str, Any] = {
+    "manager": manager,
+    "framework": framework,
+    "scripts": scripts,
+    "entryPoints": entry_points,
+    "styling": styling,
+    "routing": routing,
+    "components": components,
+    "injectionPoints": injection_points,
+    "limits": limits,
+    "warnings": warnings,
+    "runHints": {
+      "candidates": run_candidates,
+      "ports": env_ports,
+      "configs": config_hits,
+      "preferredHtml": preferred_html,
     }
+  }
 
-    warnings = warns
-    if framework == "unknown":
-        warnings.append("Kunde inte med säkerhet fastställa ramverk (antingen saknas react/next i dependencies eller så är projektet ovanligt).")
-
-    project_model: Dict[str, Any] = {
-        "manager": manager,
-        "framework": framework,
-        "scripts": scripts,
-        "entryPoints": entry_points,
-        "styling": styling,
-        "routing": routing,
-        "components": components,
-        "injectionPoints": injection_points,
-        "limits": limits,
-        "warnings": warnings,
-    }
-
-    return {"project_model": project_model}
+  return {"project_model": project_model}

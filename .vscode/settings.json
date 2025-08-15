@@ -1,36 +1,30 @@
 {
-  // ───── Editor behaviour ─────
   "editor.formatOnSave": true,
   "editor.codeActionsOnSave": {
     "source.fixAll.eslint": "explicit"
   },
-
-  // ───── Python settings ─────
   "python.testing.pytestEnabled": true,
   "python.analysis.typeCheckingMode": "basic",
 
-  // << tell VS Code which interpreter to use >>
   "python.defaultInterpreterPath": "${workspaceFolder}/backend/.venv/Scripts/python.exe",
-
-  // << auto-activate that interpreter whenever a new terminal opens >>
   "python.terminal.activateEnvironment": true,
+  "python.envFile": "${workspaceFolder}/backend/.env",
 
-  // ───── File-tree cleanliness ─────
+  // Viktigt: peka på roten, inte ./backend
+  "python.analysis.extraPaths": ["${workspaceFolder}"],
+
   "files.exclude": {
     "**/__pycache__": true,
     "**/.venv": true,
     "**/node_modules": true
   },
 
-  // ───── Tailwind IntelliSense ─────
   "tailwindCSS.experimental.classRegex": [
     "tw`([^`]*)",
     "tw=\"([^\"]*)"
   ],
 
-  // ───── Terminal profile ─────
   "terminal.integrated.defaultProfile.windows": "Git Bash",
-  "python.analysis.extraPaths": [
-    "./backend/tasks"
-  ]
+  "python-envs.defaultEnvManager": "ms-python.python:system",
+  "python-envs.pythonProjects": []
 }
