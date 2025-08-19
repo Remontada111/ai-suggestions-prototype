@@ -12,7 +12,6 @@
 
   // Viktigt: peka på roten, inte ./backend
   "python.analysis.extraPaths": ["${workspaceFolder}"],
-
   "files.exclude": {
     "**/__pycache__": true,
     "**/.venv": true,

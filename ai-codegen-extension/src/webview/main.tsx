@@ -3,8 +3,10 @@
    React-panel för AI Figma Codegen – kompakt preview, centrerad, lightbox-
    toggle med mörknad bakgrund och stäng-kryss. Hög DPI även i zoomläge.
    + Mini-preview av användarens dev-server under Figma-kortet.
-   + [NY] Project Summary från backend-analys.
-   + [NY] Kandidat-förslag med “Acceptera förhandsvisning”.
+   + Project Summary från backend-analys (via postMessage).
+   + Kandidat-förslag med “Acceptera förhandsvisning”.
+   + 🔹 NYTT: Manuell projektväljare via “Välj projekt…” (cmd: chooseProject)
+   + 🔹 NYTT: Top-bar med status + snabbåtgärder.
    -------------------------------------------------------------------------- */
 
 /// <reference types="vite/client" />
@@ -23,12 +25,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Diff } from "unidiff";
-import stripAnsi from "strip-ansi";
 import "./index.css";
-
-// [NY] – Project Summary UI
-import ProjectSummary from "./components/ProjectSummary";
 
 /* ------------------------------------------------------- */
 /* 🛠  Typer                                               */
@@ -38,8 +35,8 @@ interface InitMessage {
   taskId?: string;
   fileKey: string;
   nodeId: string;
-  token?: string;       // nyckeln kan saknas → optional
-  figmaToken?: string;  // bakåtkompatibelt namn
+  token?: string;
+  figmaToken?: string;
 }
 
 interface DevUrlMessage {
@@ -64,12 +61,6 @@ interface FigmaImageApiRes {
   err?: string;
 }
 
-interface TaskRes {
-  status: "PENDING" | "STARTED" | "SUCCESS" | "FAILURE";
-  pr_url?: string;
-  diff?: string;
-}
-
 /* ------------------------------------------------------- */
 /* 🌐  VS Code WebView-API                                 */
 /* ------------------------------------------------------- */
@@ -89,17 +80,17 @@ function useFigmaImage(
   fileKey: string | null,
   nodeId:  string | null,
   token:   string | null,
-  scale:   number            // ← styr exportskala (2–4)
+  scale:   number
 ) {
   return useQuery<string>({
     enabled: !!fileKey && !!nodeId && !!token && !!scale,
     queryKey: ["figma-image", fileKey, nodeId, scale],
-    staleTime: 1000 * 60 * 60,        // 1 h
-    gcTime:    1000 * 60 * 60 * 24,   // 24 h
+    staleTime: 1000 * 60 * 60,
+    gcTime:    1000 * 60 * 60 * 24,
     retry: 1,
     queryFn: async () => {
       const capped = Math.max(1, Math.min(4, Math.round(scale)));
-      const url = `https://api.figma.com/v1/images/${fileKey}?ids=${nodeId}&format=png&scale=${capped}&use_absolute_bounds=true`;
+      const url = `https://api.figma.com/v1/images/${encodeURIComponent(fileKey!)}?ids=${encodeURIComponent(nodeId!)}&format=png&scale=${capped}&use_absolute_bounds=true`;
 
       const res = await fetch(url, { headers: { "X-Figma-Token": token! } });
       if (!res.ok) {
@@ -115,23 +106,37 @@ function useFigmaImage(
 }
 
 /* ------------------------------------------------------- */
-/*  Hook: Polla Celery-task                                */
+/* 🧩 Småhjälpare                                          */
 /* ------------------------------------------------------- */
-function useTask(taskId: string | null) {
-  return useQuery<TaskRes>({
-    enabled: !!taskId,
-    queryKey: ["task", taskId],
-    refetchInterval: 1500,
-    refetchIntervalInBackground: true,
-    queryFn: async () => {
-      const r = await fetch(`http://localhost:8000/task/${taskId}`);
-      if (!r.ok) {
-        const text = await r.text();
-        throw new Error(text);
-      }
-      return (await r.json()) as TaskRes;
-    },
-  });
+function postChooseProject() {
+  vscode.postMessage({ cmd: "chooseProject" });
+}
+
+function postAcceptCandidate() {
+  vscode.postMessage({ cmd: "acceptCandidate" });
+}
+
+async function copyToClipboard(text: string) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {}
+  try {
+    // Fallback
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    document.body.removeChild(ta);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /* ------------------------------------------------------- */
@@ -140,7 +145,6 @@ function useTask(taskId: string | null) {
 const AiPanel: React.FC = () => {
   /* --- Init ------------------------------------------ */
   const [initReceived, setInitReceived] = useState(false);
-  const [taskId, setTaskId]             = useState<string | null>(null);
   const [figmaInfo, setFigmaInfo]       = useState<{
     fileKey: string | null;
     nodeId:  string | null;
@@ -150,7 +154,7 @@ const AiPanel: React.FC = () => {
   // Mini-preview URL från extension (dev-servern)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
-  // [NY] Kandidat-förslag
+  // Kandidat-förslag
   const [proposal, setProposal] = useState<CandidateProposal | null>(null);
 
   useEffect(() => {
@@ -162,7 +166,6 @@ const AiPanel: React.FC = () => {
         const m = msg as InitMessage;
         const tok = m.token ?? m.figmaToken ?? null;
         setInitReceived(true);
-        setTaskId(m.taskId ?? null);
         setFigmaInfo({ fileKey: m.fileKey, nodeId: m.nodeId, token: tok });
         return;
       }
@@ -205,13 +208,6 @@ const AiPanel: React.FC = () => {
     error:     figmaErr,
   } = useFigmaImage(figmaInfo.fileKey, figmaInfo.nodeId, figmaInfo.token, effectiveScale);
 
-  const {
-    data: taskData,
-    isLoading: taskLoading,
-    isError:   taskError,
-    error:     taskErr,
-  } = useTask(taskId);
-
   /* --- Chat ------------------------------------------- */
   const [chat, setChat] = useState("");
 
@@ -239,7 +235,50 @@ const AiPanel: React.FC = () => {
   /* ----------------------------------------------------- */
   return (
     <div className="panel-root bg-background text-foreground">
-      {/* ————— Figma kompakt preview (centrerad, högt upp) ————— */}
+      {/* ————— Top-bar: status + snabbåtgärder ————— */}
+      <div className="px-4 pt-3">
+        <Card>
+          <CardContent className="py-3">
+            <div className="flex items-center gap-2">
+              <div className="flex-1 min-w-0">
+                <div className="text-xs opacity-70">Förhandsvisning</div>
+                <div className="text-xs break-all">
+                  {previewUrl ?? "Väntar på URL …"}
+                </div>
+              </div>
+              <Button
+                onClick={() => postChooseProject()}
+                aria-label="Välj projekt manuellt"
+                title="Välj projekt manuellt"
+              >
+                Välj projekt…
+              </Button>
+              {previewUrl && (
+                <Button
+                  onClick={async () => {
+                    const ok = await copyToClipboard(previewUrl);
+                    if (ok) {
+                      // enkel visuell feedback
+                      console.log("Kopierad:", previewUrl);
+                    }
+                  }}
+                  aria-label="Kopiera förhandsvisningslänk"
+                  title="Kopiera förhandsvisningslänk"
+                >
+                  Kopiera länk
+                </Button>
+              )}
+            </div>
+            {initReceived && !figmaInfo.token && (
+              <p className="mt-2 text-[11px] text-destructive">
+                ⚠️ Ingen Figma-token – ställ in <em>aiFigmaCodegen.figmaToken</em> i Inställningar.
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* ————— Figma kompakt preview (centrerad) ————— */}
       <div className="preview-shell">
         <div
           className={`preview-grid ${figmaUrl ? "is-ready" : "is-loading"}`}
@@ -255,18 +294,12 @@ const AiPanel: React.FC = () => {
             }
           }}
         >
-          {initReceived && !figmaInfo.token && (
-            <p className="text-destructive text-sm">⚠️ Ingen Figma-token – kontrollera inställningen.</p>
-          )}
-
           {figmaLoading && <p className="text-sm opacity-70">Laddar …</p>}
-
           {figmaError && (
             <p className="text-destructive text-sm">
               {(figmaErr as Error).message}
             </p>
           )}
-
           {figmaUrl && (
             <img
               src={figmaUrl}
@@ -281,7 +314,7 @@ const AiPanel: React.FC = () => {
         </div>
       </div>
 
-      {/* ————— [NY] Föreslagen kandidat (Acceptera) ————— */}
+      {/* ————— Föreslagen kandidat (Acceptera / Välj projekt…) ————— */}
       {proposal && (
         <div className="px-4 mt-3">
           <Card>
@@ -290,14 +323,14 @@ const AiPanel: React.FC = () => {
             </CardHeader>
             <CardContent>
               <p className="text-sm mb-2">
-                <b>{proposal.label}</b><br />
-                <span className="opacity-80">{proposal.description}</span><br />
-                <span className="opacity-60">{proposal.dir}</span>
+                <b className="block">{proposal.label}</b>
+                <span className="opacity-80 block">{proposal.description}</span>
+                <span className="opacity-60 block">{proposal.dir}</span>
               </p>
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
                 <Button
                   onClick={() => {
-                    vscode.postMessage({ cmd: "acceptCandidate" });
+                    postAcceptCandidate();
                     setProposal(null); // dölj rutan när vi startar
                   }}
                 >
@@ -305,9 +338,15 @@ const AiPanel: React.FC = () => {
                 </Button>
                 <Button
                   className="btn-secondary"
+                  onClick={() => postChooseProject()}
+                >
+                  Välj projekt…
+                </Button>
+                <Button
+                  className="btn-ghost"
                   onClick={() => setProposal(null)}
                 >
-                  Avbryt
+                  Göm
                 </Button>
               </div>
             </CardContent>
@@ -315,7 +354,7 @@ const AiPanel: React.FC = () => {
         </div>
       )}
 
-      {/* ————— Mini-preview av hela projektet (iframe) ————— */}
+      {/* ————— Mini-preview av projektet (iframe) ————— */}
       {previewUrl && (
         <div
           className="mt-3 mx-auto w-full max-w-[340px] rounded-xl overflow-hidden"
@@ -330,14 +369,21 @@ const AiPanel: React.FC = () => {
             className="block w-full h-[240px] border-0"
             sandbox="allow-scripts allow-forms allow-same-origin"
           />
-          <p className="px-2 py-1 text-xs opacity-70 break-all">{previewUrl}</p>
+          <div className="flex items-center justify-between px-2 py-1">
+            <p className="text-xs opacity-70 break-all mr-2">{previewUrl}</p>
+            <Button
+              className="h-6 px-2 text-xs"
+              onClick={async () => {
+                if (!previewUrl) return;
+                const ok = await copyToClipboard(previewUrl);
+                if (ok) console.log("Kopierad:", previewUrl);
+              }}
+            >
+              Kopiera
+            </Button>
+          </div>
         </div>
       )}
-
-      {/* ————— [NY] Project Summary (analysresultat) ————— */}
-      <div className="px-4 mt-3">
-        <ProjectSummary />
-      </div>
 
       {/* ————— Lightbox / zoomläge ————— */}
       {zoomed && (
@@ -365,41 +411,7 @@ const AiPanel: React.FC = () => {
         </div>
       )}
 
-      {/* ————— Resten av panelen (status + chat) ————— */}
-      {!taskId ? (
-        <p className="px-4">⏳ Initierar panel …</p>
-      ) : taskLoading ? (
-        <p className="px-4">⏳ Startar AI-pipen …</p>
-      ) : taskError ? (
-        <p className="px-4 text-destructive">{(taskErr as Error).message}</p>
-      ) : (
-        <>
-          <Card className="mt-3 mx-4">
-            <CardHeader><CardTitle>Status</CardTitle></CardHeader>
-            <CardContent>
-              <p className="mb-2 font-mono">{taskData!.status}</p>
-              {taskData!.diff && (
-                <pre className="whitespace-pre-wrap rounded-md bg-muted p-2 text-sm overflow-auto">
-                  {stripAnsi(Diff.colorLines(taskData!.diff))}
-                </pre>
-              )}
-            </CardContent>
-          </Card>
-
-          {taskData!.pr_url && (
-            <div className="px-4">
-              <Button
-                className="w-full mt-2"
-                onClick={() => vscode.postMessage({ cmd: "openPR", url: taskData!.pr_url })}
-              >
-                📦 Öppna Pull Request
-              </Button>
-            </div>
-          )}
-        </>
-      )}
-
-      {/* Chat */}
+      {/* ————— Chat ————— */}
       <div className="flex gap-2 px-4 py-3">
         <input
           type="text"

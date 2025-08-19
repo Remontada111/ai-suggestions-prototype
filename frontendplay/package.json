@@ -1,0 +1,17 @@
+{
+  "name": "frontendplay",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.102.0"
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 0",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 0"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0"
+  }
+}

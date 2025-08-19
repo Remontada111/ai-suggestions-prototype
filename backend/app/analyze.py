@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-# backend/app/routes/analyze.py
+# backend/app/analyze.py
 
 from typing import List, Literal, Optional, Dict, Any, cast
 
 from pydantic import BaseModel, Field, model_validator
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from celery import Celery
 from celery import current_app as celery_current_app
 from celery.result import AsyncResult
@@ -61,6 +61,8 @@ class AnalyzeManifest(BaseModel):
 
 class AnalyzeStartResponse(BaseModel):
     task_id: str
+    # Fix B: backend returnerar en absolut poll-URL som extensionen kan använda direkt.
+    poll_url: Optional[str] = None
 
 class AnalyzeStatusResponse(BaseModel):
     status: str
@@ -70,9 +72,9 @@ class AnalyzeStatusResponse(BaseModel):
 # ==== Endpoints ====
 
 @router.post("", response_model=AnalyzeStartResponse)
-def start_analysis(manifest: AnalyzeManifest):
+def start_analysis(manifest: AnalyzeManifest, request: Request):
     """
-    Startar asynkron projektanalys. Returnerar Celery task_id.
+    Startar asynkron projektanalys. Returnerar Celery task_id och absolut poll_url.
     """
     try:
         task = celery_app.send_task(
@@ -81,7 +83,10 @@ def start_analysis(manifest: AnalyzeManifest):
         )
     except Exception as e:  # pragma: no cover - robust felhantering
         raise HTTPException(status_code=500, detail=f"Kunde inte queue:a analyze_task: {e}")
-    return AnalyzeStartResponse(task_id=task.id)
+
+    # Bygg absolut URL till status-endpointen så frontend slipper gissa.
+    poll_url = request.url_for("get_analysis", task_id=task.id)
+    return AnalyzeStartResponse(task_id=task.id, poll_url=str(poll_url))
 
 @router.get("/{task_id}", response_model=AnalyzeStatusResponse)
 def get_analysis(task_id: str):

@@ -3,11 +3,10 @@ from __future__ import annotations
 """
 AI-driven PR-bot – FastAPI gateway
 
-Tar emot Figma-payload, startar Celery-tasken *integrate_figma_node*
-och exponerar en polling-endpoint som lämnar tillbaka PR-URL när arbetet är klart.
+Kör så här (från projektroten):
+    uvicorn backend.app.main:app --reload
 """
 
-# ── Standard- & tredjepartsbibliotek ───────────────────────────────────────
 import logging
 import os
 from pathlib import Path
@@ -17,7 +16,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-# ── Ladda .env TIDIGT (innan imports som läser miljövariabler) ────────────
+# ── Ladda .env TIDIGT ─────────────────────────────────────────────────────
 BACKEND_DIR = Path(__file__).resolve().parents[1]   # .../backend
 ENV_PATH = BACKEND_DIR / ".env"
 load_dotenv(ENV_PATH, override=True)
@@ -31,37 +30,51 @@ if not all([GH_TOKEN, FIGMA_TOKEN, TARGET_REPO]):
         f"Saknade env-variabler. Förväntade i {ENV_PATH} minst GH_TOKEN, FIGMA_TOKEN, TARGET_REPO."
     )
 
-# ── Nu är env laddad; importera saker som kräver den ──────────────────────
-from ..tasks.codegen import integrate_figma_node  # noqa: E402
+# ── Importer som kräver att paketstrukturen stämmer ───────────────────────
+# Viktigt: kör Uvicorn som uvicorn backend.app.main:app --reload
+from backend.tasks.codegen import integrate_figma_node  # noqa: E402
 
-# Valfri Analyze-router (om backend/app/analyze.py exponerar `router`)
-analyze_router = None
+# ✅ Importera analyzern från samma mapp (backend/app/analyze.py)
 try:
-    from .analyze import router as _analyze_router  # type: ignore  # noqa: E402
-    analyze_router = _analyze_router
-except Exception as e:  # pragma: no cover
-    logging.getLogger(__name__).warning("Analyze-router kunde inte importeras: %s", e)
+    from .analyze import router as analyze_router  # noqa: E402
+except Exception as e:
+    raise RuntimeError(
+        "Kunde inte importera analyze-routern från backend.app.analyze.\n"
+        "Kontrollera att 'backend/__init__.py' och 'backend/app/__init__.py' finns (kan vara tomma),\n"
+        "samt att backend/app/analyze.py exponerar 'router'."
+    ) from e
 
 # ── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-pr-bot")
 
-# ── FastAPI-instans + CORS ────────────────────────────────────────────────
+# ── FastAPI + CORS ────────────────────────────────────────────────────────
 app = FastAPI(title="AI PR-bot")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # begränsa vid behov i prod
+    allow_origins=["*"],      # begränsa i prod
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Inkludera Analyze-routern om den fanns
-if analyze_router:
-    app.include_router(analyze_router, prefix="/analyze", tags=["analyze"])
-else:
-    logger.info("Startar utan analyze-router (backend/app/analyze.py med `router` saknas eller kunde inte importeras).")
+# Inkludera analyzern (Fix A: inget extra prefix – routern har redan "/analyze")
+app.include_router(analyze_router)
 
-# ── Typ-hjälp ─────────────────────────────────────────────────────────────
+# ── Logga alla rutter vid uppstart (hjälper felsöka 404) ──────────────────
+@app.on_event("startup")
+async def _log_routes() -> None:  # pragma: no cover
+    try:
+        lines = []
+        for r in app.router.routes:
+            methods = ",".join(sorted(getattr(r, "methods", []) or []))
+            path = getattr(r, "path", "")
+            name = getattr(r, "name", "")
+            lines.append(f"{methods:15s} {path:40s} → {name}")
+        logger.info("Registrerade rutter:\n" + "\n".join(lines))
+    except Exception as e:
+        logger.warning("Kunde inte lista rutter: %s", e)
+
+# ── Typer ─────────────────────────────────────────────────────────────────
 class Payload(TypedDict):
     fileKey: str
     nodeId: str
@@ -74,10 +87,6 @@ async def healthz() -> Dict[str, str]:
 # ── POST /figma-hook ──────────────────────────────────────────────────────
 @app.post("/figma-hook")
 async def figma_hook(payload: Payload) -> Dict[str, Any]:
-    """
-    Initierar Celery-jobbet *integrate_figma_node* och returnerar task-ID
-    som frontend kan polla via /task/{id}.
-    """
     file_key = payload.get("fileKey")
     node_id = payload.get("nodeId")
     if not (file_key and node_id):
@@ -89,15 +98,9 @@ async def figma_hook(payload: Payload) -> Dict[str, Any]:
 # ── GET /task/{task_id} ───────────────────────────────────────────────────
 @app.get("/task/{task_id}")
 async def task_status(task_id: str) -> Dict[str, Any]:
-    """
-    Returnerar Celery-status (PENDING, STARTED, SUCCESS, FAILURE …) och,
-    vid SUCCESS, PR-URL från task-resultatet.
-    """
     result = integrate_figma_node.AsyncResult(task_id)
     status: str = result.state
-
     response: Dict[str, Any] = {"status": status}
-
     if status == "SUCCESS":
         if isinstance(result.result, dict):
             pr_url = result.result.get("pr_url")
@@ -105,5 +108,4 @@ async def task_status(task_id: str) -> Dict[str, Any]:
                 response["pr_url"] = pr_url
     elif status == "FAILURE":
         response["error"] = str(result.result)
-
     return response
