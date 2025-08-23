@@ -5,8 +5,15 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as http from "node:http";
 import * as https from "node:https";
+
 import { detectProjects, Candidate } from "./detector";
 import { runDevServer, stopDevServer, runInlineStaticServer, stopInlineServer } from "./runner";
+
+// ⬇️ ML: ladda eventuell modell (faller tillbaka till heuristik om ingen finns)
+import { loadModelIfAny } from "./ml/classifier";
+
+// ⬇️ Dataset-export (för träning senare)
+import { exportDatasetCommand } from "./commands/exportDataset";
 
 let currentPanel: vscode.WebviewPanel | undefined;
 
@@ -91,6 +98,25 @@ function normalizeDevCmdPorts(raw: string): string {
   if (/\bstorybook\b/.test(cmd) && !/\s(-p|--port)\s+\d+/.test(cmd)) cmd += " --port 0";
 
   return cmd;
+}
+
+/** Hitta modellfil i vanliga lägen (roten, dist/, eller relativt __dirname). */
+function resolveBundledModelPath(context: vscode.ExtensionContext): string | undefined {
+  const cand: string[] = [
+    // extension-rot (rekommenderat): <extRoot>/ml_artifacts/frontend-detector-gbdt.json
+    path.resolve(context.asAbsolutePath("."), "ml_artifacts", "frontend-detector-gbdt.json"),
+    // om du kopierar artefakter in i dist/
+    path.resolve(context.asAbsolutePath("."), "dist", "ml_artifacts", "frontend-detector-gbdt.json"),
+    // relativt transpilerad fil
+    path.resolve(__dirname, "..", "ml_artifacts", "frontend-detector-gbdt.json"),
+    path.resolve(__dirname, "..", "..", "ml_artifacts", "frontend-detector-gbdt.json"),
+  ];
+  for (const p of cand) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch { /* ignore */ }
+  }
+  return undefined;
 }
 
 /* ─────────────────────────────────────────────────────────
@@ -673,6 +699,18 @@ function basicFallbackHtml(webview: vscode.Webview): string {
 export async function activate(context: vscode.ExtensionContext) {
   log("Aktiverar extension …");
 
+  // 🔹 Ladda ML-modell (om finns) – annars faller systemet tillbaka till heuristik
+  const bundledModelPath = resolveBundledModelPath(context);
+  if (bundledModelPath) {
+    log("Försöker ladda bundlad ML-modell:", bundledModelPath);
+  } else {
+    log("Ingen bundlad ML-modell hittades (detta är OK för MVP).");
+  }
+  loadModelIfAny({
+    globalStoragePath: context.globalStorageUri.fsPath, // användarspecifik modell tar företräde om finns
+    bundledModelPath,
+  });
+
   // 🔹 Statusrads-knapp för snabb åtkomst till manuell projektväljare
   statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusItem.text = "$(rocket) Preview";
@@ -681,6 +719,7 @@ export async function activate(context: vscode.ExtensionContext) {
   statusItem.show();
   context.subscriptions.push(statusItem);
 
+  // 🔹 Huvudflöde: scanna + föreslå/starta
   const scanCmd = vscode.commands.registerCommand("ai-figma-codegen.scanAndPreview", async () => {
     try {
       log("scanAndPreview: söker kandidater …");
@@ -719,6 +758,7 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   });
 
+  // 🔹 Öppna panel och auto-föreslå
   const openCmd = vscode.commands.registerCommand("ai-figma-codegen.openPanel", async () => {
     log("openPanel: öppnar/hämtar panel …");
     const panel = ensurePanel(context);
@@ -741,11 +781,25 @@ export async function activate(context: vscode.ExtensionContext) {
     panel.reveal(vscode.ViewColumn.Two);
   });
 
-  // 🔹 Kommando – öppna manuell projektväljare
+  // 🔹 Manuell projektväljare
   const chooseCmd = vscode.commands.registerCommand("ai-figma-codegen.chooseProject", async () => {
     await showProjectQuickPick(context);
   });
 
+  // 🔹 Exportera dataset för ML-träning (JSONL)
+  const exportCmd = vscode.commands.registerCommand(
+    "ai-figma-codegen.exportFrontendDetectorDataset",
+    async () => {
+      try {
+        await exportDatasetCommand();
+      } catch (e: any) {
+        errlog("ExportDataset fel:", e?.message || String(e));
+        vscode.window.showErrorMessage(`ExportDataset misslyckades: ${e?.message || String(e)}`);
+      }
+    }
+  );
+
+  // 🔹 URI-handler (ex. deep-link från annan app)
   const uriHandler = vscode.window.registerUriHandler({
     handleUri: async (uri: vscode.Uri) => {
       try {
@@ -786,7 +840,7 @@ export async function activate(context: vscode.ExtensionContext) {
     },
   });
 
-  context.subscriptions.push(scanCmd, openCmd, chooseCmd, uriHandler);
+  context.subscriptions.push(scanCmd, openCmd, chooseCmd, exportCmd, uriHandler);
   log("Extension aktiverad.");
 }
 

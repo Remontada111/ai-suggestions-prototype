@@ -1,15 +1,21 @@
-// extension/src/detector.ts
+// src/detector.ts
 // Extremt robust kandidatdetektering för frontend-projekt.
-// - Skannar workspace + “lösa” rötter (+ monorepo: workspaces/lerna/nx)
-// - Djup HTML-detektion (index.html i hela trädet, prioriterar rot)
-// - Deterministisk poäng-/rangordningsmodell
-// - Smart ignorering av buller (node_modules m.fl. – men tar dem som signal om deps)
+// Förbättringar (MVP++ + ML-integration):
+// - Intent-medveten HTML-detektion (root/public boost, src/tests/examples penalties)
+// - DOM-signalering från entry-filer (React/Vue/Svelte/Angular/#app)
+// - Lättviktiga overrides via frontend.detector.json
+// - ML (GBDT) ovanpå heuristiken: bygger FeatureVector → p(frontend) → kombinerar score
+// - Bibehåller monorepo-stöd, cache, deterministisk rangordning och fallbacks
 
 import * as vscode from "vscode";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import fg from "fast-glob"; // npm i fast-glob
 import YAML from "yaml";    // npm i yaml
+
+// ⬇️ ML-importer
+import { buildFeatureVector, type HtmlIntent, type DomIntent } from "./ml/features";
+import { predictFrontendProb, combineHeuristicAndML } from "./ml/classifier";
 
 /** Kandidat-projekt vi kan försöka köra/förhandsvisa */
 export type Candidate = {
@@ -27,6 +33,8 @@ export type Candidate = {
   runCandidates?: { name?: string; cmd: string; source: string }[];
   configHints?: string[];
 };
+
+type Overrides = { forceInclude?: string[]; forceExclude?: string[] };
 
 const IGNORE_GLOBS =
   "**/{node_modules,dist,dist-webview,build,out,.next,.svelte-kit,.output,.git,coverage,.venv,venv,__pycache__}/**";
@@ -132,26 +140,31 @@ function* walk(dir: string, maxDepth = 5): Generator<string> {
   }
 }
 
-/** Hitta djup HTML – prioriterar rot/index.html, annars närmast roten */
+/** Intent-medveten HTML-sökning – prioriterar rot/public och nedvärderar src/tests/examples */
 async function findAnyHtmlDeep(dir: string): Promise<string | undefined> {
   const ignore = [
-    "**/node_modules/**","**/dist/**","**/build/**","**/out/**","**/.next/**",
-    "**/.svelte-kit/**","**/.output/**","**/.git/**","**/coverage/**",
-    "**/.venv/**","**/venv/**","**/__pycache__/**","**/dist-webview/**",
+    "**/node_modules/**", "**/dist/**", "**/build/**", "**/out/**", "**/.next/**",
+    "**/.svelte-kit/**", "**/.output/**", "**/.git/**", "**/coverage/**",
+    "**/.venv/**", "**/venv/**", "**/__pycache__/**", "**/dist-webview/**",
   ];
 
   const rootIdx = path.join(dir, "index.html");
   if (fs.existsSync(rootIdx)) return "index.html";
 
-  // Begränsa antal för performance (räcker gott för ranking)
   const hits = await fg(["**/*.html"], { cwd: dir, absolute: false, dot: false, ignore });
   if (!hits.length) return undefined;
 
+  const PENALIZE = /(\/|^)(src|test|tests|__tests__|example|examples|demo|demos|tools|scripts)(\/|$)/i;
+
   const score = (rel: string) => {
     const norm = rel.replace(/\\/g, "/");
-    const isIndex = path.basename(norm).toLowerCase() === "index.html";
+    const base = path.basename(norm).toLowerCase();
+    const isIndex = base === "index.html";
     const depth = norm.split("/").length;
-    return (isIndex ? 1000 : 0) - depth; // större = bättre
+    let s = (isIndex ? 1000 : 0) - depth; // större = bättre
+    if (norm === "public/index.html") s += 25; // vanligt i CRA m.fl.
+    if (PENALIZE.test(norm)) s -= 50;        // t.ex. src/index.html som transpile-harness
+    return s;
   };
 
   hits.sort((a, b) => score(b) - score(a));
@@ -189,34 +202,16 @@ function findEntryFile(dir: string): string | undefined {
 /** Upptäck konfigurationsfiler som indikerar frontend */
 function detectConfigs(dir: string): string[] {
   const names = [
-    "vite.config.ts",
-    "vite.config.js",
-    "vite.config.mjs",
-    "vite.config.cjs",
-    "next.config.js",
-    "next.config.mjs",
-    "next.config.ts",
-    "svelte.config.js",
-    "svelte.config.mjs",
-    "svelte.config.ts",
-    "nuxt.config.ts",
-    "nuxt.config.js",
-    "nuxt.config.mjs",
-    "remix.config.js",
-    "remix.config.mjs",
-    "remix.config.ts",
-    "solid.config.ts",
-    "solid.config.js",
-    "astro.config.mjs",
-    "astro.config.ts",
-    "astro.config.js",
+    "vite.config.ts","vite.config.js","vite.config.mjs","vite.config.cjs",
+    "next.config.js","next.config.mjs","next.config.ts",
+    "svelte.config.js","svelte.config.mjs","svelte.config.ts",
+    "nuxt.config.ts","nuxt.config.js","nuxt.config.mjs",
+    "remix.config.js","remix.config.mjs","remix.config.ts",
+    "solid.config.ts","solid.config.js",
+    "astro.config.mjs","astro.config.ts","astro.config.js",
     "angular.json",
-    "webpack.config.js",
-    "webpack.dev.js",
-    "webpack.dev.mjs",
+    "webpack.config.js","webpack.dev.js","webpack.dev.mjs",
     "storybook.config.js",
-    "main.ts",
-    "main.js",
   ];
   const hits: string[] = [];
   for (const n of names) {
@@ -262,8 +257,7 @@ function buildRunCandidates(
   if (configHints.includes("angular.json")) push("npx -y ng serve", "angular.json");
   if (configHints.some((x) => x.startsWith("webpack"))) push("npx -y webpack serve", "webpack config");
 
-  // Sista utväg: statisk server
-  // (findAnyHtmlDeep sköts i makeCandidateForDir → här räcker det att ha fallback)
+  // Sista utväg: statisk server – endast om index.html i roten
   const html = fs.existsSync(path.join(dir, "index.html")) ? "index.html" : undefined;
   if (html) push("npx -y http-server -p 0", `static (${html})`);
 
@@ -337,45 +331,81 @@ function readGitignore(root: string): string[] {
     .filter((l) => l && !l.startsWith("#"));
 }
 
-/** Enumerera paketmappar i ett (potentiellt) monorepo via workspaces/lerna/nx. */
-async function enumerateWorkspacePackageDirs(root: string): Promise<string[]> {
-  const pkg = readJson(path.join(root, "package.json")) || {};
-  const ws = readWorkspacesFromPkg(pkg);
-  const pnpm = parsePnpmWorkspaceYaml(path.join(root, "pnpm-workspace.yaml"));
-  const lerna = readLernaPackages(root);
-  const nx = readNxProjects(root);
+/** AST-lös, snabb HTML-intent-inspektion */
+function inspectHtmlIntent(
+  dir: string,
+  relHtml: string
+): HtmlIntent {
+  const hints: string[] = [];
+  let score = 0;
+  const htmlPath = path.join(dir, relHtml);
+  const html = readText(htmlPath) ?? "";
 
-  const patterns = [...ws, ...pnpm, ...lerna]
-    .map((p) => p.replace(/\\/g, "/"))
-    .map((p) => (p.endsWith("/") ? p : p + "/"))
-    .map((p) => p + "package.json");
+  const normRel = relHtml.replace(/\\/g, "/");
+  if (normRel === "index.html") { score += 6; hints.push("html@root"); }
+  if (normRel === "public/index.html") { score += 5; hints.push("html@public"); }
+  if (/(^|\/)(src|test|tests|examples?|demos?|tools|scripts)\/index\.html$/i.test(normRel)) {
+    score -= 6; hints.push("html@likely-harness");
+  }
 
-  const ignore = [
-    "**/node_modules/**",
-    "**/dist/**",
-    "**/dist-webview/**",
-    "**/build/**",
-    "**/out/**",
-    "**/.next/**",
-    "**/.svelte-kit/**",
-    "**/.output/**",
-    "**/.git/**",
-    "**/coverage/**",
-    "**/.venv/**",
-    "**/venv/**",
-    "**/__pycache__/**",
-  ];
-  ignore.push(...readGitignore(root));
+  if (/\bid=["']app["']\b/i.test(html)) { score += 2; hints.push("html#app"); }
+  if (/\b\/@vite\/client\b/.test(html)) { score += 4; hints.push("html@vite"); }
 
-  const files = patterns.length ? await fg(patterns, { cwd: root, absolute: true, dot: false, ignore }) : [];
-
-  const fromPatterns = files.map((f) => path.dirname(f));
-  const fromNx = nx.map((d) => path.resolve(root, d));
-
-  return Array.from(new Set([...fromPatterns, ...fromNx]));
+  // <script type="module" src="...">
+  const m = html.match(/<script[^>]*type=["']module["'][^>]*src=["']([^"']+)["'][^>]*>/i);
+  if (m?.[1]) {
+    const srcRaw = m[1];
+    const src = srcRaw.replace(/^\.\//, "");
+    hints.push(`html:script=${src}`);
+    if (/\.(jsx?|tsx?)$/i.test(src)) { score += 2; }
+    if (/\.ts$/i.test(src)) { score -= 2; hints.push("ts-in-html"); } // ofta transpile-harness
+    const p = path.join(dir, src);
+    if (fs.existsSync(p)) { hints.push("entry:from-html"); score += 1; }
+    return { score, hints };
+  }
+  return { score, hints };
 }
 
-/** Poängsätt kandidat (deterministisk ranking) */
+/** Snabb DOM-signal i entry-filen */
+function inspectEntryDom(dir: string, relEntry?: string): DomIntent {
+  if (!relEntry) return { score: 0, hints: [] };
+  const p = path.join(dir, relEntry);
+  const code = readText(p) ?? "";
+  let score = 0; const hints: string[] = [];
+
+  const tests: Array<[RegExp, string, number]> = [
+    [/document\.getElementById\s*\(\s*["']app["']\s*\)/i, "dom:#app", 2],
+    [/ReactDOM\.(createRoot|render)\s*\(/, "dom:react", 3],
+    [/\bcreateApp\s*\(.*\)\.mount\s*\(/i, "dom:vue", 3],
+    [/\bnew\s+Vue\s*\(.*\)\s*\.\$mount\s*\(/i, "dom:vue2", 2],
+    [/\bnew\s+App\s*\(\s*{[^}]*target\s*:/i, "dom:svelte", 3],
+    [/\bangular\.bootstrap\b/i, "dom:angular", 2],
+  ];
+  for (const [rx, tag, pts] of tests) {
+    if (rx.test(code)) { score += pts; hints.push(tag); }
+  }
+  return { score, hints };
+}
+
+/** Läs overrides i repo-rot (frivilligt) */
+function readOverrides(root: string): Overrides {
+  const j = readJson(path.join(root, "frontend.detector.json"));
+  return (j && typeof j === "object") ? (j as Overrides) : {};
+}
+
+/** Hjälp: matcha override mot ett kandidatdir */
+function overrideMatches(root: string, candDir: string, tag: string): boolean {
+  const rel = path.relative(root, candDir).replace(/\\/g, "/");
+  const normTag = tag.replace(/^[.\/]+/, "");
+  return (
+    rel === normTag ||
+    rel.startsWith(normTag + "/") ||
+    path.basename(candDir) === normTag ||
+    path.resolve(root, normTag) === path.resolve(candDir)
+  );
+}
+
+/** Poängsätt kandidat (deterministisk ranking, baspoäng) */
 function scoreCandidate(
   dir: string,
   pkg: any,
@@ -446,21 +476,52 @@ async function makeCandidateForDir(dir: string, excludeAbsDirs: string[]): Promi
               : undefined;
 
   const entryHtml = await findAnyHtmlDeep(dir);
-  const entryFile = findEntryFile(dir);
+  const entryFileDetected = findEntryFile(dir);
 
-  const { score, reasons } = scoreCandidate(dir, pkg, configHints, entryHtml, entryFile);
-  if (score <= -9999) return null;
+  // Intent från HTML + dom-signal
+  const htmlIntent = entryHtml ? inspectHtmlIntent(dir, entryHtml) : { score: 0, hints: [] as string[] };
+  let finalEntryFile = entryFileDetected;
+  const domIntent = inspectEntryDom(dir, finalEntryFile);
+
+  // Baspoäng
+  const base = scoreCandidate(dir, pkg, configHints, entryHtml, finalEntryFile);
+  if (base.score <= -9999) return null;
+
+  // Extra heuristikpoäng (HTML/DOM)
+  const heuristicExtra = htmlIntent.score + domIntent.score;
+  let heuristicFinal = base.score + heuristicExtra;
+
+  // ⬇️ ML: bygg feature-vektor och prediktera p(frontend)
+  const fv = buildFeatureVector({
+    dir,
+    pkg,
+    configHints,
+    entryHtml,
+    entryFile: finalEntryFile,
+    heuristicBaseScore: base.score,
+    htmlIntent,
+    domIntent,
+  });
+
+  const mlProb = predictFrontendProb(fv); // null om ingen modell laddad
+  if (mlProb != null) {
+    // Kombinera heuristikscore + ML-prob. Default weight=10 ⇒ ±5 poäng kring 0.5
+    heuristicFinal = combineHeuristicAndML(heuristicFinal, mlProb, { weight: 10 });
+  }
+
+  const reasons = [...base.reasons, ...htmlIntent.hints, ...domIntent.hints];
+  if (mlProb != null) reasons.push(`ml:p=${mlProb.toFixed(3)}`);
 
   const cand: Candidate = {
     dir,
     manager,
     devCmd,
     framework,
-    confidence: score,
+    confidence: heuristicFinal,
     reason: reasons,
     pkgName: pkg?.name,
     entryHtml,
-    entryFile,
+    entryFile: finalEntryFile,
     runCandidates: buildRunCandidates(pkg, dir, manager, framework, configHints),
     configHints,
   };
@@ -484,10 +545,51 @@ function cmp(a: Candidate, b: Candidate) {
   try { return fs.statSync(b.dir).mtimeMs - fs.statSync(a.dir).mtimeMs; } catch { return 0; }
 }
 
+/** Enumerera paketmappar i ett (potentiellt) monorepo via workspaces/lerna/nx. */
+async function enumerateWorkspacePackageDirs(root: string): Promise<string[]> {
+  const pkg = readJson(path.join(root, "package.json")) || {};
+  const ws = readWorkspacesFromPkg(pkg);
+  const pnpm = parsePnpmWorkspaceYaml(path.join(root, "pnpm-workspace.yaml"));
+  const lerna = readLernaPackages(root);
+  const nx = readNxProjects(root);
+
+  const patterns = [...ws, ...pnpm, ...lerna]
+    .map((p) => p.replace(/\\/g, "/"))
+    .map((p) => (p.endsWith("/") ? p : p + "/"))
+    .map((p) => p + "package.json");
+
+  const ignore = [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/dist-webview/**",
+    "**/build/**",
+    "**/out/**",
+    "**/.next/**",
+    "**/.svelte-kit/**",
+    "**/.output/**",
+    "**/.git/**",
+    "**/coverage/**",
+    "**/.venv/**",
+    "**/venv/**",
+    "**/__pycache__/**",
+  ];
+  ignore.push(...readGitignore(root));
+
+  const files = patterns.length ? await fg(patterns, { cwd: root, absolute: true, dot: false, ignore }) : [];
+
+  const fromPatterns = files.map((f) => path.dirname(f));
+  const fromNx = nx.map((d) => path.resolve(root, d));
+
+  return Array.from(new Set([...fromPatterns, ...fromNx]));
+}
+
 /** Detektera kandidater i en “lös” rot (även utanför workspace) */
 async function detectInLooseDir(root: string, excludeAbsDirs: string[]): Promise<Candidate[]> {
   const out: Candidate[] = [];
   const seen = new Set<string>();
+
+  // 0) Läs overrides
+  const overrides = readOverrides(root);
 
   // 1) Monorepo-uppräkning
   try {
@@ -518,8 +620,23 @@ async function detectInLooseDir(root: string, excludeAbsDirs: string[]): Promise
     if (rootCand) out.push(rootCand);
   }
 
-  out.sort(cmp);
-  return out;
+  // Overrides: exclude/boost
+  let list = out;
+  if (overrides.forceExclude?.length) {
+    list = list.filter(c => !overrides.forceExclude!.some(tag => overrideMatches(root, c.dir, tag)));
+  }
+  if (overrides.forceInclude?.length) {
+    list = list.map(c => {
+      const hit = overrides.forceInclude!.some(tag => overrideMatches(root, c.dir, tag));
+      if (hit) {
+        return { ...c, confidence: c.confidence + 100, reason: [...c.reason, "override:forceInclude"] };
+      }
+      return c;
+    });
+  }
+
+  list.sort(cmp);
+  return list;
 }
 
 /** Detektera kandidater i workspace-mappar via monorepo-mönster + VS Code globbing (snabbt) */
@@ -530,9 +647,13 @@ async function detectInWorkspaceFolder(
   const candidates: Candidate[] = [];
   const seen = new Set<string>();
 
+  // 0) Overrides
+  const root = f.uri.fsPath;
+  const overrides = readOverrides(root);
+
   // A) Monorepo-workspaces först
   try {
-    const wsDirs = await enumerateWorkspacePackageDirs(f.uri.fsPath);
+    const wsDirs = await enumerateWorkspacePackageDirs(root);
     const promises = wsDirs.map(async (dir) => {
       if (seen.has(dir)) return;
       const cand = await makeCandidateForDir(dir, excludeAbsDirs);
@@ -576,9 +697,23 @@ async function detectInWorkspaceFolder(
   }
 
   // De-dupe per dir
-  const uniq = new Map<string, Candidate>();
-  for (const c of candidates) if (!uniq.has(c.dir)) uniq.set(c.dir, c);
-  return Array.from(uniq.values()).sort(cmp);
+  let list = Array.from(new Map<string, Candidate>(candidates.map(c => [c.dir, c])).values());
+
+  // Overrides: exclude/boost
+  if (overrides.forceExclude?.length) {
+    list = list.filter(c => !overrides.forceExclude!.some(tag => overrideMatches(root, c.dir, tag)));
+  }
+  if (overrides.forceInclude?.length) {
+    list = list.map(c => {
+      const hit = overrides.forceInclude!.some(tag => overrideMatches(root, c.dir, tag));
+      if (hit) {
+        return { ...c, confidence: c.confidence + 100, reason: [...c.reason, "override:forceInclude"] };
+      }
+      return c;
+    });
+  }
+
+  return list.sort(cmp);
 }
 
 /** Intern scanning utan exkludering, används för att fylla cachen. */
@@ -621,7 +756,7 @@ export async function detectProjects(excludeAbsDirs: string[] = []): Promise<Can
     // Filtrera cache enligt excludeAbsDirs
     const filtered = _cache.list.filter((c) => !isUnder(c.dir, excludeAbsDirs));
     return filtered.slice().sort(cmp);
-    }
+  }
 
   const list = await scanAllProjectsUnfiltered();
   _cache = { at: Date.now(), list };

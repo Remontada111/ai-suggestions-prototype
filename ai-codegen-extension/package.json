@@ -23,6 +23,14 @@
       {
         "command": "ai-figma-codegen.scanAndPreview",
         "title": "AI Figma Codegen: Scan & Preview"
+      },
+      {
+        "command": "ai-figma-codegen.chooseProject",
+        "title": "AI Figma Codegen: Choose Project"
+      },
+      {
+        "command": "ai-figma-codegen.exportFrontendDetectorDataset",
+        "title": "AI Figma Codegen: Export Frontend Detector Dataset"
       }
     ],
     "configuration": {
@@ -36,6 +44,15 @@
       }
     }
   },
+  "files": [
+    "dist/**",
+    "dist-webview/**",
+    "ml_artifacts/**",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "package.json"
+  ],
   "scripts": {
     "compile": "tsc -p .",
     "watch": "tsc -p . -w",
@@ -45,7 +62,9 @@
     "prepackage": "npm run compile && npm run build:webview",
     "package": "vsce package --no-dependencies",
     "tw": "tailwindcss",
-    "tw:dev": "tailwindcss -i ./src/index.css -o ./dist/style.css --watch"
+    "tw:dev": "tailwindcss -i ./src/index.css -o ./dist/style.css --watch",
+    "ml:dump-features": "npm run compile && node dist/ml/dump_feature_order.js",
+    "ml:train": "python ml/train_gbdt.py --dataset ml_artifacts/dataset.jsonl --feature-order ml_artifacts/feature_order.json --out ml_artifacts/frontend-detector-gbdt.json --rounds 300 --early 30 --seed 42"
   },
   "devDependencies": {
     "@tailwindcss/cli": "^4.1.11",
@@ -66,6 +85,7 @@
     "@tanstack/react-query": "^5.83.0",
     "clsx": "^2.1.1",
     "dotenv": "^17.2.0",
+    "fast-glob": "^3.3.2",
     "node-fetch": "^3.3.2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",

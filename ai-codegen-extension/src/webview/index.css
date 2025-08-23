@@ -1,10 +1,11 @@
 @import "tailwindcss/preflight";
 @tailwind utilities;
-@reference "tailwindcss";   /* gör core-utilities tillgängliga för @apply */
+@reference "tailwindcss"; /* gör core-utilities tillgängliga för @apply */
 
-/* ─────────────────────────────────────────────── */
-/*  THEME – Mappa till VS Code tokens              */
-/* ─────────────────────────────────────────────── */
+/* ───────────────────────────────────────────────
+   THEME – Mappa till VS Code tokens
+   Subtilt, lätt och enterprise-vänligt.
+   ─────────────────────────────────────────────── */
 :root {
   color-scheme: light dark;
 
@@ -16,11 +17,24 @@
   --border: color-mix(in srgb, var(--vscode-foreground) 14%, var(--vscode-sideBar-background) 86%);
   --muted: color-mix(in srgb, var(--vscode-sideBar-background) 92%, var(--vscode-foreground) 8%);
   --destructive: var(--vscode-errorForeground);
-  --overlay: color-mix(in srgb, var(--vscode-editor-background) 30%, black 70%); /* mörk bakgrund vid zoom */
+  --overlay: color-mix(in srgb, var(--vscode-editor-background) 30%, black 70%);
+  --accent: var(--vscode-focusBorder);
+
+  /* Elevation */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, .08);
+  --shadow-md: 0 6px 16px rgba(0, 0, 0, .14);
+
+  /* Radius & spacing */
+  --radius: 14px;
+  --radius-round: 9999px;
+  --space-1: .25rem;
+  --space-2: .5rem;
+  --space-3: .75rem;
+  --space-4: 1rem;
 
   /* Preview-dimension (kompakt) */
-  --preview-width: 220px;  /* liten, “inte alls stor” */
-  --preview-max-height: 160px;
+  --preview-width: 240px;      /* lite större men fortfarande kompakt */
+  --preview-max-height: 168px; /* 7:5 ungefär */
 }
 
 /* Tailwind/shadcn utility hooks */
@@ -29,22 +43,97 @@
 .bg-muted { background-color: var(--muted) !important; }
 .text-destructive { color: var(--destructive) !important; }
 
-/* Panel-root: låt innehåll börja högt upp och centrera horisontellt */
+/* Typsnittshjälp */
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+
+/* Flerradstrunkering (för lång URL) */
+.truncate-multiline {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Basfokus – konsekvent och sober */
+:where(button, [role="button"], .input, a, iframe):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+
+/* Panel-root: kolumnlayout med luft och rytm */
 .panel-root {
   display: grid;
   grid-auto-rows: min-content;
-  row-gap: .5rem;
+  row-gap: .75rem;
 }
 
-/* ─────────────────────────────────────────────── */
-/*  Kompakt Figma-preview                          */
-/* ─────────────────────────────────────────────── */
+/* Kort: subtil elevation */
+.card-elevated {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Status-dot (ok/pending) */
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  display: inline-block;
+  background: color-mix(in srgb, var(--foreground) 40%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--foreground) 10%, transparent);
+}
+.status-dot.ok {
+  background: color-mix(in srgb, var(--foreground) 70%, transparent);
+}
+.status-dot.pending {
+  background: color-mix(in srgb, var(--foreground) 30%, transparent);
+}
+
+/* Badges/tags */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: .375rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-round);
+  padding: 2px 8px;
+  font-size: 11px;
+  background: color-mix(in srgb, var(--card) 70%, var(--foreground) 5%);
+  color: color-mix(in srgb, var(--foreground) 90%, transparent);
+}
+
+/* Sekundär/Ghost-knapp fallback (om Button-variant ej finns) */
+.btn-secondary {
+  background: color-mix(in srgb, var(--card) 80%, var(--foreground) 4%) !important;
+  border: 1px solid var(--border) !important;
+}
+.btn-secondary:hover {
+  background: color-mix(in srgb, var(--card) 70%, var(--foreground) 6%) !important;
+}
+.btn-ghost {
+  background: transparent !important;
+  border: 1px dashed var(--border) !important;
+}
+.btn-ghost:hover {
+  background: color-mix(in srgb, var(--card) 85%, transparent) !important;
+}
+.btn-positive {
+  /* mikrofeedback för “kopierad” */
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--foreground) 8%, transparent) !important;
+}
+
+/* ───────────────────────────────────────────────
+   Kompakt Figma-preview
+   ─────────────────────────────────────────────── */
 
 /* Wrapper som centrerar horisontellt och ligger högt upp */
 .preview-shell {
   display: grid;
-  justify-content: center;   /* horisontellt centrerad */
-  align-content: start;      /* högt upp i panelen */
+  justify-content: center;
+  align-content: start;
   padding: .5rem .75rem 0 .75rem;
 }
 
@@ -53,11 +142,10 @@
   position: relative;
   width: 100%;
   max-width: var(--preview-width);
-  border-radius: 14px;
+  border-radius: var(--radius);
   border: 1px solid var(--border);
   background-color: var(--card);
   padding: 8px;
-  cursor: default;
   transition: box-shadow .2s ease, transform .2s ease, border-color .2s ease;
   user-select: none;
   overflow: hidden;
@@ -86,14 +174,40 @@
     );
   background-size: 12px 12px;
 }
-
-.preview-grid.is-ready {
-  cursor: zoom-in;
-}
+.preview-grid.is-ready { cursor: zoom-in; }
 .preview-grid:is(:hover, :focus-visible) {
   border-color: color-mix(in srgb, var(--vscode-foreground) 24%, var(--vscode-sideBar-background) 76%);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--vscode-foreground) 10%, transparent);
   transform: translateY(-1px);
+}
+
+/* Skeleton shimmer */
+.skeleton {
+  width: 100%;
+  height: var(--preview-max-height);
+  border-radius: calc(var(--radius) - 6px);
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--card) 80%, var(--foreground) 4%) 0%,
+    color-mix(in srgb, var(--card) 70%, var(--foreground) 6%) 50%,
+    color-mix(in srgb, var(--card) 80%, var(--foreground) 4%) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.25s infinite;
+}
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Felstate i previewkortet */
+.error-state {
+  display: grid;
+  gap: .5rem;
+  align-content: center;
+  justify-items: center;
+  min-height: var(--preview-max-height);
+  text-align: center;
 }
 
 /* Bilden: skarp, kontrollerad storlek */
@@ -103,7 +217,7 @@
   max-height: var(--preview-max-height);
   aspect-ratio: auto;
 
-  /* högkvalitetsinterpolering (inte “crisp-edges”) */
+  /* högkvalitetsinterpolering */
   image-rendering: auto;
   -ms-interpolation-mode: bicubic;
 
@@ -111,12 +225,24 @@
   content-visibility: auto;
   contain-intrinsic-size: 320px 240px;
 }
-
 .figma-clickable { cursor: zoom-in; }
 
-/* ─────────────────────────────────────────────── */
-/*  Lightbox / zoomläge                            */
-/* ─────────────────────────────────────────────── */
+/* Liten hint i hörnet */
+.zoom-hint {
+  position: absolute;
+  bottom: 6px;
+  right: 8px;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--card) 80%, transparent);
+  opacity: .8;
+}
+
+/* ───────────────────────────────────────────────
+   Lightbox / zoomläge
+   ─────────────────────────────────────────────── */
 .figma-overlay {
   position: fixed;
   inset: 0;
@@ -124,30 +250,25 @@
   z-index: 9999;
   animation: overlay-fade .15s ease-out;
 }
-
 .figma-modal {
   position: absolute;
   inset: 50% auto auto 50%;
   transform: translate(-50%, -50%) scale(1);
   max-width: min(92vw, 1100px);
   max-height: 92vh;
-  border-radius: 14px;
+  border-radius: var(--radius);
   overflow: hidden;
   background: var(--card);
-  box-shadow:
-    0 10px 30px rgba(0,0,0,.35),
-    0 2px 10px rgba(0,0,0,.25);
+  box-shadow: var(--shadow-md);
   animation: modal-pop .18s ease-out;
 }
-
 .figma-modal-img {
   display: block;
   max-width: 100%;
   max-height: 92vh;
   object-fit: contain;
-  image-rendering: auto;      /* bibehåll skärpa i zoom */
+  image-rendering: auto;
 }
-
 .figma-close {
   position: absolute;
   top: 8px;
@@ -157,7 +278,7 @@
   border: 1px solid var(--border);
   background: color-mix(in srgb, var(--card) 80%, black 20%);
   color: var(--foreground);
-  border-radius: 9999px;
+  border-radius: var(--radius-round);
   display: grid;
   place-items: center;
   font-size: 20px;
@@ -176,4 +297,92 @@
 @keyframes modal-pop {
   from { opacity: 0; transform: translate(-50%, -50%) scale(.98); }
   to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+
+/* ───────────────────────────────────────────────
+   Kandidat-kort
+   ─────────────────────────────────────────────── */
+.proposal {
+  display: grid;
+  gap: .75rem;
+}
+.proposal__text {
+  display: grid;
+  gap: .25rem;
+}
+
+/* ───────────────────────────────────────────────
+   Mini-Preview (iframe)
+   ─────────────────────────────────────────────── */
+.mini-preview {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--card);
+  box-shadow: var(--shadow-sm);
+}
+.mini-preview__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .5rem;
+  padding: .5rem .5rem .5rem .75rem;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--card) 85%, transparent);
+  font-size: 12px;
+}
+.mini-preview__frame {
+  /* 16:10 aspect ratio för harmonisk form */
+  position: relative;
+  width: 100%;
+  max-width: 560px;
+  aspect-ratio: 16 / 10;
+  margin: 0 auto;
+  background: var(--background);
+}
+.mini-preview__iframe {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  border-radius: 0;
+}
+
+/* ───────────────────────────────────────────────
+   Chatbar (sticky, låg kontrast, balanserad)
+   ─────────────────────────────────────────────── */
+.chatbar {
+  position: sticky;
+  bottom: 0;
+  padding: .5rem .75rem .75rem;
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--background) 70%, transparent),
+    var(--background)
+  );
+  backdrop-filter: blur(2px);
+  border-top: 1px solid var(--border);
+}
+.chatbar__inner {
+  display: flex;
+  gap: .5rem;
+  align-items: center;
+}
+.input {
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--card) 90%, transparent);
+  color: var(--foreground);
+  border-radius: var(--radius);
+  padding: .5rem .75rem;
+  font-size: 14px;
+  transition: border-color .15s ease, background .15s ease, box-shadow .15s ease;
+}
+.input::placeholder { opacity: .6; }
+.input:hover {
+  background: color-mix(in srgb, var(--card) 85%, transparent);
+}
+.input:focus {
+  background: color-mix(in srgb, var(--card) 80%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--foreground) 8%, transparent);
 }
