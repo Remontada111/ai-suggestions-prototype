@@ -219,8 +219,7 @@ function ensurePanel(context) {
                 else if (lastUiPhase === "loading") {
                     currentPanel.webview.postMessage({ type: "ui-phase", phase: "loading" });
                 }
-                if (pendingCandidate)
-                    postCandidateProposal(pendingCandidate);
+                // (Minimal UI) – ingen kandidat-proposal att posta längre
                 return;
             }
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "acceptCandidate") {
@@ -228,14 +227,14 @@ function ensurePanel(context) {
                     warn("acceptCandidate utan pendingCandidate – ignorerar.");
                     return;
                 }
-                await startCandidatePreviewWithFallback(pendingCandidate, context);
+                await startCandidatePreviewWithFallback(pendingCandidate, context, { silentUntilReady: true });
                 return;
             }
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "chooseProject") {
                 await showProjectQuickPick(context);
                 return;
             }
-            // 🟡 NYTT: Onboarding-knapp – välj MAPP
+            // Onboarding-knapp – välj MAPP
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "pickFolder") {
                 await pickFolderAndStart(context);
                 return;
@@ -257,18 +256,9 @@ function ensurePanel(context) {
     }
     return currentPanel;
 }
-function postCandidateProposal(c) {
-    var _a, _b, _d;
-    if (!currentPanel)
-        return;
-    const label = c.pkgName ? c.pkgName : path.basename(c.dir);
-    const launchCmd = selectLaunchCommand(c);
-    const description = `${c.framework} • ${(_d = launchCmd !== null && launchCmd !== void 0 ? launchCmd : (_b = (_a = c.runCandidates) === null || _a === void 0 ? void 0 : _a[0]) === null || _b === void 0 ? void 0 : _b.cmd) !== null && _d !== void 0 ? _d : "auto"}`;
-    currentPanel.webview.postMessage({
-        type: "candidate-proposal",
-        payload: { label, description, dir: c.dir, launchCmd: launchCmd !== null && launchCmd !== void 0 ? launchCmd : undefined },
-    });
-}
+// (behåller postCandidateProposal-funktionen om den behövs senare,
+// men den används inte längre av minimal UI)
+function postCandidateProposal(_c) { }
 /* ─────────────────────────────────────────────────────────
    Upptäckt & uppstart
    ───────────────────────────────────────────────────────── */
@@ -349,131 +339,47 @@ async function startOrRespectfulFallback(c, context) {
     const { externalUrl } = await (0, runner_1.runInlineStaticServer)(storageDir);
     return { externalUrl, mode: "inline", watchRoot: storageDir };
 }
-/** Bygg liten temporär preview i globalStorage (används som fallback) */
+/** Bygg mycket minimalistisk temporär preview i globalStorage (fritt från text/labels) */
 async function ensureStoragePreview(context) {
     const root = context.globalStorageUri.fsPath;
     const previewDir = path.join(root, "ai-figma-preview");
     await fsp.mkdir(previewDir, { recursive: true });
     const indexPath = path.join(previewDir, "index.html");
-    const mainPath = path.join(previewDir, "main.js");
-    if (!fs.existsSync(indexPath)) {
-        const html = `<!doctype html>
+    // Skriv alltid om för att säkerställa uppdaterad minimal version
+    const html = `<!doctype html>
 <html lang="sv">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>AI Preview</title>
+    <title>Preview</title>
     <style>
       :root {
         --bg: var(--vscode-sideBar-background);
-        --fg: var(--vscode-foreground);
-        --muted: color-mix(in srgb, var(--vscode-foreground) 65%, var(--vscode-sideBar-background) 35%);
-        --border: color-mix(in srgb, var(--vscode-foreground) 20%, var(--vscode-sideBar-background) 80%);
+        --border: color-mix(in srgb, var(--vscode-foreground) 18%, var(--vscode-sideBar-background) 82%);
         --card: var(--vscode-editorWidget-background);
-        --btn-bg: var(--vscode-button-background);
-        --btn-fg: var(--vscode-button-foreground);
-        --btn-hover: color-mix(in srgb, var(--vscode-button-background) 85%, black 15%);
       }
       * { box-sizing: border-box; }
-      body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.4 ui-sans-serif,system-ui; }
-      .wrap { padding: 10px; display: grid; gap: 10px; }
-      .bar {
-        display: flex; align-items: center; gap: 8px; padding: 8px 10px;
-        border: 1px solid var(--border); border-radius: 10px; background: var(--card);
-      }
-      .bar .grow { flex: 1; min-width: 0; }
-      .btn {
-        appearance: none; border: 0; border-radius: 8px; padding: 6px 10px;
-        background: var(--btn-bg); color: var(--btn-fg); cursor: pointer; font: inherit;
-      }
-      .btn:hover { background: var(--btn-hover); }
+      html, body { height: 100%; }
+      body { margin: 0; background: var(--bg); }
       .mini {
-        width: 100%; height: 260px; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: var(--card);
+        width: 100%;
+        height: 100%;
+        background: var(--card);
+        border: 1px solid var(--border);
       }
-      iframe { display:block; width:100%; height:100%; border:0; }
-      .url { opacity:.9; word-break: break-all; }
-      .muted { color: var(--muted); }
-      .card {
-        border: 1px solid var(--border); border-radius: 12px; background: var(--card); padding: 10px; display: grid; gap: 6px;
-      }
-      .row { display:flex; gap:8px; align-items:center; }
-      .label { font-weight:600; }
-      .desc { opacity:.9; }
-      .dir { font-family: ui-monospace, Menlo, Monaco, "SF Mono", monospace; opacity:.85; }
-      .actions { display:flex; gap:8px; }
     </style>
   </head>
   <body>
-    <div class="wrap">
-      <div class="bar">
-        <div class="grow">
-          <div class="muted">Förhandsvisning</div>
-          <div id="info" class="url">Väntar på URL …</div>
-        </div>
-        <button class="btn" id="chooseBtn">Välj projekt…</button>
-      </div>
-
-      <div id="proposal" class="card" style="display:none">
-        <div class="row"><div class="label">Föreslagen kandidat</div></div>
-        <div class="row"><div id="pLabel"></div></div>
-        <div class="row desc"><div id="pDesc"></div></div>
-        <div class="row dir"><div id="pDir"></div></div>
-        <div class="actions">
-          <button class="btn" id="acceptBtn">Starta föreslagen</button>
-          <button class="btn" id="altBtn">Välj projekt…</button>
-        </div>
-      </div>
-
-      <div class="mini"><iframe id="preview" sandbox="allow-scripts allow-forms allow-same-origin"></iframe></div>
-    </div>
-
-    <script>
-      const vscode = acquireVsCodeApi();
-      const iframe = document.getElementById('preview');
-      const info = document.getElementById('info');
-      const proposal = document.getElementById('proposal');
-      const pLabel = document.getElementById('pLabel');
-      const pDesc  = document.getElementById('pDesc');
-      const pDir   = document.getElementById('pDir');
-
-      document.getElementById('chooseBtn').addEventListener('click', () => vscode.postMessage({ cmd: 'chooseProject' }));
-      document.getElementById('altBtn').addEventListener('click', () => vscode.postMessage({ cmd: 'chooseProject' }));
-      document.getElementById('acceptBtn').addEventListener('click', () => vscode.postMessage({ cmd: 'acceptCandidate' }));
-
-      window.addEventListener('message', (e) => {
-        const msg = e.data;
-        if (msg?.type === 'devurl') { iframe.src = msg.url; info.textContent = msg.url; }
-        if (msg?.type === 'candidate-proposal' && msg?.payload) {
-          const { label, description, dir } = msg.payload;
-          pLabel.textContent = label;
-          pDesc.textContent = description || '';
-          pDir.textContent = dir || '';
-          proposal.style.display = 'grid';
-        }
-      });
-
-      vscode.postMessage({ type: 'ready' });
-    </script>
+    <div class="mini"></div>
   </body>
 </html>`;
-        await fsp.writeFile(indexPath, html, "utf8");
-    }
-    if (!fs.existsSync(mainPath)) {
-        const js = `const el = document.getElementById('app');
-el.style.fontFamily = 'ui-sans-serif, system-ui';
-el.style.padding = '12px';
-el.style.lineHeight = '1.4';
-el.innerHTML = '<h1 style="margin:0 0 4px 0;font-size:18px">AI Preview</h1>' +
-               '<p>Ingen körbar dev-server och ingen befintlig index.html hittades i projektet.</p>' +
-               '<p>Denna temporära yta ligger i extensionens storage – inget skrevs in i projektet.</p>';`;
-        await fsp.writeFile(mainPath, js, "utf8");
-    }
+    await fsp.writeFile(indexPath, html, "utf8");
     return previewDir;
 }
 /**
  * Starta kandidatens preview:
- * - Normalt: placeholder → byt när redo.
- * - Med silentUntilReady: ingen placeholder; skicka bara devurl när klart.
+ * - Minimal UI: använd alltid silentUntilReady där vi själva triggar start,
+ *   och visa loader i webview tills verklig URL finns.
  */
 async function startCandidatePreviewWithFallback(c, context, opts) {
     const panel = ensurePanel(context);
@@ -486,7 +392,6 @@ async function startCandidatePreviewWithFallback(c, context, opts) {
     }
     catch ( /* ignore */_b) { /* ignore */ }
     stopReloadWatcher();
-    // Silent-läget används för onboarding-flowet (visa loader tills klart)
     const silent = !!(opts === null || opts === void 0 ? void 0 : opts.silentUntilReady);
     let placeholder = null;
     if (!silent) {
@@ -514,15 +419,14 @@ async function startCandidatePreviewWithFallback(c, context, opts) {
                     warn("Kunde inte stoppa placeholder-server:", e);
                 }
             }
-            // Meddela att bakgrundsladdning är klar
+            // Klart
             lastUiPhase = "default";
             panel.webview.postMessage({ type: "ui-phase", phase: "default" });
         }
         catch (err) {
             errlog("Primär preview misslyckades:", (err === null || err === void 0 ? void 0 : err.message) || String(err));
             if (!silent)
-                return; // i normal-läge finns redan placeholder
-            // I silent-läge: signalera fel (enkelt)
+                return;
             panel.webview.postMessage({ type: "ui-error", message: String((err === null || err === void 0 ? void 0 : err.message) || err) });
         }
     })();
@@ -565,10 +469,12 @@ async function showProjectQuickPick(context) {
     if (!chosen)
         return;
     pendingCandidate = chosen._c;
-    postCandidateProposal(pendingCandidate);
-    await startCandidatePreviewWithFallback(pendingCandidate, context);
+    // Minimal UI: visa loader + starta tyst
+    lastUiPhase = "loading";
+    panel.webview.postMessage({ type: "ui-phase", phase: "loading" });
+    await startCandidatePreviewWithFallback(pendingCandidate, context, { silentUntilReady: true });
 }
-/* 🟡 NYTT: Välj mapp (onboarding) och starta i bakgrunden */
+/* Välj mapp (onboarding) och starta i bakgrunden – oförändrat då det redan kör silent */
 async function pickFolderAndStart(context) {
     const panel = ensurePanel(context);
     const uris = await vscode.window.showOpenDialog({
@@ -593,7 +499,6 @@ async function pickFolderAndStart(context) {
             return;
         }
         pendingCandidate = candidates[0];
-        // Starta tyst i bakgrunden; webview visar loader tills vi skickar devurl
         await startCandidatePreviewWithFallback(pendingCandidate, context, { silentUntilReady: true });
     }
     catch (e) {
@@ -653,10 +558,9 @@ function basicFallbackHtml(webview) {
   frame-src   http: https:;
 ">
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Project Preview (fallback)</title>
+<title>Project Preview</title>
 </head>
 <body>
-<div>Installera webview-bundlen (dist-webview) för full funktion.</div>
 <script>window.addEventListener('load',()=>acquireVsCodeApi().postMessage({type:'ready'}));</script>
 </body>
 </html>`;
@@ -692,19 +596,25 @@ async function activate(context) {
             }
             const panel = ensurePanel(context);
             pendingCandidate = candidates[0];
-            postCandidateProposal(pendingCandidate);
             panel.reveal(vscode.ViewColumn.Two);
             if (candidates.length === 1 || ((_a = pendingCandidate === null || pendingCandidate === void 0 ? void 0 : pendingCandidate.confidence) !== null && _a !== void 0 ? _a : 0) >= AUTO_START_SURE_THRESHOLD) {
-                await startCandidatePreviewWithFallback(pendingCandidate, context);
+                // Minimal UI: visa loader + starta tyst
+                lastUiPhase = "loading";
+                panel.webview.postMessage({ type: "ui-phase", phase: "loading" });
+                await startCandidatePreviewWithFallback(pendingCandidate, context, { silentUntilReady: true });
             }
             else {
                 const pickNow = "Välj projekt…";
                 const startTop = "Starta föreslagen";
                 const choice = await vscode.window.showInformationMessage("Flera kandidater hittades. Vill du välja manuellt eller starta föreslagen?", pickNow, startTop);
-                if (choice === pickNow)
+                if (choice === pickNow) {
                     await showProjectQuickPick(context);
-                else if (choice === startTop)
-                    await startCandidatePreviewWithFallback(pendingCandidate, context);
+                }
+                else if (choice === startTop) {
+                    lastUiPhase = "loading";
+                    panel.webview.postMessage({ type: "ui-phase", phase: "loading" });
+                    await startCandidatePreviewWithFallback(pendingCandidate, context, { silentUntilReady: true });
+                }
             }
         }
         catch (err) {
@@ -716,15 +626,16 @@ async function activate(context) {
         var _a;
         const panel = ensurePanel(context);
         panel.reveal(vscode.ViewColumn.Two);
-        // OBS: openPanel lämnas som tidigare (ingen onboarding-tvingan här)
+        // Minimal UI: ingen auto-onboarding här, men om vi autostartar så gör det tyst med loader
         if (!pendingCandidate) {
             const candidates = await (0, detector_1.detectProjects)([]);
             lastCandidates = candidates;
             if (candidates.length) {
                 pendingCandidate = candidates[0];
-                postCandidateProposal(pendingCandidate);
                 if (candidates.length === 1 || ((_a = pendingCandidate === null || pendingCandidate === void 0 ? void 0 : pendingCandidate.confidence) !== null && _a !== void 0 ? _a : 0) >= AUTO_START_SURE_THRESHOLD) {
-                    await startCandidatePreviewWithFallback(pendingCandidate, context);
+                    lastUiPhase = "loading";
+                    panel.webview.postMessage({ type: "ui-phase", phase: "loading" });
+                    await startCandidatePreviewWithFallback(pendingCandidate, context, { silentUntilReady: true });
                 }
             }
         }
@@ -741,7 +652,7 @@ async function activate(context) {
             vscode.window.showErrorMessage(`ExportDataset misslyckades: ${(e === null || e === void 0 ? void 0 : e.message) || String(e)}`);
         }
     });
-    // 🔹 URI-handler (Figma import) – visa BARA onboarding först
+    // 🔹 URI-handler (Figma import) – visa onboarding först, starta sedan tyst
     const uriHandler = vscode.window.registerUriHandler({
         handleUri: async (uri) => {
             try {
@@ -756,7 +667,6 @@ async function activate(context) {
                 const panel = ensurePanel(context);
                 lastInitPayload = { type: "init", fileKey, nodeId, token, figmaToken: token };
                 panel.webview.postMessage(lastInitPayload);
-                // 🔸 Viktigt: Ingen auto-scan/auto-start här – visa onboarding
                 lastUiPhase = "onboarding";
                 panel.webview.postMessage({ type: "ui-phase", phase: "onboarding" });
                 panel.reveal(vscode.ViewColumn.Two);

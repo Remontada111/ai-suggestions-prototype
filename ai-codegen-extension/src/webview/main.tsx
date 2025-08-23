@@ -1,10 +1,12 @@
-/* ai-codegen-extension/webview/main.tsx
+/* ai-codegen-extension/webview/main.tsx 
    --------------------------------------------------------------------------
-   Prereview med onboarding- & loader-flöde:
-   - UI-faser: onboarding → loading → ready.
-   - Onboarding visar en central "Choose a folder" (folder-illustration).
-   - Loading visar animerad loader.
-   - Ready visar ordinarie UI (Figma + prereview) med vit bakgrund och skala.
+   Minimal UI:
+   - Endast Figma-design överst och projektets prereview (iframe) underst.
+   - Ingen statustext, ingen URI-text, inga zoom-/skala-kontroller.
+   - Iframen är alltid skalad till 67%.
+   - Behåll "Välj projekt…" och "Kopiera länk"-knapparna.
+   - Behåll "Skicka instruktioner"-knappen (chat-funktionen).
+   - Onboarding- och Loader-faser orörda.
    -------------------------------------------------------------------------- */
 
 /// <reference types="vite/client" />
@@ -13,7 +15,6 @@ import React, {
   useEffect,
   useMemo,
   useState,
-  useCallback,
   useRef,
 } from "react";
 import { createRoot } from "react-dom/client";
@@ -24,12 +25,6 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import "./index.css";
 
 /* -------------------- Typer -------------------- */
@@ -42,11 +37,8 @@ interface InitMessage {
   figmaToken?: string;
 }
 interface DevUrlMessage { type: "devurl"; url: string; }
-interface CandidateProposal { label: string; description: string; dir: string; launchCmd?: string; }
-interface CandidateProposalMessage { type: "candidate-proposal"; payload: CandidateProposal; }
 interface UiPhaseMessage { type: "ui-phase"; phase: "onboarding" | "loading" | "default"; }
 interface UiErrorMessage { type: "ui-error"; message: string; }
-
 interface FigmaImageApiRes { images: Record<string, string>; err?: string; }
 
 /* ------------------ VS Code API ---------------- */
@@ -61,16 +53,16 @@ function useFigmaImage(
   fileKey: string | null,
   nodeId: string | null,
   token: string | null,
-  scale: number
+  scaleForApi: number
 ) {
   return useQuery<string>({
-    enabled: !!fileKey && !!nodeId && !!token && !!scale,
-    queryKey: ["figma-image", fileKey, nodeId, scale],
+    enabled: !!fileKey && !!nodeId && !!token && !!scaleForApi,
+    queryKey: ["figma-image", fileKey, nodeId, scaleForApi],
     staleTime: 1000 * 60 * 60,
     gcTime: 1000 * 60 * 60 * 24,
     retry: 1,
     queryFn: async () => {
-      const capped = Math.max(1, Math.min(4, Math.round(scale)));
+      const capped = Math.max(1, Math.min(4, Math.round(scaleForApi)));
       const url = `https://api.figma.com/v1/images/${encodeURIComponent(
         fileKey!
       )}?ids=${encodeURIComponent(
@@ -92,7 +84,7 @@ function useFigmaImage(
 
 /* ----------------- Hjälpare -------------------- */
 const announce = (m: string) => {
-  console.log(m);
+  // skärmläsare (osynligt för UI)
   const el = document.getElementById("sr-live");
   if (el) el.textContent = m;
 };
@@ -105,8 +97,7 @@ const copyToClipboard = async (text: string) => {
   }
 };
 
-/* ----------------- Onboarding UI ----------------
-   (portad från given styled-components till ren CSS) */
+/* ----------------- Onboarding UI ---------------- */
 const Onboarding: React.FC<{ onPick: () => void }> = ({ onPick }) => {
   return (
     <div className="ob-shell">
@@ -123,7 +114,6 @@ const Onboarding: React.FC<{ onPick: () => void }> = ({ onPick }) => {
         </button>
       </div>
 
-      {/* Inlined CSS för onboarding */}
       <style>{`
         .ob-shell {
           min-height: 70vh;
@@ -248,16 +238,14 @@ const Loader: React.FC = () => {
 type Phase = "onboarding" | "loading" | "ready";
 
 const AiPanel: React.FC = () => {
-  const [phase, setPhase] = useState<Phase>("ready"); // default för icke-URI-flöden
+  const [phase, setPhase] = useState<Phase>("ready");
   const [initReceived, setInitReceived] = useState(false);
   const [figmaInfo, setFigmaInfo] = useState<{ fileKey: string | null; nodeId: string | null; token: string | null; }>({ fileKey: null, nodeId: null, token: null });
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [proposal, setProposal] = useState<CandidateProposal | null>(null);
-  const [copied, setCopied] = useState(false);
   const queryClientLocal = useQueryClient();
 
   useEffect(() => {
-    const listener = (e: MessageEvent<InitMessage | DevUrlMessage | CandidateProposalMessage | UiPhaseMessage | UiErrorMessage | any>) => {
+    const listener = (e: MessageEvent<InitMessage | DevUrlMessage | UiPhaseMessage | UiErrorMessage | any>) => {
       const msg = e.data;
       if (!msg || typeof msg !== "object") return;
 
@@ -271,11 +259,6 @@ const AiPanel: React.FC = () => {
       if ((msg as DevUrlMessage).type === "devurl") {
         const m = msg as DevUrlMessage;
         if (typeof m.url === "string") setPreviewUrl(m.url);
-        return;
-      }
-      if ((msg as CandidateProposalMessage).type === "candidate-proposal") {
-        const m = msg as CandidateProposalMessage;
-        if (m?.payload) setProposal(m.payload);
         return;
       }
       if ((msg as UiPhaseMessage).type === "ui-phase") {
@@ -295,16 +278,13 @@ const AiPanel: React.FC = () => {
     return () => window.removeEventListener("message", listener);
   }, []);
 
-  /* --- Zoom/scale för Figma-minipreview (oförändrat) --- */
-  const [zoomed, setZoomed] = useState(false);
-  const baseScale = useMemo(() => Math.max(2, Math.min(4, Math.ceil(window.devicePixelRatio * 2))), []);
-  const effectiveScale = zoomed ? 4 : baseScale;
-
-  const { data: figmaUrl, isLoading: figmaLoading, isError: figmaError, error: figmaErr } = useFigmaImage(
-    figmaInfo.fileKey, figmaInfo.nodeId, figmaInfo.token, effectiveScale
+  // Figma-bild (intern API-skala för hög DPI, ej UI-zoom)
+  const figmaApiScale = useMemo(() => Math.max(2, Math.min(4, Math.ceil(window.devicePixelRatio * 2))), []);
+  const { data: figmaUrl, isLoading: figmaLoading, isError: figmaError } = useFigmaImage(
+    figmaInfo.fileKey, figmaInfo.nodeId, figmaInfo.token, figmaApiScale
   );
 
-  /* --- Ready-villkor: devurl + (om vi har init) figmaUrl --- */
+  // Växla från loader → ready
   useEffect(() => {
     if (phase !== "loading") return;
     const devReady = !!previewUrl;
@@ -313,20 +293,10 @@ const AiPanel: React.FC = () => {
     if (devReady && figmaReady) setPhase("ready");
   }, [phase, previewUrl, initReceived, figmaInfo.token, figmaUrl, figmaLoading, figmaError]);
 
-  /* --- Chat --- */
-  const [chat, setChat] = useState("");
-
-  /* --- Skalenlig iframe — samma som tidigare leverans --- */
+  // Fast iframe-skala 67%
+  const FIXED_SCALE = 0.67;
   const previewFrameRef = useRef<HTMLDivElement | null>(null);
-  const [{ mode: zoomMode, manual: manualScale }, setZoomState] = useState(() => {
-    try {
-      const m = (localStorage.getItem("aiPreview.zoom") as "fit" | "manual") || "fit";
-      const s = parseFloat(localStorage.getItem("aiPreview.manualScale") || "0.67") || 0.67;
-      return { mode: m, manual: Math.min(1, Math.max(0.25, s)) };
-    } catch { return { mode: "fit" as const, manual: 0.67 }; }
-  });
   const [containerSize, setContainerSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
-  const [scale, setScale] = useState<number>(1);
 
   useEffect(() => {
     const el = previewFrameRef.current;
@@ -340,37 +310,11 @@ const AiPanel: React.FC = () => {
     return () => ro.disconnect();
   }, []);
 
-  useEffect(() => {
-    const referenceWidth = 1280;
-    if (zoomMode === "fit") {
-      const s = containerSize.w > 0 ? Math.min(1, Math.max(0.25, containerSize.w / referenceWidth)) : 1;
-      setScale(s);
-    } else {
-      setScale(Math.min(1, Math.max(0.25, manualScale)));
-    }
-  }, [zoomMode, manualScale, containerSize.w]);
-
-  const setMode = useCallback((m: "fit" | "manual") => {
-    setZoomState((prev) => {
-      const next = { mode: m, manual: prev.manual };
-      try { localStorage.setItem("aiPreview.zoom", next.mode); localStorage.setItem("aiPreview.manualScale", String(next.manual)); } catch {}
-      return next;
-    });
-  }, []);
-  const setManual = useCallback((v: number) => {
-    setZoomState(() => {
-      const next = { mode: "manual" as const, manual: Math.min(1, Math.max(0.25, v)) };
-      try { localStorage.setItem("aiPreview.zoom", next.mode); localStorage.setItem("aiPreview.manualScale", String(next.manual)); } catch {}
-      return next;
-    });
-  }, []);
-
-  const zoomLabel = (s: number) => `${Math.round(s * 100)}%`;
+  // Chat
+  const [chat, setChat] = useState("");
 
   /* ---------------- Render ---------------- */
-  const hasToken = !!figmaInfo.token;
 
-  // Onboarding-fas
   if (phase === "onboarding") {
     return (
       <div className="panel-root bg-background text-foreground">
@@ -380,7 +324,6 @@ const AiPanel: React.FC = () => {
     );
   }
 
-  // Loading-fas
   if (phase === "loading") {
     return (
       <div className="panel-root bg-background text-foreground">
@@ -390,158 +333,52 @@ const AiPanel: React.FC = () => {
     );
   }
 
-  // Ready-fas (ordinarie UI)
+  // Ready
   return (
     <div className="panel-root bg-background text-foreground">
       <div id="sr-live" className="sr-only" aria-live="polite" />
 
-      {/* Top-bar */}
-      <div className="px-4 pt-3">
-        <Card className="card-elevated">
-          <CardContent className="py-3">
-            <div className="flex items-start md:items-center gap-3">
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2 mb-1">
-                  <span className={`status-dot ${previewUrl ? "ok" : "pending"}`} aria-hidden="true" />
-                  <span className="text-xs opacity-80">
-                    {previewUrl ? "Förhandsvisning aktiv" : "Väntar på dev-serverns URL"}
-                  </span>
-                </div>
-                <div className="text-xs break-all mono truncate-multiline">
-                  {previewUrl ?? "Ingen URL tillgänglig ännu …"}
-                </div>
-                {initReceived && !hasToken && (
-                  <p className="mt-2 text-[11px] text-destructive">
-                    ⚠️ Ingen Figma-token – ställ in <em>aiFigmaCodegen.figmaToken</em> i Inställningar.
-                  </p>
-                )}
-              </div>
-
-              {/* Zoom-kontroller */}
-              <div className="flex items-center gap-2 shrink-0">
-                <div className="flex items-center gap-1">
-                  <Button
-                    className={`h-7 px-3 text-xs ${zoomMode === "fit" ? "" : "btn-secondary"}`}
-                    onClick={() => setMode("fit")}
-                    title="Passa bredd"
-                    aria-label="Passa bredd"
-                  >
-                    Passa bredd
-                  </Button>
-                  <select
-                    aria-label="Zoomnivå"
-                    title="Zoomnivå"
-                    className="h-7 text-xs px-2 rounded-md border border-border bg-background"
-                    value={zoomMode === "fit" ? "fit" : String(manualScale)}
-                    onChange={(e) => {
-                      const v = e.currentTarget.value;
-                      if (v === "fit") setMode("fit");
-                      else setManual(parseFloat(v));
-                    }}
-                  >
-                    <option value="fit">Passa bredd</option>
-                    <option value="1">100%</option>
-                    <option value="0.8">80%</option>
-                    <option value="0.67">67%</option>
-                    <option value="0.5">50%</option>
-                  </select>
-                  <span className="text-[11px] opacity-70 tabular-nums ml-1">
-                    {zoomMode === "fit" ? "Auto" : zoomLabel(scale)}
-                  </span>
-                </div>
-
-                <Button onClick={() => vscode.postMessage({ cmd: "chooseProject" })}>Välj projekt…</Button>
-                <Button
-                  onClick={async () => {
-                    if (!previewUrl) return;
-                    const ok = await copyToClipboard(previewUrl);
-                    if (ok) { announce("Länk kopierad."); }
-                  }}
-                  disabled={!previewUrl}
-                  aria-label="Kopiera förhandsvisningslänk"
-                  title={previewUrl ? "Kopiera förhandsvisningslänk" : "Ingen länk ännu"}
-                >
-                  Kopiera länk
-                </Button>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
+      {/* Minimala topp-actions (inga texter/status/URI) */}
+      <div className="px-4 pt-3 flex items-center justify-end gap-2">
+        <Button onClick={() => vscode.postMessage({ cmd: "chooseProject" })}>
+          Välj projekt…
+        </Button>
+        <Button
+          onClick={async () => {
+            if (!previewUrl) return;
+            const ok = await copyToClipboard(previewUrl);
+            if (ok) announce("Länk kopierad.");
+          }}
+          disabled={!previewUrl}
+          aria-label="Kopiera förhandsvisningslänk"
+        >
+          Kopiera länk
+        </Button>
       </div>
 
-      {/* Figma kompakt preview (oförändrat från tidigare) */}
+      {/* Figma (ingen text/overlay/hint) */}
       <div className="preview-shell">
-        <div
-          className={`preview-grid ${figmaUrl ? "is-ready" : figmaLoading ? "is-loading" : "is-error"}`}
-          role={figmaUrl ? "button" : "img"}
-          tabIndex={figmaUrl ? 0 : -1}
-          aria-label={figmaUrl ? "Öppna större förhandsvisning" : "Figma-förhandsvisning"}
-          onClick={figmaUrl ? () => setZoomed(true) : undefined}
-          onKeyDown={(e) => {
-            if (figmaUrl && (e.key === "Enter" || e.key === " ")) {
-              e.preventDefault(); setZoomed(true);
-            }
-          }}
-        >
+        <div className={`preview-grid ${figmaUrl ? "is-ready" : figmaLoading ? "is-loading" : "is-error"}`}>
           {figmaLoading && <div className="skeleton" aria-hidden="true" />}
-          {figmaError && (
-            <div className="error-state">
-              <p className="text-sm mb-2">
-                {(figmaErr as Error)?.message ?? "Kunde inte ladda Figma-bilden."}
-              </p>
-              <div className="flex gap-2">
-                <Button
-                  onClick={() => queryClientLocal.invalidateQueries({
-                    queryKey: ["figma-image", figmaInfo.fileKey, figmaInfo.nodeId, effectiveScale],
-                  })}
-                  className="btn-secondary"
-                >
-                  Försök igen
-                </Button>
-                <Button onClick={() => vscode.postMessage({ cmd: "chooseProject" })} className="btn-ghost">
-                  Välj projekt…
-                </Button>
-              </div>
-            </div>
-          )}
           {figmaUrl && !figmaLoading && !figmaError && (
-            <>
-              <img
-                src={figmaUrl}
-                alt="Vald Figma-nod"
-                className="figma-img figma-clickable"
-                loading="lazy"
-                decoding="async"
-                fetchPriority="high"
-                draggable={false}
-              />
-              <div className="zoom-hint" aria-hidden="true">Klicka för att zooma</div>
-            </>
+            <img
+              src={figmaUrl}
+              alt=""
+              className="figma-img"
+              loading="lazy"
+              decoding="async"
+              fetchPriority="high"
+              draggable={false}
+            />
           )}
+          {/* Vid fel: visa inget textinnehåll */}
         </div>
       </div>
 
-      {/* Mini-preview (vit bakgrund + skala) */}
+      {/* Projektets preview (vit bakgrund, fast skala 67%) */}
       {previewUrl && (
         <div className="px-4">
           <div className="mini-preview card-elevated">
-            <div className="mini-preview__header">
-              <span className="mono truncate">{previewUrl}</span>
-              <div className="flex items-center gap-2">
-                <Button
-                  className="h-7 px-3 text-xs btn-secondary"
-                  onClick={async () => {
-                    if (!previewUrl) return;
-                    const ok = await copyToClipboard(previewUrl);
-                    if (ok) announce("Länk kopierad.");
-                  }}
-                  aria-label="Kopiera förhandsvisningslänk"
-                >
-                  Kopiera
-                </Button>
-              </div>
-            </div>
-
             <div
               ref={previewFrameRef}
               className="mini-preview__frame"
@@ -553,9 +390,9 @@ const AiPanel: React.FC = () => {
                 className="mini-preview__iframe"
                 sandbox="allow-scripts allow-forms allow-same-origin"
                 style={{
-                  width: containerSize.w > 0 && scale > 0 ? `${containerSize.w / scale}px` : "100%",
-                  height: containerSize.h > 0 && scale > 0 ? `${containerSize.h / scale}px` : "100%",
-                  transform: `scale(${scale})`,
+                  width: containerSize.w > 0 ? `${containerSize.w / FIXED_SCALE}px` : "100%",
+                  height: containerSize.h > 0 ? `${containerSize.h / FIXED_SCALE}px` : "100%",
+                  transform: `scale(${FIXED_SCALE})`,
                   transformOrigin: "top left",
                   display: "block",
                   border: "0",
@@ -563,31 +400,17 @@ const AiPanel: React.FC = () => {
                 }}
               />
             </div>
-
-            <div className="px-3 py-2 text-[11px] opacity-70 border-t border-border">
-              Zoom:&nbsp;{zoomMode === "fit" ? "Passa bredd (auto)" : zoomLabel(scale)}
-            </div>
           </div>
         </div>
       )}
 
-      {/* Lightbox */}
-      {zoomed && (
-        <div className="figma-overlay" onClick={() => setZoomed(false)} aria-modal="true" role="dialog">
-          <div className="figma-modal" onClick={(e) => e.stopPropagation()} role="document">
-            <button className="figma-close" aria-label="Stäng förhandsvisning" onClick={() => setZoomed(false)}>×</button>
-            {figmaUrl && <img src={figmaUrl} alt="Figma-nod (förstorad)" className="figma-modal-img" draggable={false} />}
-          </div>
-        </div>
-      )}
-
-      {/* Chat */}
+      {/* Chat: behåll endast knapptexten "Skicka instruktioner" */}
       <div className="chatbar">
         <div className="chatbar__inner">
           <input
             type="text"
             className="flex-1 input"
-            placeholder="Skicka instruktion …"
+            placeholder=""
             value={chat}
             onChange={(e) => setChat(e.currentTarget.value)}
             onKeyDown={(e) => {
@@ -595,7 +418,7 @@ const AiPanel: React.FC = () => {
                 vscode.postMessage({ cmd: "chat", text: chat.trim() }); setChat("");
               }
             }}
-            aria-label="Meddelande till assistenten"
+            aria-label="Instruktioner"
           />
           <Button
             onClick={() => {
@@ -604,7 +427,7 @@ const AiPanel: React.FC = () => {
             }}
             disabled={!chat.trim()}
           >
-            Skicka
+            Skicka instruktioner
           </Button>
         </div>
       </div>
