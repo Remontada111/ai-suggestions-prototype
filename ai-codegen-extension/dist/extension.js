@@ -172,12 +172,114 @@ function resolveBundledModelPath(context) {
     return undefined;
 }
 /* ─────────────────────────────────────────────────────────
+   Kom-ihåg valt projekt + Maximal visningsyta
+   ───────────────────────────────────────────────────────── */
+const STORAGE_KEYS = { remembered: "aiFigmaCodegen.rememberedProject.v1" };
+const SETTINGS_NS = "aiFigmaCodegen";
+const STORAGE_KEYS_UI = { askedFullView: "ui.askedFullView.v1" };
+function updateStatusBar(current) {
+    if (!statusItem)
+        return;
+    if (current) {
+        statusItem.text = `$(rocket) Preview: ${current.pkgName || path.basename(current.dir)}`;
+        statusItem.tooltip = "Förhandsvisar valt projekt • klicka för att byta";
+    }
+    else {
+        statusItem.text = "$(rocket) Preview";
+        statusItem.tooltip = "Välj projekt för förhandsvisning";
+    }
+}
+async function rememberCandidate(c, context) {
+    const payload = { dir: c.dir, savedAt: Date.now() };
+    await context.globalState.update(STORAGE_KEYS.remembered, payload);
+    updateStatusBar(c);
+    log("Sparade valt projekt:", c.dir);
+}
+async function forgetRemembered(context) {
+    await context.globalState.update(STORAGE_KEYS.remembered, undefined);
+    updateStatusBar(null);
+    vscode.window.showInformationMessage("Glömde sparat projekt.");
+}
+async function tryGetRememberedCandidate(context) {
+    const rec = context.globalState.get(STORAGE_KEYS.remembered);
+    if (!(rec === null || rec === void 0 ? void 0 : rec.dir))
+        return null;
+    try {
+        if (!fs.existsSync(rec.dir)) {
+            await context.globalState.update(STORAGE_KEYS.remembered, undefined);
+            return null;
+        }
+    }
+    catch (_a) {
+        return null;
+    }
+    try {
+        const cands = await (0, detector_1.detectProjects)([rec.dir]);
+        if (cands === null || cands === void 0 ? void 0 : cands.length)
+            return cands[0];
+    }
+    catch ( /* ignore */_b) { /* ignore */ }
+    return null;
+}
+/** Gör webviewen så stor som möjligt inom VS Code (utan OS-helskärm). */
+async function enterFullView(panel) {
+    try {
+        await vscode.commands.executeCommand("workbench.action.editorLayoutSingle");
+    }
+    catch (_a) { }
+    try {
+        await vscode.commands.executeCommand("workbench.action.closePanel");
+    }
+    catch (_b) { }
+    try {
+        await vscode.commands.executeCommand("workbench.action.closeSidebar");
+    }
+    catch (_d) { }
+    try {
+        panel === null || panel === void 0 ? void 0 : panel.reveal(vscode.ViewColumn.One, false);
+    }
+    catch (_e) { }
+}
+/** Auto-”full view”; Zen Mode (nära helskärm) om aktiverat i settings. */
+async function tryAutoFullView(panel, context) {
+    var _a;
+    const cfg = vscode.workspace.getConfiguration(SETTINGS_NS);
+    const autoFull = cfg.get("autoFullView", true);
+    const useZen = cfg.get("autoZenMode", false);
+    const asked = context.globalState.get(STORAGE_KEYS_UI.askedFullView, false);
+    // Engångsfråga om autoFullView inte är explicit satt av användaren
+    if (!asked && ((_a = cfg.inspect("autoFullView")) === null || _a === void 0 ? void 0 : _a.globalValue) === undefined) {
+        await context.globalState.update(STORAGE_KEYS_UI.askedFullView, true);
+        const yes = "Ja, kör Full View";
+        const no = "Inte nu";
+        const pick = await vscode.window.showInformationMessage("Vill du öppna förhandsvisningen i Full View-läge framöver?", yes, no);
+        try {
+            await cfg.update("autoFullView", pick === yes, vscode.ConfigurationTarget.Global);
+        }
+        catch ( /* ignore */_b) { /* ignore */ }
+    }
+    const finalAutoFull = vscode.workspace.getConfiguration(SETTINGS_NS).get("autoFullView", true);
+    if (finalAutoFull)
+        await enterFullView(panel);
+    if (useZen) {
+        // OBS: toggle – aktiveras endast om användaren valt detta i settings.
+        try {
+            await vscode.commands.executeCommand("workbench.action.toggleZenMode");
+        }
+        catch (_d) { }
+        // (Valfritt ytterligare: toggla OS-helskärm)
+        // try { await vscode.commands.executeCommand("workbench.action.toggleFullScreen"); } catch {}
+    }
+}
+/* ─────────────────────────────────────────────────────────
    Panel och meddelandehantering
    ───────────────────────────────────────────────────────── */
 function ensurePanel(context) {
     if (!currentPanel) {
         log("Skapar ny Webview-panel …");
-        currentPanel = vscode.window.createWebviewPanel("aiFigmaCodegen.panel", "🎯 Project Preview", vscode.ViewColumn.Two, {
+        currentPanel = vscode.window.createWebviewPanel("aiFigmaCodegen.panel", "🎯 Project Preview", 
+        // ✅ Alltid i kolumn ETT för maximal bredd
+        vscode.ViewColumn.One, {
             enableScripts: true,
             retainContextWhenHidden: true,
             localResourceRoots: [vscode.Uri.file(path.join(context.extensionPath, "dist-webview"))],
@@ -219,7 +321,24 @@ function ensurePanel(context) {
                 else if (lastUiPhase === "loading") {
                     currentPanel.webview.postMessage({ type: "ui-phase", phase: "loading" });
                 }
-                // (Minimal UI) – ingen kandidat-proposal att posta längre
+                return;
+            }
+            // 🔹 Nytt: placering accepterad från webview (redo för ML/lagring)
+            if ((msg === null || msg === void 0 ? void 0 : msg.type) === "placementAccepted" && (msg === null || msg === void 0 ? void 0 : msg.payload)) {
+                try {
+                    // Exempel: spara till workspaceState för senare ML/kommandon
+                    const ws = vscode.workspace.getConfiguration(SETTINGS_NS);
+                    const persist = ws.get("persistPlacements", true);
+                    if (persist) {
+                        const key = "lastPlacement.v1";
+                        await vscode.workspace.getConfiguration().update(`${SETTINGS_NS}.${key}`, msg.payload, vscode.ConfigurationTarget.Workspace);
+                    }
+                    log("Placement accepted:", msg.payload);
+                    vscode.window.showInformationMessage("Placement mottagen. Redo för ML-analys.");
+                }
+                catch (e) {
+                    errlog("Kunde inte spara placement:", (e === null || e === void 0 ? void 0 : e.message) || String(e));
+                }
                 return;
             }
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "acceptCandidate") {
@@ -243,6 +362,10 @@ function ensurePanel(context) {
                 vscode.env.openExternal(vscode.Uri.parse(msg.url));
                 return;
             }
+            if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "enterFullView") {
+                await enterFullView(currentPanel);
+                return;
+            }
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "chat" && typeof msg.text === "string") {
                 log("[chat]", msg.text);
                 return;
@@ -252,7 +375,8 @@ function ensurePanel(context) {
         log("Webview HTML laddad.");
     }
     else {
-        currentPanel.reveal(vscode.ViewColumn.Two);
+        // ✅ Visa alltid i kolumn ETT
+        currentPanel.reveal(vscode.ViewColumn.One);
     }
     return currentPanel;
 }
@@ -339,13 +463,12 @@ async function startOrRespectfulFallback(c, context) {
     const { externalUrl } = await (0, runner_1.runInlineStaticServer)(storageDir);
     return { externalUrl, mode: "inline", watchRoot: storageDir };
 }
-/** Bygg mycket minimalistisk temporär preview i globalStorage (fritt från text/labels) */
+/** Minimal temporär preview i globalStorage */
 async function ensureStoragePreview(context) {
     const root = context.globalStorageUri.fsPath;
     const previewDir = path.join(root, "ai-figma-preview");
     await fsp.mkdir(previewDir, { recursive: true });
     const indexPath = path.join(previewDir, "index.html");
-    // Skriv alltid om för att säkerställa uppdaterad minimal version
     const html = `<!doctype html>
 <html lang="sv">
   <head>
@@ -361,25 +484,16 @@ async function ensureStoragePreview(context) {
       * { box-sizing: border-box; }
       html, body { height: 100%; }
       body { margin: 0; background: var(--bg); }
-      .mini {
-        width: 100%;
-        height: 100%;
-        background: var(--card);
-        border: 1px solid var(--border);
-      }
+      .mini { width: 100%; height: 100%; background: var(--card); border: 1px solid var(--border); }
     </style>
   </head>
-  <body>
-    <div class="mini"></div>
-  </body>
+  <body><div class="mini"></div></body>
 </html>`;
     await fsp.writeFile(indexPath, html, "utf8");
     return previewDir;
 }
 /**
- * Starta kandidatens preview:
- * - Minimal UI: använd alltid silentUntilReady där vi själva triggar start,
- *   och visa loader i webview tills verklig URL finns.
+ * Starta kandidatens preview (silent placeholder tills verklig URL finns)
  */
 async function startCandidatePreviewWithFallback(c, context, opts) {
     const panel = ensurePanel(context);
@@ -419,7 +533,6 @@ async function startCandidatePreviewWithFallback(c, context, opts) {
                     warn("Kunde inte stoppa placeholder-server:", e);
                 }
             }
-            // Klart
             lastUiPhase = "default";
             panel.webview.postMessage({ type: "ui-phase", phase: "default" });
         }
@@ -446,7 +559,7 @@ function toPickItems(candidates) {
 }
 async function showProjectQuickPick(context) {
     const panel = ensurePanel(context);
-    panel.reveal(vscode.ViewColumn.Two);
+    panel.reveal(vscode.ViewColumn.One); // ✅ håll oss i kolumn ETT
     if (!lastCandidates.length) {
         try {
             lastCandidates = await (0, detector_1.detectProjects)([]);
@@ -469,12 +582,15 @@ async function showProjectQuickPick(context) {
     if (!chosen)
         return;
     pendingCandidate = chosen._c;
-    // Minimal UI: visa loader + starta tyst
+    // Spara valet
+    await rememberCandidate(pendingCandidate, context);
+    // Maximal visningsyta + start
     lastUiPhase = "loading";
     panel.webview.postMessage({ type: "ui-phase", phase: "loading" });
+    await tryAutoFullView(panel, context);
     await startCandidatePreviewWithFallback(pendingCandidate, context, { silentUntilReady: true });
 }
-/* Välj mapp (onboarding) och starta i bakgrunden – oförändrat då det redan kör silent */
+/* Välj mapp (onboarding) */
 async function pickFolderAndStart(context) {
     const panel = ensurePanel(context);
     const uris = await vscode.window.showOpenDialog({
@@ -499,6 +615,9 @@ async function pickFolderAndStart(context) {
             return;
         }
         pendingCandidate = candidates[0];
+        // Spara valet
+        await rememberCandidate(pendingCandidate, context);
+        await tryAutoFullView(panel, context);
         await startCandidatePreviewWithFallback(pendingCandidate, context, { silentUntilReady: true });
     }
     catch (e) {
@@ -585,9 +704,27 @@ async function activate(context) {
     statusItem.command = "ai-figma-codegen.chooseProject";
     statusItem.show();
     context.subscriptions.push(statusItem);
+    // Uppdatera statusbar baserat på ihågkommet projekt (om finns)
+    (async () => {
+        const rem = await tryGetRememberedCandidate(context);
+        updateStatusBar(rem);
+    })();
     const scanCmd = vscode.commands.registerCommand("ai-figma-codegen.scanAndPreview", async () => {
         var _a;
         try {
+            // Försök först med ihågkommet projekt
+            const remembered = await tryGetRememberedCandidate(context);
+            if (remembered) {
+                const panel = ensurePanel(context);
+                pendingCandidate = remembered;
+                updateStatusBar(remembered);
+                panel.reveal(vscode.ViewColumn.One);
+                lastUiPhase = "loading";
+                panel.webview.postMessage({ type: "ui-phase", phase: "loading" });
+                await tryAutoFullView(panel, context);
+                await startCandidatePreviewWithFallback(remembered, context, { silentUntilReady: true });
+                return;
+            }
             const candidates = await (0, detector_1.detectProjects)([]);
             lastCandidates = candidates;
             if (!candidates.length) {
@@ -596,11 +733,12 @@ async function activate(context) {
             }
             const panel = ensurePanel(context);
             pendingCandidate = candidates[0];
-            panel.reveal(vscode.ViewColumn.Two);
+            panel.reveal(vscode.ViewColumn.One);
             if (candidates.length === 1 || ((_a = pendingCandidate === null || pendingCandidate === void 0 ? void 0 : pendingCandidate.confidence) !== null && _a !== void 0 ? _a : 0) >= AUTO_START_SURE_THRESHOLD) {
-                // Minimal UI: visa loader + starta tyst
                 lastUiPhase = "loading";
                 panel.webview.postMessage({ type: "ui-phase", phase: "loading" });
+                await rememberCandidate(pendingCandidate, context);
+                await tryAutoFullView(panel, context);
                 await startCandidatePreviewWithFallback(pendingCandidate, context, { silentUntilReady: true });
             }
             else {
@@ -613,6 +751,8 @@ async function activate(context) {
                 else if (choice === startTop) {
                     lastUiPhase = "loading";
                     panel.webview.postMessage({ type: "ui-phase", phase: "loading" });
+                    await rememberCandidate(pendingCandidate, context);
+                    await tryAutoFullView(panel, context);
                     await startCandidatePreviewWithFallback(pendingCandidate, context, { silentUntilReady: true });
                 }
             }
@@ -625,8 +765,19 @@ async function activate(context) {
     const openCmd = vscode.commands.registerCommand("ai-figma-codegen.openPanel", async () => {
         var _a;
         const panel = ensurePanel(context);
-        panel.reveal(vscode.ViewColumn.Two);
-        // Minimal UI: ingen auto-onboarding här, men om vi autostartar så gör det tyst med loader
+        panel.reveal(vscode.ViewColumn.One);
+        // AUTO: om vi har ett ihågkommet projekt – starta direkt
+        const remembered = await tryGetRememberedCandidate(context);
+        if (remembered) {
+            pendingCandidate = remembered;
+            updateStatusBar(remembered);
+            lastUiPhase = "loading";
+            panel.webview.postMessage({ type: "ui-phase", phase: "loading" });
+            await tryAutoFullView(panel, context);
+            await startCandidatePreviewWithFallback(remembered, context, { silentUntilReady: true });
+            return;
+        }
+        // Annars fallback till nuvarande logik …
         if (!pendingCandidate) {
             const candidates = await (0, detector_1.detectProjects)([]);
             lastCandidates = candidates;
@@ -635,6 +786,8 @@ async function activate(context) {
                 if (candidates.length === 1 || ((_a = pendingCandidate === null || pendingCandidate === void 0 ? void 0 : pendingCandidate.confidence) !== null && _a !== void 0 ? _a : 0) >= AUTO_START_SURE_THRESHOLD) {
                     lastUiPhase = "loading";
                     panel.webview.postMessage({ type: "ui-phase", phase: "loading" });
+                    await rememberCandidate(pendingCandidate, context);
+                    await tryAutoFullView(panel, context);
                     await startCandidatePreviewWithFallback(pendingCandidate, context, { silentUntilReady: true });
                 }
             }
@@ -651,6 +804,10 @@ async function activate(context) {
             errlog("ExportDataset fel:", (e === null || e === void 0 ? void 0 : e.message) || String(e));
             vscode.window.showErrorMessage(`ExportDataset misslyckades: ${(e === null || e === void 0 ? void 0 : e.message) || String(e)}`);
         }
+    });
+    // 🔹 Nytt: Glöm sparat projekt
+    const forgetCmd = vscode.commands.registerCommand("ai-figma-codegen.forgetProject", async () => {
+        await forgetRemembered(context);
     });
     // 🔹 URI-handler (Figma import) – visa onboarding först, starta sedan tyst
     const uriHandler = vscode.window.registerUriHandler({
@@ -669,7 +826,7 @@ async function activate(context) {
                 panel.webview.postMessage(lastInitPayload);
                 lastUiPhase = "onboarding";
                 panel.webview.postMessage({ type: "ui-phase", phase: "onboarding" });
-                panel.reveal(vscode.ViewColumn.Two);
+                panel.reveal(vscode.ViewColumn.One);
             }
             catch (e) {
                 errlog("URI-öppning misslyckades:", (e === null || e === void 0 ? void 0 : e.message) || String(e));
@@ -677,7 +834,7 @@ async function activate(context) {
             }
         },
     });
-    context.subscriptions.push(scanCmd, openCmd, chooseCmd, exportCmd, uriHandler);
+    context.subscriptions.push(scanCmd, openCmd, chooseCmd, exportCmd, uriHandler, forgetCmd);
     log("Extension aktiverad.");
 }
 async function deactivate() {

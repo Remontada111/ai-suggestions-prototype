@@ -31,6 +31,10 @@
       {
         "command": "ai-figma-codegen.exportFrontendDetectorDataset",
         "title": "AI Figma Codegen: Export Frontend Detector Dataset"
+      },
+      {
+        "command": "ai-figma-codegen.forgetProject",
+        "title": "AI Figma Codegen: Glöm valt projekt"
       }
     ],
     "configuration": {
@@ -40,6 +44,16 @@
           "type": "string",
           "default": "",
           "markdownDescription": "Din Figma Personal Access Token (Account → Settings → Developer tokens)."
+        },
+        "aiFigmaCodegen.autoFullView": {
+          "type": "boolean",
+          "default": true,
+          "description": "Öppna förhandsvisningen i 'Full View' (stänger side- och bottenpanel, enkel editorlayout) när flödet startar."
+        },
+        "aiFigmaCodegen.autoZenMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Växla VS Codes Zen Mode automatiskt när flödet startar (toggle). Rekommenderas endast efter opt-in."
         }
       }
     }

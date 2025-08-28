@@ -1,448 +1,527 @@
-/* ai-codegen-extension/webview/main.tsx 
-   --------------------------------------------------------------------------
-   Minimal UI:
-   - Endast Figma-design överst och projektets prereview (iframe) underst.
-   - Ingen statustext, ingen URI-text, inga zoom-/skala-kontroller.
-   - Iframen är alltid skalad till 67%.
-   - Behåll "Välj projekt…" och "Kopiera länk"-knapparna.
-   - Behåll "Skicka instruktioner"-knappen (chat-funktionen).
-   - Onboarding- och Loader-faser orörda.
-   -------------------------------------------------------------------------- */
+// webview/main.tsx
+// Interaktiv visning enligt önskemål:
+// 1) Initialt visas endast Figma-designen (övre lager).
+// 2) När användaren klickar/draggar på designen visas projektets preview UNDER (nedre lager),
+//    med Figma-lagret semitransparent så man kan placera genom att dra/släppa.
+// 3) Robust resize/drag med låst aspect (1280×800), min/max-gränser, och clamping i bildens koordinater.
+// 4) Stöd för Figma-token via både Authorization: Bearer (OAuth) och X-FIGMA-TOKEN (PAT).
+// 5) Skickar placementAccepted på släpp.
 
-/// <reference types="vite/client" />
-
-import React, {
-  useEffect,
-  useMemo,
-  useState,
-  useRef,
-} from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import {
-  QueryClient,
-  QueryClientProvider,
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query";
-import { Button } from "@/components/ui/button";
 import "./index.css";
 
-/* -------------------- Typer -------------------- */
-interface InitMessage {
-  type: "init";
-  taskId?: string;
-  fileKey: string;
-  nodeId: string;
-  token?: string;
-  figmaToken?: string;
-}
-interface DevUrlMessage { type: "devurl"; url: string; }
-interface UiPhaseMessage { type: "ui-phase"; phase: "onboarding" | "loading" | "default"; }
-interface UiErrorMessage { type: "ui-error"; message: string; }
-interface FigmaImageApiRes { images: Record<string, string>; err?: string; }
-
-/* ------------------ VS Code API ---------------- */
-declare const acquireVsCodeApi: any;
+declare function acquireVsCodeApi(): {
+  postMessage: (msg: any) => void;
+  getState: () => any;
+  setState: (state: any) => void;
+};
 const vscode = acquireVsCodeApi();
-vscode.postMessage({ type: "ready" });
 
-const queryClient = new QueryClient();
+// ─────────────────────────────────────────────────────────
+// Konstanter / utils
+// ─────────────────────────────────────────────────────────
+const PROJECT_BASE = { w: 1280, h: 800 };
+const PREVIEW_MIN_SCALE = 0.3;
+const PREVIEW_MAX_SCALE = 1.0;
+const OVERLAY_MIN_FACTOR = PREVIEW_MIN_SCALE;
+const FIGMA_FETCH_MAX_RETRIES = 6;
 
-/* ------------- Figma data-hook ----------------- */
-function useFigmaImage(
-  fileKey: string | null,
-  nodeId: string | null,
-  token: string | null,
-  scaleForApi: number
-) {
-  return useQuery<string>({
-    enabled: !!fileKey && !!nodeId && !!token && !!scaleForApi,
-    queryKey: ["figma-image", fileKey, nodeId, scaleForApi],
-    staleTime: 1000 * 60 * 60,
-    gcTime: 1000 * 60 * 60 * 24,
-    retry: 1,
-    queryFn: async () => {
-      const capped = Math.max(1, Math.min(4, Math.round(scaleForApi)));
-      const url = `https://api.figma.com/v1/images/${encodeURIComponent(
-        fileKey!
-      )}?ids=${encodeURIComponent(
-        nodeId!
-      )}&format=png&scale=${capped}&use_absolute_bounds=true`;
+ type UiPhase = "default" | "onboarding" | "loading";
+ type IncomingMsg =
+  | { type: "devurl"; url: string }
+  | { type: "ui-phase"; phase: UiPhase }
+  | { type: "init"; fileKey: string; nodeId: string; token?: string; figmaToken?: string }
+  | { type: "figma-image-url"; url: string };
 
-      const res = await fetch(url, { headers: { "X-Figma-Token": token! } });
-      if (!res.ok) {
-        const t = await res.text();
-        throw new Error(`Figma API ${res.status}: ${t}`);
-      }
-      const data = (await res.json()) as FigmaImageApiRes;
-      const img = data.images[nodeId!];
-      if (!img) throw new Error(data.err ?? "Ingen bild returnerad");
-      return img;
-    },
+ type Vec2 = { x: number; y: number };
+ type Rect = { x: number; y: number; w: number; h: number };
+
+ function clamp(n: number, lo: number, hi: number) {
+  return Math.max(lo, Math.min(hi, n));
+ }
+ function round(n: number) {
+  return Math.round(n);
+ }
+ function arFit(width: number, height: number, targetAR: number) {
+  const ar = width / height;
+  if (Math.abs(ar - targetAR) < 1e-6) return { w: width, h: height };
+  if (ar > targetAR) return { w: width, h: width / targetAR };
+  return { w: height * targetAR, h: height };
+ }
+
+// ─────────────────────────────────────────────────────────
+// Figma: hämta renditions-URL (prova Bearer → X-FIGMA-TOKEN)
+// ─────────────────────────────────────────────────────────
+async function resolveFigmaRenditionUrl(
+  fileKey: string,
+  nodeId: string,
+  token?: string
+): Promise<{ url: string | null; error?: { status: number; message: string } }> {
+  if (!fileKey || !nodeId || !token) {
+    return { url: null, error: { status: 0, message: "Saknar fileKey/nodeId/token" } };
+  }
+
+  const base = "https://api.figma.com/v1/images";
+  const params = new URLSearchParams({
+    ids: nodeId,
+    format: "png",
+    use_absolute_bounds: "true",
+    scale: "1",
   });
+  const endpoint = `${base}/${encodeURIComponent(fileKey)}?${params.toString()}`;
+
+  async function tryOnce(headers: Record<string, string>) {
+    const res = await fetch(endpoint, { headers });
+    let body: any = null;
+    try { body = await res.json(); } catch {}
+    return { ok: res.ok, status: res.status, body };
+  }
+
+  let attempt = 0;
+  while (attempt < FIGMA_FETCH_MAX_RETRIES) {
+    attempt++;
+    const r1 = await tryOnce({ Authorization: `Bearer ${token}` });
+    if (r1.ok) {
+      const u = r1.body?.images?.[nodeId] || null;
+      if (u) return { url: u };
+    } else if (r1.status === 401 || r1.status === 403) {
+      const r2 = await tryOnce({ "X-FIGMA-TOKEN": token });
+      if (r2.ok) {
+        const u = r2.body?.images?.[nodeId] || null;
+        if (u) return { url: u };
+      }
+      const msg = r2.body?.err || r1.body?.err || "Åtkomst nekad. Kontrollera token/scope/filåtkomst.";
+      return { url: null, error: { status: 403, message: String(msg) } };
+    }
+    await new Promise((r) => setTimeout(r, 300 * attempt));
+  }
+
+  return { url: null, error: { status: 500, message: "Kunde inte hämta Figma-bild efter flera försök." } };
 }
 
-/* ----------------- Hjälpare -------------------- */
-const announce = (m: string) => {
-  // skärmläsare (osynligt för UI)
-  const el = document.getElementById("sr-live");
-  if (el) el.textContent = m;
-};
-const copyToClipboard = async (text: string) => {
-  try { await navigator.clipboard.writeText(text); return true; }
-  catch {
-    const ta = document.createElement("textarea");
-    ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
-    document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); return true;
-  }
-};
+// ─────────────────────────────────────────────────────────
+// App
+// ─────────────────────────────────────────────────────────
+function App() {
+  // UI-phase, devurl, preview-reveal, fel
+  const [phase, setPhase] = useState<UiPhase>("default");
+  const [devUrl, setDevUrl] = useState<string | null>(null);
+  const [showPreview, setShowPreview] = useState(false); // ← initialt false (endast Figma syns)
+  const [figmaErr, setFigmaErr] = useState<string | null>(null);
 
-/* ----------------- Onboarding UI ---------------- */
-const Onboarding: React.FC<{ onPick: () => void }> = ({ onPick }) => {
-  return (
-    <div className="ob-shell">
-      <div className="ob-card">
-        <div className="ob-folder">
-          <div className="front-side">
-            <div className="tip" />
-            <div className="cover" />
-          </div>
-          <div className="back-side cover" />
-        </div>
-        <button className="ob-button" onClick={onPick} aria-label="Choose a folder">
-          Choose a folder
-        </button>
-      </div>
+  // Skalning baserat på tillgänglig höjd
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [containerH, setContainerH] = useState<number>(0);
+  const previewScale = useMemo(() => {
+    if (!containerH) return PREVIEW_MIN_SCALE;
+    const s = containerH / PROJECT_BASE.h;
+    return clamp(s, PREVIEW_MIN_SCALE, PREVIEW_MAX_SCALE);
+  }, [containerH]);
 
-      <style>{`
-        .ob-shell {
-          min-height: 70vh;
-          display: grid;
-          place-items: center;
-          padding: 24px;
-        }
-        .ob-card {
-          --transition: 350ms;
-          --folder-W: 120px;
-          --folder-H: 80px;
-          display: flex;
-          flex-direction: column;
-          align-items: center;
-          justify-content: flex-end;
-          padding: 10px;
-          background: linear-gradient(135deg, #6dd5ed, #2193b0);
-          border-radius: 15px;
-          box-shadow: 0 15px 30px rgba(0,0,0,.2);
-          height: calc(var(--folder-H) * 1.7);
-          width: min(420px, 90%);
-          position: relative;
-        }
-        .ob-folder {
-          position: absolute;
-          top: -20px;
-          left: calc(50% - 60px);
-          animation: ob-float 2.5s infinite ease-in-out;
-          transition: transform var(--transition) ease;
-        }
-        .ob-folder:hover { transform: scale(1.05); }
-        .ob-folder .front-side, .ob-folder .back-side {
-          position: absolute; transition: transform var(--transition); transform-origin: bottom center;
-        }
-        .ob-card:hover .front-side { transform: rotateX(-40deg) skewX(15deg); }
-        .ob-folder .back-side::before, .ob-folder .back-side::after {
-          content: ""; display: block; background-color: white; opacity: .5;
-          width: var(--folder-W); height: var(--folder-H); position: absolute;
-          transform-origin: bottom center; border-radius: 15px; transition: transform 350ms; z-index: 0;
-        }
-        .ob-card:hover .back-side::before { transform: rotateX(-5deg) skewX(5deg); }
-        .ob-card:hover .back-side::after  { transform: rotateX(-15deg) skewX(12deg); }
-        .ob-folder .front-side { z-index: 1; }
-        .ob-folder .tip {
-          background: linear-gradient(135deg, #ff9a56, #ff6f56);
-          width: 80px; height: 20px; border-radius: 12px 12px 0 0;
-          box-shadow: 0 5px 15px rgba(0,0,0,.2);
-          position: absolute; top: -10px; z-index: 2;
-        }
-        .ob-folder .cover {
-          background: linear-gradient(135deg, #ffe563, #ffc663);
-          width: var(--folder-W); height: var(--folder-H);
-          box-shadow: 0 15px 30px rgba(0,0,0,.3);
-          border-radius: 10px;
-        }
-        .ob-button {
-          font-size: 1.1em; color: #fff; text-align: center;
-          background: rgba(255,255,255,.2);
-          border: none; border-radius: 10px; cursor: pointer;
-          transition: background var(--transition) ease;
-          width: 100%; padding: 10px 35px; position: relative;
-        }
-        .ob-button:hover { background: rgba(255,255,255,.4); }
+  // Figma-bild + overlay i bildens koordinater
+  const [figmaSrc, setFigmaSrc] = useState<string | null>(null);
+  const [figmaN, setFigmaN] = useState<{ w: number; h: number } | null>(null);
+  const figmaImgRef = useRef<HTMLImageElement | null>(null);
+  const [overlay, setOverlay] = useState<Rect | null>(null);
 
-        @keyframes ob-float {
-          0% { transform: translateY(0) }
-          50% { transform: translateY(-20px) }
-          100% { transform: translateY(0) }
-        }
-      `}</style>
-    </div>
-  );
-};
+  // Drag/resize-state
+  const dragState = useRef<{
+    mode: "move" | "nw" | "ne" | "se" | "sw" | null;
+    startPt: Vec2;
+    startRect: Rect;
+  } | null>(null);
 
-/* ----------------- Loader UI -------------------- */
-const Loader: React.FC = () => {
-  return (
-    <div className="ld-shell">
-      <div className="ld-card">
-        <div className="ld-loader">
-          <p>loading</p>
-          <div className="ld-words">
-            <span className="ld-word">buttons</span>
-            <span className="ld-word">forms</span>
-            <span className="ld-word">switches</span>
-            <span className="ld-word">cards</span>
-            <span className="ld-word">buttons</span>
-          </div>
-        </div>
-      </div>
-
-      <style>{`
-        .ld-shell { min-height: 70vh; display: grid; place-items: center; }
-        .ld-card { --bg-color: #111; background-color: var(--bg-color); padding: 1rem 2rem; border-radius: 1.25rem; }
-        .ld-loader {
-          color: rgb(124,124,124); font-family: "Poppins", system-ui, sans-serif; font-weight: 500; font-size: 25px;
-          box-sizing: content-box; height: 40px; padding: 10px 10px; display: flex; border-radius: 8px;
-        }
-        .ld-words { overflow: hidden; position: relative; }
-        .ld-words::after {
-          content: ""; position: absolute; inset: 0;
-          background: linear-gradient(var(--bg-color) 10%, transparent 30%, transparent 70%, var(--bg-color) 90%);
-          z-index: 20;
-        }
-        .ld-word { display: block; height: 100%; padding-left: 6px; color: #956afa; animation: ld-spin 4s infinite; }
-        @keyframes ld-spin {
-          10% { transform: translateY(-102%); }
-          25% { transform: translateY(-100%); }
-          35% { transform: translateY(-202%); }
-          50% { transform: translateY(-200%); }
-          60% { transform: translateY(-302%); }
-          75% { transform: translateY(-300%); }
-          85% { transform: translateY(-402%); }
-          100% { transform: translateY(-400%); }
-        }
-      `}</style>
-    </div>
-  );
-};
-
-/* ----------------- Huvudkomponent ---------------- */
-type Phase = "onboarding" | "loading" | "ready";
-
-const AiPanel: React.FC = () => {
-  const [phase, setPhase] = useState<Phase>("ready");
-  const [initReceived, setInitReceived] = useState(false);
-  const [figmaInfo, setFigmaInfo] = useState<{ fileKey: string | null; nodeId: string | null; token: string | null; }>({ fileKey: null, nodeId: null, token: null });
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const queryClientLocal = useQueryClient();
-
-  useEffect(() => {
-    const listener = (e: MessageEvent<InitMessage | DevUrlMessage | UiPhaseMessage | UiErrorMessage | any>) => {
-      const msg = e.data;
-      if (!msg || typeof msg !== "object") return;
-
-      if ((msg as InitMessage).type === "init") {
-        const m = msg as InitMessage;
-        const tok = m.token ?? m.figmaToken ?? null;
-        setInitReceived(true);
-        setFigmaInfo({ fileKey: m.fileKey, nodeId: m.nodeId, token: tok });
-        return;
-      }
-      if ((msg as DevUrlMessage).type === "devurl") {
-        const m = msg as DevUrlMessage;
-        if (typeof m.url === "string") setPreviewUrl(m.url);
-        return;
-      }
-      if ((msg as UiPhaseMessage).type === "ui-phase") {
-        const p = (msg as UiPhaseMessage).phase;
-        if (p === "onboarding") setPhase("onboarding");
-        else if (p === "loading") setPhase("loading");
-        else setPhase("ready");
-        return;
-      }
-      if ((msg as UiErrorMessage).type === "ui-error") {
-        setPhase("onboarding");
-        alert((msg as UiErrorMessage).message || "Kunde inte starta projektet.");
-        return;
-      }
-    };
-    window.addEventListener("message", listener);
-    return () => window.removeEventListener("message", listener);
-  }, []);
-
-  // Figma-bild (intern API-skala för hög DPI, ej UI-zoom)
-  const figmaApiScale = useMemo(() => Math.max(2, Math.min(4, Math.ceil(window.devicePixelRatio * 2))), []);
-  const { data: figmaUrl, isLoading: figmaLoading, isError: figmaError } = useFigmaImage(
-    figmaInfo.fileKey, figmaInfo.nodeId, figmaInfo.token, figmaApiScale
-  );
-
-  // Växla från loader → ready
-  useEffect(() => {
-    if (phase !== "loading") return;
-    const devReady = !!previewUrl;
-    const figmaNeeded = initReceived && !!figmaInfo.token;
-    const figmaReady = !figmaNeeded || (!!figmaUrl && !figmaLoading && !figmaError);
-    if (devReady && figmaReady) setPhase("ready");
-  }, [phase, previewUrl, initReceived, figmaInfo.token, figmaUrl, figmaLoading, figmaError]);
-
-  // Fast iframe-skala 67%
-  const FIXED_SCALE = 0.67;
-  const previewFrameRef = useRef<HTMLDivElement | null>(null);
-  const [containerSize, setContainerSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
-
-  useEffect(() => {
-    const el = previewFrameRef.current;
-    if (!el) return;
+  // Följ editorhöjden
+  useLayoutEffect(() => {
+    if (!rootRef.current) return;
     const ro = new ResizeObserver((entries) => {
-      const cr = entries[0]?.contentRect;
-      if (!cr) return;
-      setContainerSize({ w: Math.max(0, cr.width), h: Math.max(0, cr.height) });
+      const e = entries[entries.length - 1];
+      if (!e) return;
+      const h = e.contentRect.height;
+      setContainerH(h - 16);
     });
-    ro.observe(el);
+    ro.observe(rootRef.current);
     return () => ro.disconnect();
   }, []);
 
-  // Chat
-  const [chat, setChat] = useState("");
+  // Meddelanden från extension
+  useEffect(() => {
+    function onMsg(ev: MessageEvent) {
+      const msg = ev.data as IncomingMsg;
+      if (!msg || typeof msg !== "object") return;
 
-  /* ---------------- Render ---------------- */
+      if (msg.type === "devurl") {
+        setDevUrl(msg.url);
+        return;
+      }
+      if (msg.type === "ui-phase") {
+        setPhase(msg.phase);
+        return;
+      }
+      if (msg.type === "figma-image-url" && typeof msg.url === "string") {
+        setFigmaSrc(msg.url);
+        setFigmaErr(null);
+        return;
+      }
+      if (msg.type === "init") {
+        (async () => {
+          const { url, error } = await resolveFigmaRenditionUrl(
+            msg.fileKey,
+            msg.nodeId,
+            msg.figmaToken || msg.token
+          );
+          if (url) {
+            setFigmaSrc(url);
+            setFigmaErr(null);
+          } else {
+            setFigmaSrc(null);
+            const hint =
+              error?.status === 401 || error?.status === 403
+                ? "Åtkomst nekad (401/403). Säkerställ token/scope/filåtkomst."
+                : error?.message || "Okänt fel vid hämtning av Figma-bild.";
+            setFigmaErr(hint);
+            console.error("[Figma images] error", error);
+          }
+        })();
+        return;
+      }
+    }
+    window.addEventListener("message", onMsg);
+    vscode.postMessage({ type: "ready" });
+    return () => window.removeEventListener("message", onMsg);
+  }, []);
 
-  if (phase === "onboarding") {
-    return (
-      <div className="panel-root bg-background text-foreground">
-        <div id="sr-live" className="sr-only" aria-live="polite" />
-        <Onboarding onPick={() => vscode.postMessage({ cmd: "pickFolder" })} />
-      </div>
-    );
+  // När Figma-lagret laddats → initiera overlay
+  const onFigmaLoad = useCallback(() => {
+    const el = figmaImgRef.current;
+    if (!el) return;
+    const natural = { w: el.naturalWidth || el.width, h: el.naturalHeight || el.height };
+    setFigmaN(natural);
+
+    const maxW = Math.min(natural.w, PROJECT_BASE.w);
+    const maxH = Math.min(natural.h, PROJECT_BASE.h);
+    const ar = PROJECT_BASE.w / PROJECT_BASE.h;
+    const sized = arFit(maxW, maxH, ar);
+    const w = Math.min(sized.w, maxW);
+    const h = Math.min(sized.h, maxH);
+
+    const rect: Rect = {
+      w: round(w),
+      h: round(h),
+      x: round((natural.w - w) / 2),
+      y: round((natural.h - h) / 2),
+    };
+    setOverlay(rect);
+  }, []);
+
+  // Koordinater & skalor
+  const stageH = useMemo(() => round(PROJECT_BASE.h * previewScale), [previewScale]);
+  const stageW = useMemo(() => round(PROJECT_BASE.w * previewScale), [previewScale]);
+  const imageDisplayScale = useMemo(() => {
+    if (!figmaN || figmaN.h === 0) return 1;
+    return stageH / figmaN.h;
+  }, [figmaN, stageH]);
+
+  const imageDisplayW = useMemo(
+    () => (figmaN ? round(figmaN.w * imageDisplayScale) : 0),
+    [figmaN, imageDisplayScale]
+  );
+
+  const overlayLimits = useMemo(() => {
+    if (!figmaN) return null;
+    const minW = Math.min(figmaN.w, PROJECT_BASE.w * OVERLAY_MIN_FACTOR);
+    const minH = Math.min(figmaN.h, PROJECT_BASE.h * OVERLAY_MIN_FACTOR);
+    const maxW = Math.min(figmaN.w, PROJECT_BASE.w);
+    const maxH = Math.min(figmaN.h, PROJECT_BASE.h);
+    const ar = PROJECT_BASE.w / PROJECT_BASE.h;
+    return { minW, minH, maxW, maxH, ar };
+  }, [figmaN]);
+
+  function clampRectToImage(r: Rect): Rect {
+    if (!figmaN) return r;
+    const x = clamp(r.x, 0, figmaN.w - r.w);
+    const y = clamp(r.y, 0, figmaN.h - r.h);
+    return { ...r, x, y };
+  }
+  function clampSizeToLimits(w: number, h: number): { w: number; h: number } {
+    if (!overlayLimits) return { w, h };
+    const W = clamp(w, overlayLimits.minW, overlayLimits.maxW);
+    const H = clamp(h, overlayLimits.minH, overlayLimits.maxH);
+    const sized = arFit(W, H, overlayLimits.ar);
+    return {
+      w: clamp(sized.w, overlayLimits.minW, overlayLimits.maxW),
+      h: clamp(sized.h, overlayLimits.minH, overlayLimits.maxH),
+    };
   }
 
-  if (phase === "loading") {
-    return (
-      <div className="panel-root bg-background text-foreground">
-        <div id="sr-live" className="sr-only" aria-live="polite" />
-        <Loader />
-      </div>
-    );
-  }
+  // Drag/resize
+  const figmaWrapRef = useRef<HTMLDivElement | null>(null);
 
-  // Ready
+  const toImageCoords = useCallback(
+    (clientX: number, clientY: number): Vec2 => {
+      const wrap = figmaWrapRef.current;
+      if (!wrap || imageDisplayScale === 0) return { x: 0, y: 0 };
+      const b = wrap.getBoundingClientRect();
+      const x = (clientX - b.left) / imageDisplayScale;
+      const y = (clientY - b.top) / imageDisplayScale;
+      return { x, y };
+    },
+    [imageDisplayScale]
+  );
+
+  const startMove = useCallback(
+    (e: React.PointerEvent) => {
+      if (!overlay) return;
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      document.body.classList.add("dragging");
+      setShowPreview(true); // ← visa preview under när man börjar interagera
+      dragState.current = {
+        mode: "move",
+        startPt: toImageCoords(e.clientX, e.clientY),
+        startRect: { ...overlay },
+      };
+    },
+    [overlay, toImageCoords]
+  );
+
+  const startResize = useCallback(
+    (mode: "nw" | "ne" | "se" | "sw") =>
+      (e: React.PointerEvent) => {
+        if (!overlay) return;
+        (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+        document.body.classList.add("dragging");
+        setShowPreview(true); // ← visa preview under
+        dragState.current = {
+          mode,
+          startPt: toImageCoords(e.clientX, e.clientY),
+          startRect: { ...overlay },
+        };
+      },
+    [overlay, toImageCoords]
+  );
+
+  const onPointerMove = useCallback(
+    (e: React.PointerEvent) => {
+      if (!dragState.current || !overlay || !figmaN) return;
+      const st = dragState.current;
+      const pt = toImageCoords(e.clientX, e.clientY);
+      const dx = pt.x - st.startPt.x;
+      const dy = pt.y - st.startPt.y;
+
+      if (st.mode === "move") {
+        const next = clampRectToImage({
+          ...st.startRect,
+          x: st.startRect.x + dx,
+          y: st.startRect.y + dy,
+        });
+        setOverlay(next);
+        return;
+      }
+
+      const ar = PROJECT_BASE.w / PROJECT_BASE.h;
+      let { x, y, w, h } = st.startRect;
+
+      if (st.mode === "nw") {
+        let newW = st.startRect.w - dx;
+        let newH = st.startRect.h - dy;
+        ({ w: newW, h: newH } = clampSizeToLimits(arFit(newW, newH, ar).w, arFit(newW, newH, ar).h));
+        x = st.startRect.x + (st.startRect.w - newW);
+        y = st.startRect.y + (st.startRect.h - newH);
+        w = newW; h = newH;
+      } else if (st.mode === "ne") {
+        let newW = st.startRect.w + dx;
+        let newH = st.startRect.h - dy;
+        ({ w: newW, h: newH } = clampSizeToLimits(arFit(newW, newH, ar).w, arFit(newW, newH, ar).h));
+        x = st.startRect.x;
+        y = st.startRect.y + (st.startRect.h - newH);
+        w = newW; h = newH;
+      } else if (st.mode === "se") {
+        let newW = st.startRect.w + dx;
+        let newH = st.startRect.h + dy;
+        ({ w: newW, h: newH } = clampSizeToLimits(arFit(newW, newH, ar).w, arFit(newW, newH, ar).h));
+        x = st.startRect.x; y = st.startRect.y;
+        w = newW; h = newH;
+      } else if (st.mode === "sw") {
+        let newW = st.startRect.w - dx;
+        let newH = st.startRect.h + dy;
+        ({ w: newW, h: newH } = clampSizeToLimits(arFit(newW, newH, ar).w, arFit(newW, newH, ar).h));
+        x = st.startRect.x + (st.startRect.w - newW);
+        y = st.startRect.y;
+        w = newW; h = newH;
+      }
+
+      const next = clampRectToImage({ x, y, w, h });
+      setOverlay(next);
+    },
+    [overlay, figmaN, toImageCoords]
+  );
+
+  const onPointerUp = useCallback(() => {
+    if (!dragState.current || !overlay || !figmaN) return;
+    dragState.current = null;
+    document.body.classList.remove("dragging");
+
+    // Dölj preview efter interaktion ("reveal on interact")
+    setTimeout(() => setShowPreview(false), 100);
+
+    const scale = { sx: PROJECT_BASE.w / overlay.w, sy: PROJECT_BASE.h / overlay.h };
+    vscode.postMessage({
+      type: "placementAccepted",
+      payload: {
+        imageNatural: { ...figmaN },
+        overlay,
+        projectBase: { ...PROJECT_BASE },
+        scale,
+        ts: Date.now(),
+        source: "webview/main.tsx",
+      },
+    });
+  }, [overlay, figmaN]);
+
+  // Render
+
   return (
-    <div className="panel-root bg-background text-foreground">
-      <div id="sr-live" className="sr-only" aria-live="polite" />
-
-      {/* Minimala topp-actions (inga texter/status/URI) */}
-      <div className="px-4 pt-3 flex items-center justify-end gap-2">
-        <Button onClick={() => vscode.postMessage({ cmd: "chooseProject" })}>
-          Välj projekt…
-        </Button>
-        <Button
-          onClick={async () => {
-            if (!previewUrl) return;
-            const ok = await copyToClipboard(previewUrl);
-            if (ok) announce("Länk kopierad.");
+    <div ref={rootRef} className="panel-root px-4 pt-3" style={{ height: "100vh" }}>
+      {/* En enda scen: preview underst (osynlig tills interaktion), Figma ovanpå */}
+      <div
+        className="stage"
+        style={{
+          position: "relative",
+          width: stageW,
+          height: stageH,
+        }}
+      >
+        {/* UNDERLAGER: projektets preview */}
+        <div
+          className="laptop-shell"
+          style={{
+            position: "absolute",
+            inset: 0,
+            // visa bara under interaktion
+            visibility: showPreview && devUrl && phase === "default" ? "visible" : "hidden",
           }}
-          disabled={!previewUrl}
-          aria-label="Kopiera förhandsvisningslänk"
         >
-          Kopiera länk
-        </Button>
-      </div>
-
-      {/* Figma (ingen text/overlay/hint) */}
-      <div className="preview-shell">
-        <div className={`preview-grid ${figmaUrl ? "is-ready" : figmaLoading ? "is-loading" : "is-error"}`}>
-          {figmaLoading && <div className="skeleton" aria-hidden="true" />}
-          {figmaUrl && !figmaLoading && !figmaError && (
-            <img
-              src={figmaUrl}
-              alt=""
-              className="figma-img"
-              loading="lazy"
-              decoding="async"
-              fetchPriority="high"
-              draggable={false}
-            />
-          )}
-          {/* Vid fel: visa inget textinnehåll */}
+          {(!devUrl || phase !== "default") && <div className="skeleton" aria-hidden="true" />}
+          {devUrl && (
+            <iframe
+              title="preview"
+              src={devUrl}
+              className="mini-preview__iframe"
+              style={{ pointerEvents: dragState.current ? "none" : "auto" }}
+            />)
+          }
         </div>
-      </div>
 
-      {/* Projektets preview (vit bakgrund, fast skala 67%) */}
-      {previewUrl && (
-        <div className="px-4">
-          <div className="mini-preview card-elevated">
+        {/* ÖVERLAGER: Figma-bilden + overlay/handles */}
+        <div
+          ref={figmaWrapRef}
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "grid",
+            alignItems: "start",
+          }}
+        >
+          {figmaErr && (
             <div
-              ref={previewFrameRef}
-              className="mini-preview__frame"
-              style={{ backgroundColor: "#fff", overflow: "hidden", position: "relative" }}
+              style={{
+                height: stageH,
+                display: "grid",
+                alignItems: "center",
+                justifyItems: "center",
+                border: "1px dashed var(--border)",
+                borderRadius: 12,
+                padding: 16,
+              }}
             >
-              <iframe
-                src={previewUrl}
-                title="Project preview"
-                className="mini-preview__iframe"
-                sandbox="allow-scripts allow-forms allow-same-origin"
+              <div className="text-foreground" style={{ maxWidth: 560, lineHeight: 1.4 }}>
+                <strong>Figma-bild kunde inte hämtas.</strong>
+                <div style={{ marginTop: 8 }}>{figmaErr}</div>
+              </div>
+            </div>
+          )}
+
+          {!figmaErr && figmaSrc && (
+            <div style={{ position: "relative", width: stageW, height: stageH }}>
+              <img
+                ref={figmaImgRef}
+                src={figmaSrc}
+                alt="Figma node"
+                className="figma-img"
+                draggable={false}
+                onLoad={onFigmaLoad}
+                onPointerDown={() => setShowPreview(true)} // klick visar preview under
                 style={{
-                  width: containerSize.w > 0 ? `${containerSize.w / FIXED_SCALE}px` : "100%",
-                  height: containerSize.h > 0 ? `${containerSize.h / FIXED_SCALE}px` : "100%",
-                  transform: `scale(${FIXED_SCALE})`,
-                  transformOrigin: "top left",
+                  width: "100%",
+                  height: "100%",
                   display: "block",
-                  border: "0",
-                  backgroundColor: "#fff",
+                  userSelect: "none",
+                  pointerEvents: "auto",
+                  transition: "opacity 120ms ease",
+                  // gör Figma-lagret lätt transparent under interaktion så preview syns tydligt
+                  opacity: showPreview ? 0.8 : 1,
                 }}
               />
-            </div>
-          </div>
-        </div>
-      )}
 
-      {/* Chat: behåll endast knapptexten "Skicka instruktioner" */}
-      <div className="chatbar">
-        <div className="chatbar__inner">
-          <input
-            type="text"
-            className="flex-1 input"
-            placeholder=""
-            value={chat}
-            onChange={(e) => setChat(e.currentTarget.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && chat.trim()) {
-                vscode.postMessage({ cmd: "chat", text: chat.trim() }); setChat("");
-              }
-            }}
-            aria-label="Instruktioner"
-          />
-          <Button
-            onClick={() => {
-              if (!chat.trim()) return;
-              vscode.postMessage({ cmd: "chat", text: chat.trim() }); setChat("");
-            }}
-            disabled={!chat.trim()}
-          >
-            Skicka instruktioner
-          </Button>
+              {/* Overlay/markeringsruta i visade px */}
+              {overlay && (
+                <div
+                  className="overlay-box"
+                  role="region"
+                  aria-label="Placering"
+                  onPointerDown={startMove}
+                  onPointerMove={onPointerMove}
+                  onPointerUp={onPointerUp}
+                  onPointerCancel={onPointerUp}
+                  style={{
+                    position: "absolute",
+                    left: round(overlay.x * imageDisplayScale),
+                    top: round(overlay.y * imageDisplayScale),
+                    width: round(overlay.w * imageDisplayScale),
+                    height: round(overlay.h * imageDisplayScale),
+                    border: "2px solid var(--accent)",
+                    borderRadius: 8,
+                    boxShadow: "0 0 0 2px rgba(0,0,0,.06), 0 1px 6px rgba(0,0,0,.2)",
+                    background: "transparent",
+                    cursor: "move",
+                  }}
+                >
+                  {/* Resize-handles */}
+                  <div className="resize-handle handle-nw" onPointerDown={startResize("nw")} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerUp} />
+                  <div className="resize-handle handle-ne" onPointerDown={startResize("ne")} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerUp} />
+                  <div className="resize-handle handle-se" onPointerDown={startResize("se")} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerUp} />
+                  <div className="resize-handle handle-sw" onPointerDown={startResize("sw")} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerUp} />
+                </div>
+              )}
+            </div>
+          )}
+
+          {!figmaErr && !figmaSrc && (
+            <div
+              style={{
+                height: stageH,
+                display: "grid",
+                placeItems: "center",
+                border: "1px dashed var(--border)",
+                borderRadius: 12,
+                padding: 12,
+              }}
+            >
+              <div className="text-foreground" style={{ opacity: 0.8 }}>
+                {phase === "onboarding" ? "Öppna via Figma-URI för att ladda en nod." : "Laddar Figma-bild…"}
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>
   );
-};
+}
 
-/* ---------------- Bootstrap ------------------- */
+// Montera appen
 const rootEl = document.getElementById("root");
 if (rootEl) {
-  createRoot(rootEl).render(
-    <QueryClientProvider client={queryClient}>
-      <AiPanel />
-    </QueryClientProvider>
-  );
-} else {
-  console.error("Hittade inte #root i webview HTML.");
+  const root = createRoot(rootEl);
+  root.render(<App />);
 }
