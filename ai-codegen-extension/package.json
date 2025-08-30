@@ -2,7 +2,7 @@
   "name": "ai-figma-codegen",
   "displayName": "AI Figma Codegen",
   "publisher": "crnolic",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Förhandsvisa och importera Figma-komponenter direkt i VS Code.",
   "engines": {
     "vscode": "^1.102.0"
@@ -50,10 +50,20 @@
           "default": true,
           "description": "Öppna förhandsvisningen i 'Full View' (stänger side- och bottenpanel, enkel editorlayout) när flödet startar."
         },
+        "aiFigmaCodegen.autoWindowFullScreen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Växla VS Codes riktiga helskärm (F11) när flödet startar. Rekommenderas på Windows för stabil rendering."
+        },
         "aiFigmaCodegen.autoZenMode": {
           "type": "boolean",
           "default": false,
           "description": "Växla VS Codes Zen Mode automatiskt när flödet startar (toggle). Rekommenderas endast efter opt-in."
+        },
+        "aiFigmaCodegen.autoStartOnImport": {
+          "type": "boolean",
+          "default": true,
+          "description": "Starta automatiskt det senast valda (ihågkomna) projektet vid import av valfri Figma-URI (oavsett fileKey/node)."
         }
       }
     }
