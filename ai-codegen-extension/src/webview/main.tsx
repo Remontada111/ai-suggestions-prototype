@@ -530,40 +530,51 @@ function App() {
       style={{ position: "fixed", inset: 0, padding: CANVAS_MARGIN }}
       onWheel={onWheel}
     >
-      {/* UNDERLAGER: Laptop-UI (projektets preview) */}
-      <div
-        className="laptop-shell"
+     {/* Laptop-UI */}
+<div
+  className="laptop-shell"
+  style={{
+    position: "absolute",
+    left: stageDims.left + CANVAS_MARGIN,
+    top:  stageDims.top  + CANVAS_MARGIN,
+    width: stageDims.w,            // klippruta
+    height: stageDims.h,
+    zIndex: 5,
+    visibility: devUrl ? "visible" : "hidden",
+    overflow: "hidden",
+  }}
+>
+  {(!devUrl || phase !== "default") && (
+    <div className="skeleton" aria-hidden="true" style={{ width: "100%", height: "100%", borderRadius: 12 }} />
+  )}
+
+  {devUrl && (
+    <div
+      style={{
+        position: "absolute",
+        left: 0, top: 0,
+        width: PROJECT_BASE.w,
+        height: PROJECT_BASE.h,
+        transform: `scale(${stageDims.scale})`,
+        transformOrigin: "top left",
+      }}
+    >
+      <iframe
+        title="preview"
+        src={devUrl}
+        sandbox="allow-scripts allow-forms allow-same-origin"
         style={{
-          position: "absolute",
-          left: stageDims.left + CANVAS_MARGIN,
-          top: stageDims.top + CANVAS_MARGIN,
-          width: stageDims.w,
-          height: stageDims.h,
-          zIndex: 5,
-          visibility: devUrl ? "visible" : "hidden",
+          width: PROJECT_BASE.w,
+          height: PROJECT_BASE.h,
+          border: 0,
+          pointerEvents: "none",
+          background: "#fff",
+          display: "block",
         }}
-      >
-        {(!devUrl || phase !== "default") && (
-          <div className="skeleton" aria-hidden="true" style={{ width: "100%", height: "100%", borderRadius: 12 }} />
-        )}
-        {devUrl && (
-          <iframe
-            title="preview"
-            src={devUrl}
-            sandbox="allow-scripts allow-forms allow-same-origin"
-            className="mini-preview__iframe"
-            style={{
-              width: "100%",
-              height: "100%",
-              border: 0,
-              pointerEvents: "none",
-              position: "relative",
-              zIndex: 0,
-              background: "#fff",
-            }}
-          />
-        )}
-      </div>
+      />
+    </div>
+  )}
+</div>
 
       {/* ÖVERLAGER: Onboarding-kort */}
       <ChooseProjectCard visible={showChooseCard} compact={!!devUrl && phase === "default"} busy={phase === "loading"} />
