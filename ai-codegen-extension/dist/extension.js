@@ -173,11 +173,11 @@ function resolveBundledModelPath(context) {
     return undefined;
 }
 /* ─────────────────────────────────────────────────────────
-   Kom-ihåg valt projekt + Maximal visningsyta
+   Kom-ihåg valt projekt + Zen-mode-hantering
    ───────────────────────────────────────────────────────── */
 const STORAGE_KEYS = { remembered: "aiFigmaCodegen.rememberedProject.v1" };
 const SETTINGS_NS = "aiFigmaCodegen";
-const STORAGE_KEYS_UI = { askedFullView: "ui.askedFullView.v1" };
+const STORAGE_KEYS_UI = { askedFullView: "ui.askedFullView.v1", zenApplied: "ui.zenApplied.v1" };
 function updateStatusBar(current) {
     if (!statusItem)
         return;
@@ -222,34 +222,21 @@ async function tryGetRememberedCandidate(context) {
     catch ( /* ignore */_b) { /* ignore */ }
     return null;
 }
-/** Gör webviewen så stor som möjligt inom VS Code (utan OS-helskärm). */
+/** Visa panelen i editor-kolumnen. */
 async function enterFullView(panel) {
-    try {
-        await vscode.commands.executeCommand("workbench.action.editorLayoutSingle");
-    }
-    catch (_a) { }
-    try {
-        await vscode.commands.executeCommand("workbench.action.closePanel");
-    }
-    catch (_b) { }
-    try {
-        await vscode.commands.executeCommand("workbench.action.closeSidebar");
-    }
-    catch (_d) { }
     try {
         panel === null || panel === void 0 ? void 0 : panel.reveal(vscode.ViewColumn.One, false);
     }
-    catch (_e) { }
+    catch (_a) { }
 }
-/** Auto-”full view”; OS-helskärm (F11) om aktiverat i settings. */
+/** Maxa Zen Mode. Stäng terminalpanelen. Aldrig OS-helskärm. */
 async function tryAutoFullView(panel, context) {
     var _a;
     const cfg = vscode.workspace.getConfiguration(SETTINGS_NS);
-    const autoFull = cfg.get("autoFullView", true);
-    const useZen = cfg.get("autoZenMode", false);
-    const useWinFS = cfg.get("autoWindowFullScreen", true); // ⬅️ ny
+    const useZen = cfg.get("autoZenMode", true);
+    const useWinFS = cfg.get("autoWindowFullScreen", false);
     const asked = context.globalState.get(STORAGE_KEYS_UI.askedFullView, false);
-    // Engångsfråga om autoFullView inte är explicit satt av användaren
+    // Engångsfråga kvar för bakåtkompabilitet
     if (!asked && ((_a = cfg.inspect("autoFullView")) === null || _a === void 0 ? void 0 : _a.globalValue) === undefined) {
         await context.globalState.update(STORAGE_KEYS_UI.askedFullView, true);
         const yes = "Ja, kör Full View";
@@ -258,29 +245,51 @@ async function tryAutoFullView(panel, context) {
         try {
             await cfg.update("autoFullView", pick === yes, vscode.ConfigurationTarget.Global);
         }
-        catch ( /* ignore */_b) { /* ignore */ }
+        catch (_b) { }
     }
-    const finalAutoFull = vscode.workspace.getConfiguration(SETTINGS_NS).get("autoFullView", true);
-    if (finalAutoFull || autoFull)
-        await enterFullView(panel);
-    // 🚀 Riktig helskärm (F11) istället för att förlita oss på Zen Mode
-    if (useWinFS) {
+    await enterFullView(panel);
+    if (useZen) {
+        // Zen Mode utan OS-helskärm och med maximal arbetsyta
         try {
-            await vscode.commands.executeCommand("workbench.action.toggleFullScreen");
-            // liten paus + ping till webview för reflow
-            await new Promise((r) => setTimeout(r, 120));
-            panel === null || panel === void 0 ? void 0 : panel.webview.postMessage({ type: "ui-phase", phase: lastUiPhase });
+            const zenCfg = vscode.workspace.getConfiguration("zenMode");
+            await zenCfg.update("fullScreen", false, vscode.ConfigurationTarget.Workspace);
+            await zenCfg.update("centerLayout", true, vscode.ConfigurationTarget.Workspace);
+            await zenCfg.update("hideActivityBar", true, vscode.ConfigurationTarget.Workspace);
+            await zenCfg.update("hideStatusBar", true, vscode.ConfigurationTarget.Workspace);
+            await zenCfg.update("restore", true, vscode.ConfigurationTarget.Workspace);
         }
         catch (_d) { }
-    }
-    // Zen Mode (opt-in). Kan lämnas avstängt p.g.a. kända fullscreen-quirks på Windows.
-    if (useZen) {
+        const alreadyApplied = context.globalState.get(STORAGE_KEYS_UI.zenApplied, false);
+        if (!alreadyApplied) {
+            try {
+                await vscode.commands.executeCommand("workbench.action.toggleZenMode");
+            }
+            catch (_e) { }
+            try {
+                await context.globalState.update(STORAGE_KEYS_UI.zenApplied, true);
+            }
+            catch (_f) { }
+        }
+        // Stäng terminal/panel för att frigöra yta
         try {
-            await vscode.commands.executeCommand("workbench.action.toggleZenMode");
-            await new Promise((r) => setTimeout(r, 120));
+            await vscode.commands.executeCommand("workbench.action.closePanel");
+        }
+        catch (_g) { }
+        // Stabilisera layout och synka webview-fas
+        try {
+            await new Promise(r => setTimeout(r, 120));
             panel === null || panel === void 0 ? void 0 : panel.webview.postMessage({ type: "ui-phase", phase: lastUiPhase });
         }
-        catch (_e) { }
+        catch (_h) { }
+    }
+    if (useWinFS) {
+        // Endast om användaren uttryckligen valt detta
+        try {
+            await vscode.commands.executeCommand("workbench.action.toggleFullScreen");
+            await new Promise(r => setTimeout(r, 120));
+            panel === null || panel === void 0 ? void 0 : panel.webview.postMessage({ type: "ui-phase", phase: lastUiPhase });
+        }
+        catch (_j) { }
     }
 }
 function buildFigmaImagesEndpoint(fileKey, nodeId) {
@@ -378,7 +387,6 @@ async function sendFreshFigmaImageUrlToWebview(source) {
     }
     else {
         errlog(`Figma URL misslyckades (${source}):`, res.status, res.message);
-        // Skicka ett UI-fel till webview (om den väljer att visa det)
         currentPanel.webview.postMessage({
             type: "ui-error",
             message: `Figma-bild kunde inte hämtas (${res.status}). ${res.message}`,
@@ -391,13 +399,12 @@ async function sendFreshFigmaImageUrlToWebview(source) {
 function ensurePanel(context) {
     if (!currentPanel) {
         log("Skapar ny Webview-panel …");
-        currentPanel = vscode.window.createWebviewPanel("aiFigmaCodegen.panel", "🎯 Project Preview", vscode.ViewColumn.One, // ✅ alltid kolumn 1
-        {
+        currentPanel = vscode.window.createWebviewPanel("aiFigmaCodegen.panel", "🎯 Project Preview", vscode.ViewColumn.One, {
             enableScripts: true,
             retainContextWhenHidden: true,
             localResourceRoots: [vscode.Uri.file(path.join(context.extensionPath, "dist-webview"))],
         });
-        currentPanel.onDidDispose(() => {
+        currentPanel.onDidDispose(async () => {
             log("Panel stängdes – städar upp servrar och state.");
             currentPanel = undefined;
             lastDevUrl = null;
@@ -405,20 +412,30 @@ function ensurePanel(context) {
             pendingCandidate = null;
             lastUiPhase = "default";
             stopReloadWatcher();
-            (async () => {
+            try {
+                await (0, runner_1.stopDevServer)();
+            }
+            catch (e) {
+                warn("stopDevServer fel:", e);
+            }
+            try {
+                await (0, runner_1.stopInlineServer)();
+            }
+            catch (e) {
+                warn("stopInlineServer fel:", e);
+            }
+            // 🔄 Lämna Zen Mode om vi slog på det
+            const zenApplied = context.globalState.get(STORAGE_KEYS_UI.zenApplied, false);
+            if (zenApplied) {
                 try {
-                    await (0, runner_1.stopDevServer)();
+                    await vscode.commands.executeCommand("workbench.action.toggleZenMode");
                 }
-                catch (e) {
-                    warn("stopDevServer fel:", e);
-                }
+                catch (_a) { }
                 try {
-                    await (0, runner_1.stopInlineServer)();
+                    await context.globalState.update(STORAGE_KEYS_UI.zenApplied, false);
                 }
-                catch (e) {
-                    warn("stopInlineServer fel:", e);
-                }
-            })();
+                catch (_b) { }
+            }
         });
         currentPanel.webview.onDidReceiveMessage(async (msg) => {
             var _a, _b;
@@ -495,7 +512,6 @@ function ensurePanel(context) {
             }
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "enterFullView") {
                 await enterFullView(currentPanel);
-                // extra ping för stabil layout
                 try {
                     await new Promise(r => setTimeout(r, 60));
                     currentPanel === null || currentPanel === void 0 ? void 0 : currentPanel.webview.postMessage({ type: "ui-phase", phase: lastUiPhase });
@@ -722,7 +738,7 @@ async function showProjectQuickPick(context) {
     pendingCandidate = chosen._c;
     // Spara valet som globalt standardprojekt
     await rememberCandidate(pendingCandidate, context);
-    // Maximal visningsyta + start
+    // Start
     lastUiPhase = "loading";
     panel.webview.postMessage({ type: "ui-phase", phase: "loading" });
     await tryAutoFullView(panel, context);
@@ -947,7 +963,7 @@ async function activate(context) {
     const forgetCmd = vscode.commands.registerCommand("ai-figma-codegen.forgetProject", async () => {
         await forgetRemembered(context);
     });
-    // 🔹 URI-handler (Figma import) – autostarta globalt ihågkommet projekt; annars detektera+spara+starta
+    // 🔹 URI-handler (Figma import)
     const uriHandler = vscode.window.registerUriHandler({
         handleUri: async (uri) => {
             try {
@@ -963,9 +979,9 @@ async function activate(context) {
                 lastInitPayload = { type: "init", fileKey, nodeId, token, figmaToken: token };
                 panel.webview.postMessage(lastInitPayload);
                 panel.reveal(vscode.ViewColumn.One);
-                // Skicka direkt en färsk bild-URL till webviewen (och ställ fas till default)
+                // Skicka direkt en färsk bild-URL till webviewen
                 await sendFreshFigmaImageUrlToWebview("init");
-                // Global autostart: oavsett vilken Figma-fil som öppnas
+                // Global autostart
                 const cfg = vscode.workspace.getConfiguration(SETTINGS_NS);
                 const autoStartImport = cfg.get("autoStartOnImport", true);
                 if (autoStartImport) {
@@ -979,7 +995,6 @@ async function activate(context) {
                         await startCandidatePreviewWithFallback(remembered, context, { silentUntilReady: true });
                     }
                     else {
-                        // ✅ Felsäkert: hitta bästa kandidat, spara och starta
                         try {
                             const cands = await (0, detector_1.detectProjects)([]);
                             if (cands.length) {
@@ -1003,7 +1018,6 @@ async function activate(context) {
                     }
                 }
                 else {
-                    // Autostart avstängd → onboarding (Figma-bild syns ändå tack vare webview-logik)
                     lastUiPhase = "onboarding";
                     panel.webview.postMessage({ type: "ui-phase", phase: "onboarding" });
                 }

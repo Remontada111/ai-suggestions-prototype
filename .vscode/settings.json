@@ -1,4 +1,4 @@
-{
+{ 
   "editor.formatOnSave": true,
   "editor.codeActionsOnSave": {
     "source.fixAll.eslint": "explicit"
@@ -25,5 +25,12 @@
 
   "terminal.integrated.defaultProfile.windows": "Git Bash",
   "python-envs.defaultEnvManager": "ms-python.python:system",
-  "python-envs.pythonProjects": []
+  "python-envs.pythonProjects": [],
+
+  // Hindra Zen Mode från att slå på OS-helskärm
+  "zenMode.fullScreen": false,
+  "zenMode.centerLayout": true,
+  "zenMode.hideActivityBar": true,
+  "zenMode.hideStatusBar": true,
+  "zenMode.restore": true
 }

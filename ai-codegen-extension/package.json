@@ -7,12 +7,8 @@
   "engines": {
     "vscode": "^1.102.0"
   },
-  "categories": [
-    "Other"
-  ],
-  "activationEvents": [
-    "onUri"
-  ],
+  "categories": ["Other"],
+  "activationEvents": ["onUri"],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
@@ -52,13 +48,13 @@
         },
         "aiFigmaCodegen.autoWindowFullScreen": {
           "type": "boolean",
-          "default": true,
-          "description": "Växla VS Codes riktiga helskärm (F11) när flödet startar. Rekommenderas på Windows för stabil rendering."
+          "default": false,
+          "description": "Växla VS Codes OS-helskärm (F11) vid start. Av som standard. Aktivera endast om du vill dölja aktivitetsfältet."
         },
         "aiFigmaCodegen.autoZenMode": {
           "type": "boolean",
-          "default": false,
-          "description": "Växla VS Codes Zen Mode automatiskt när flödet startar (toggle). Rekommenderas endast efter opt-in."
+          "default": true,
+          "description": "Växla VS Codes Zen Mode automatiskt när flödet startar (toggle) för maximal editor-yta utan OS-helskärm."
         },
         "aiFigmaCodegen.autoStartOnImport": {
           "type": "boolean",
