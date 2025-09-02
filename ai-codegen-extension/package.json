@@ -65,6 +65,11 @@
   "type": "boolean",
   "default": true,
   "description": "Stäng sidofältet automatiskt vid preview/import."
+},
+"aiFigmaCodegen.backendBaseUrl": {
+  "type": "string",
+  "default": "http://localhost:8000",
+  "description": "Bas-URL till backend-proxy som returnerar sRGB-PNG."
 }
       }
     }

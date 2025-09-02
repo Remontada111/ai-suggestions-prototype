@@ -34,6 +34,9 @@ if not all([GH_TOKEN, FIGMA_TOKEN, TARGET_REPO]):
 # Viktigt: kör Uvicorn som uvicorn backend.app.main:app --reload
 from backend.tasks.codegen import integrate_figma_node  # noqa: E402
 
+# ✅ Figma-proxy (sRGB). Återanvänd handler-funktionen som route.
+from backend.tasks.figma_proxy import figma_image as figma_image_handler  # noqa: E402
+
 # ✅ Importera analyzern från samma mapp (backend/app/analyze.py)
 try:
     from .analyze import router as analyze_router  # noqa: E402
@@ -57,8 +60,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Inkludera analyzern (Fix A: inget extra prefix – routern har redan "/analyze")
+# Inkludera analyzern (routern har redan sina paths)
 app.include_router(analyze_router)
+
+# Registrera Figma-proxy-endpointen här så URL blir /api/figma-image
+app.add_api_route("/api/figma-image", figma_image_handler, methods=["GET"])
 
 # ── Logga alla rutter vid uppstart (hjälper felsöka 404) ──────────────────
 @app.on_event("startup")

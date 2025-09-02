@@ -8,10 +8,7 @@ import * as https from "node:https";
 
 import { detectProjects, Candidate } from "./detector";
 import { runDevServer, stopDevServer, runInlineStaticServer, stopInlineServer } from "./runner";
-
-// ⬇️ ML: ladda ev. modell
 import { loadModelIfAny } from "./ml/classifier";
-// ⬇️ Dataset-export (för träning senare)
 import { exportDatasetCommand } from "./commands/exportDataset";
 
 let currentPanel: vscode.WebviewPanel | undefined;
@@ -34,25 +31,26 @@ let lastInitPayload: InitPayload | null = null;
 let lastDevUrl: string | null = null;
 let pendingCandidate: Candidate | null = null;
 
-// 🔹 Cache för senaste detekterade kandidater + statusknapp
 let lastCandidates: Candidate[] = [];
 let statusItem: vscode.StatusBarItem | undefined;
 
+// ── Ny: behåll context så vi kan öppna projektväljaren från asynka verifieringar
+let extCtxRef: vscode.ExtensionContext | null = null;
+
 const AUTO_START_SURE_THRESHOLD = 12;
 
-// 🔹 Enkel UI-fas som webview kan återställas till vid behov
 type UiPhase = "default" | "onboarding" | "loading";
 let lastUiPhase: UiPhase = "default";
 
 /* ─────────────────────────────────────────────────────────
-   AUTO-RELOAD för statiska previews (inline/http-server)
+   AUTO-RELOAD (inline/http-server)
    ───────────────────────────────────────────────────────── */
 let reloadWatcher: vscode.FileSystemWatcher | undefined;
 let reloadTimer: NodeJS.Timeout | undefined;
 let reloadBaseUrl: string | null = null;
 
 function stopReloadWatcher() {
-  try { reloadWatcher?.dispose(); } catch { /* ignore */ }
+  try { reloadWatcher?.dispose(); } catch {}
   reloadWatcher = undefined;
   if (reloadTimer) { clearTimeout(reloadTimer); reloadTimer = undefined; }
   reloadBaseUrl = null;
@@ -80,6 +78,8 @@ function startReloadWatcher(rootDir: string, baseUrl: string) {
         `__ext_bust=${Date.now().toString(36)}`;
       lastDevUrl = bust;
       currentPanel.webview.postMessage({ type: "devurl", url: bust });
+      // ── Ny: verifiera att URL:en faktiskt svarar, annars öppna väljare
+      void verifyDevUrlAndMaybeRechoose(bust, "reload");
     }, 200);
   };
 
@@ -103,7 +103,6 @@ async function headExists(url: string): Promise<boolean> {
           method: "HEAD",
           hostname: u.hostname,
           port: u.port,
-          // ⚙️ inkludera querystring så dev-servrar med paths funkar
           path: (u.pathname || "/") + (u.search || ""),
           timeout: 1500,
         },
@@ -112,15 +111,29 @@ async function headExists(url: string): Promise<boolean> {
           resolve((res.statusCode ?? 500) < 400);
         }
       );
-      req.on("timeout", () => {
-        req.destroy();
-        resolve(false);
-      });
+      req.on("timeout", () => { req.destroy(); resolve(false); });
       req.on("error", () => resolve(false));
       req.end();
     });
   } catch {
     return false;
+  }
+}
+
+// ── Ny: verifiera devUrl och öppna projektväljaren vid ihållande 404/otillgänglig
+async function verifyDevUrlAndMaybeRechoose(url: string, reason: "initial" | "reload") {
+  if (!extCtxRef) return;
+  // 3 försök med kort backoff för att ge dev-servern tid att spinna upp
+  for (let i = 0; i < 3; i++) {
+    const ok = await headExists(url);
+    if (ok) return;
+    await new Promise(r => setTimeout(r, 700));
+  }
+  warn(`Preview otillgänglig (${reason}) på ${url}. Öppnar projektväljare.`);
+  try {
+    await showProjectQuickPick(extCtxRef);
+  } catch (e) {
+    warn("Kunde inte öppna projektväljaren:", e);
   }
 }
 
@@ -145,15 +158,13 @@ function resolveBundledModelPath(context: vscode.ExtensionContext): string | und
     path.resolve(__dirname, "..", "..", "ml_artifacts", "frontend-detector-gbdt.json"),
   ];
   for (const p of cand) {
-    try {
-      if (fs.existsSync(p)) return p;
-    } catch { /* ignore */ }
+    try { if (fs.existsSync(p)) return p; } catch {}
   }
   return undefined;
 }
 
 /* ─────────────────────────────────────────────────────────
-   Kom-ihåg valt projekt + Zen-mode-hantering
+   UI-status och remember
    ───────────────────────────────────────────────────────── */
 const STORAGE_KEYS = { remembered: "aiFigmaCodegen.rememberedProject.v1" };
 type RememberedProject = { dir: string; savedAt: number };
@@ -198,7 +209,7 @@ async function tryGetRememberedCandidate(context: vscode.ExtensionContext): Prom
   try {
     const cands = await detectProjects([rec.dir]);
     if (cands?.length) return cands[0];
-  } catch { /* ignore */ }
+  } catch {}
   return null;
 }
 
@@ -207,14 +218,14 @@ async function enterFullView(panel?: vscode.WebviewPanel) {
   try { panel?.reveal(vscode.ViewColumn.One, false); } catch {}
 }
 
-/** Maxa Zen Mode. Stäng terminalpanelen. Aldrig OS-helskärm. */
+/** Zen Mode, close panels, etc. */
 async function tryAutoFullView(panel: vscode.WebviewPanel, context: vscode.ExtensionContext) {
-  const cfg = vscode.workspace.getConfiguration(SETTINGS_NS);
-  const useZen   = cfg.get<boolean>("autoZenMode", true);
+  const cfg     = vscode.workspace.getConfiguration(SETTINGS_NS);
+  const useZen  = cfg.get<boolean>("autoZenMode", true);
   const useWinFS = cfg.get<boolean>("autoWindowFullScreen", false);
-  const asked    = context.globalState.get<boolean>(STORAGE_KEYS_UI.askedFullView, false);
+  const closeSb = cfg.get<boolean>("autoCloseSidebar", true);
+  const asked   = context.globalState.get<boolean>(STORAGE_KEYS_UI.askedFullView, false);
 
-  // Engångsfråga kvar för bakåtkompabilitet
   if (!asked && cfg.inspect<boolean>("autoFullView")?.globalValue === undefined) {
     await context.globalState.update(STORAGE_KEYS_UI.askedFullView, true);
     const yes = "Ja, kör Full View";
@@ -227,8 +238,14 @@ async function tryAutoFullView(panel: vscode.WebviewPanel, context: vscode.Exten
 
   await enterFullView(panel);
 
+  if (closeSb) {
+    try { await vscode.commands.executeCommand("workbench.action.closeSidebar"); } catch {}
+    try { await vscode.commands.executeCommand("workbench.action.closeAuxiliaryBar"); } catch {}
+    try { await vscode.commands.executeCommand("workbench.action.maximizeEditor"); } catch {}
+    try { await new Promise(r => setTimeout(r, 60)); panel?.webview.postMessage({ type: "ui-phase", phase: lastUiPhase }); } catch {}
+  }
+
   if (useZen) {
-    // Zen Mode utan OS-helskärm och med maximal arbetsyta
     try {
       const zenCfg = vscode.workspace.getConfiguration("zenMode");
       await zenCfg.update("fullScreen", false, vscode.ConfigurationTarget.Workspace);
@@ -244,10 +261,8 @@ async function tryAutoFullView(panel: vscode.WebviewPanel, context: vscode.Exten
       try { await context.globalState.update(STORAGE_KEYS_UI.zenApplied, true); } catch {}
     }
 
-    // Stäng terminal/panel för att frigöra yta
     try { await vscode.commands.executeCommand("workbench.action.closePanel"); } catch {}
 
-    // Stabilisera layout och synka webview-fas
     try {
       await new Promise(r => setTimeout(r, 120));
       panel?.webview.postMessage({ type: "ui-phase", phase: lastUiPhase });
@@ -255,7 +270,6 @@ async function tryAutoFullView(panel: vscode.WebviewPanel, context: vscode.Exten
   }
 
   if (useWinFS) {
-    // Endast om användaren uttryckligen valt detta
     try {
       await vscode.commands.executeCommand("workbench.action.toggleFullScreen");
       await new Promise(r => setTimeout(r, 120));
@@ -265,119 +279,42 @@ async function tryAutoFullView(panel: vscode.WebviewPanel, context: vscode.Exten
 }
 
 /* ─────────────────────────────────────────────────────────
-   FIGMA: Hämta bild-URL i BACKENDEN (Node)
+   FIGMA via backend-proxy (sRGB-normalisering)
    ───────────────────────────────────────────────────────── */
-type FigmaResolveResult =
-  | { ok: true; url: string }
-  | { ok: false; status: number; message: string };
-
-function buildFigmaImagesEndpoint(fileKey: string, nodeId: string) {
-  const base = "https://api.figma.com/v1/images";
-  const params = new URLSearchParams({
-    ids: nodeId,
-    format: "png",
-    use_absolute_bounds: "true",
-    scale: "1",
-  });
-  return `${base}/${encodeURIComponent(fileKey)}?${params.toString()}`;
-}
-
-async function fetchJson(url: string, headers: Record<string, string>): Promise<{ status: number; body: any }> {
-  return await new Promise((resolve, reject) => {
-    const u = new URL(url);
-    const req = https.request(
-      {
-        method: "GET",
-        hostname: u.hostname,
-        path: u.pathname + u.search,
-        headers,
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (d) => chunks.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
-        res.on("end", () => {
-          const status = res.statusCode || 0;
-          let body: any = null;
-          try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { body = null; }
-          resolve({ status, body });
-        });
-      }
-    );
-    req.on("error", (e) => reject(e));
-    req.end();
-  });
-}
-
-async function resolveFigmaImageUrlBackend(
-  fileKey: string,
-  nodeId: string,
-  token?: string
-): Promise<FigmaResolveResult> {
-  if (!fileKey || !nodeId || !token) {
-    return { ok: false, status: 0, message: "Saknar fileKey/nodeId/token" };
+function buildProxyUrl(fileKey: string, nodeId: string, scale = "2"): string | null {
+  const base = vscode.workspace.getConfiguration(SETTINGS_NS).get<string>("backendBaseUrl");
+  if (!base) return null;
+  let u: URL;
+  try {
+    u = new URL("/api/figma-image", base);
+  } catch {
+    return null;
   }
-
-  const endpoint = buildFigmaImagesEndpoint(fileKey, nodeId);
-
-  // Försök först med Authorization: Bearer
-  let r = await fetchJson(endpoint, { Authorization: `Bearer ${token}` });
-  if (r.status >= 200 && r.status < 300) {
-    const url = r.body?.images?.[nodeId];
-    if (typeof url === "string" && url.length) return { ok: true, url };
-  } else if (r.status === 401 || r.status === 403) {
-    // Fallback: X-FIGMA-TOKEN
-    r = await fetchJson(endpoint, { "X-FIGMA-TOKEN": token });
-    if (r.status >= 200 && r.status < 300) {
-      const url = r.body?.images?.[nodeId];
-      if (typeof url === "string" && url.length) return { ok: true, url };
-    }
-    const msg = r.body?.err || "Åtkomst nekad. Kontrollera token/scope/filåtkomst.";
-    return { ok: false, status: 403, message: String(msg) };
-  }
-
-  // Om vi kom hit utan URL men utan 401/403 → retry med exponentiell backoff
-  let delay = 300;
-  for (let i = 0; i < 4; i++) {
-    await new Promise((res) => setTimeout(res, delay));
-    delay *= 2;
-    const try1 = await fetchJson(endpoint, { Authorization: `Bearer ${token}` });
-    if (try1.status >= 200 && try1.status < 300) {
-      const url = try1.body?.images?.[nodeId];
-      if (typeof url === "string" && url.length) return { ok: true, url };
-    }
-  }
-
-  const msg = r.body?.err || "Kunde inte hämta Figma-bild-URL.";
-  return { ok: false, status: r.status || 500, message: String(msg) };
+  u.searchParams.set("fileKey", fileKey);
+  u.searchParams.set("nodeId", nodeId);
+  u.searchParams.set("scale", scale);
+  return u.toString();
 }
 
 async function sendFreshFigmaImageUrlToWebview(source: "init" | "refresh") {
   if (!currentPanel || !lastInitPayload) return;
   const { fileKey, nodeId } = lastInitPayload;
-  // Token: prefer payload token, annars från settings
-  const token = lastInitPayload.figmaToken ||
-                lastInitPayload.token ||
-                vscode.workspace.getConfiguration(SETTINGS_NS).get<string>("figmaToken") ||
-                undefined;
-
-  const res = await resolveFigmaImageUrlBackend(fileKey, nodeId, token);
-  if (res.ok) {
-    currentPanel.webview.postMessage({ type: "figma-image-url", url: res.url });
-    // ✅ Garantera att onboard/loading inte täcker figma-bilden
-    lastUiPhase = "default";
-    currentPanel.webview.postMessage({ type: "ui-phase", phase: "default" });
-    log(`Figma-image-url (${source}) skickad.`);
-  } else {
-    errlog(`Figma URL misslyckades (${source}):`, res.status, res.message);
+  const url = buildProxyUrl(fileKey, nodeId, "2");
+  if (!url) {
     currentPanel.webview.postMessage({
       type: "ui-error",
-      message: `Figma-bild kunde inte hämtas (${res.status}). ${res.message}`,
+      message: "Saknar giltig backendBaseUrl i inställningarna.",
     });
+    return;
   }
+  currentPanel.webview.postMessage({ type: "figma-image-url", url });
+  lastUiPhase = "default";
+  currentPanel.webview.postMessage({ type: "ui-phase", phase: "default" });
+  log(`Proxy image-url (${source}) skickad.`);
 }
 
 /* ─────────────────────────────────────────────────────────
-   Panel och meddelandehantering
+   Panel och meddelanden
    ───────────────────────────────────────────────────────── */
 function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
   if (!currentPanel) {
@@ -404,7 +341,6 @@ function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
       try { await stopDevServer(); } catch (e) { warn("stopDevServer fel:", e); }
       try { await stopInlineServer(); } catch (e) { warn("stopInlineServer fel:", e); }
 
-      // 🔄 Lämna Zen Mode om vi slog på det
       const zenApplied = context.globalState.get<boolean>(STORAGE_KEYS_UI.zenApplied, false);
       if (zenApplied) {
         try { await vscode.commands.executeCommand("workbench.action.toggleZenMode"); } catch {}
@@ -418,7 +354,6 @@ function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
       if (msg?.type === "ready") {
         if (lastInitPayload) {
           currentPanel!.webview.postMessage(lastInitPayload);
-          // Skicka också färsk Figma-image-url direkt vid ready
           await sendFreshFigmaImageUrlToWebview("init");
         }
         if (lastDevUrl) currentPanel!.webview.postMessage({ type: "devurl", url: lastDevUrl });
@@ -430,7 +365,6 @@ function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
         return;
       }
 
-      // 🔹 Placering accepterad från webview (redo för ML/lagring)
       if (msg?.type === "placementAccepted" && msg?.payload) {
         try {
           const ws = vscode.workspace.getConfiguration(SETTINGS_NS);
@@ -451,7 +385,6 @@ function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
         return;
       }
 
-      // ✅ Starta föreslagen kandidat även om pendingCandidate saknas; minns valet
       if (msg?.cmd === "acceptCandidate") {
         if (!pendingCandidate) {
           try {
@@ -467,7 +400,6 @@ function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
         return;
       }
 
-      // ✅ Stöd för “Glöm” från webview
       if (msg?.cmd === "forgetProject") {
         await forgetRemembered(context);
         return;
@@ -513,7 +445,7 @@ function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
   return currentPanel;
 }
 
-function postCandidateProposal(_c: Candidate) { /* no-op i minimal UI */ }
+function postCandidateProposal(_c: Candidate) {}
 
 /* ─────────────────────────────────────────────────────────
    Upptäckt & uppstart
@@ -581,7 +513,7 @@ async function startOrRespectfulFallback(
           const url = base + encodeURI(normalizeRel(c.entryHtml));
           return { externalUrl: url, mode: "dev" };
         }
-      } catch { /* ignore */ }
+      } catch {}
 
       return { externalUrl, mode: "dev" };
     } catch (e: any) {
@@ -593,7 +525,7 @@ async function startOrRespectfulFallback(
   if (html) {
     const { externalUrl } = await runInlineStaticServer(html.root);
     const base = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
-    return { externalUrl: base + encodeURI(html.relHtml), mode: "inline", watchRoot: html.root };
+    return { externalUrl, mode: "inline", watchRoot: html.root };
   }
 
   const storageDir = await ensureStoragePreview(context);
@@ -601,7 +533,6 @@ async function startOrRespectfulFallback(
   return { externalUrl, mode: "inline", watchRoot: storageDir };
 }
 
-/** Minimal temporär preview i globalStorage */
 async function ensureStoragePreview(context: vscode.ExtensionContext): Promise<string> {
   const root = context.globalStorageUri.fsPath;
   const previewDir = path.join(root, "ai-figma-preview");
@@ -633,7 +564,7 @@ async function ensureStoragePreview(context: vscode.ExtensionContext): Promise<s
 }
 
 /**
- * Starta kandidatens preview (silent placeholder tills verklig URL finns)
+ * Starta kandidatens preview
  */
 async function startCandidatePreviewWithFallback(
   c: Candidate,
@@ -642,8 +573,8 @@ async function startCandidatePreviewWithFallback(
 ) {
   const panel = ensurePanel(context);
 
-  try { await stopDevServer(); } catch { /* ignore */ }
-  try { await stopInlineServer(); } catch { /* ignore */ }
+  try { await stopDevServer(); } catch {}
+  try { await stopInlineServer(); } catch {}
   stopReloadWatcher();
 
   const silent = !!opts?.silentUntilReady;
@@ -661,6 +592,9 @@ async function startCandidatePreviewWithFallback(
       const res = await startOrRespectfulFallback(c, context);
       lastDevUrl = res.externalUrl;
       panel.webview.postMessage({ type: "devurl", url: res.externalUrl });
+
+      // ── Ny: verifiera att URL:en svarar, annars öppna projektväljaren
+      void verifyDevUrlAndMaybeRechoose(res.externalUrl, "initial");
 
       if ((res.mode === "inline" || res.mode === "http") && res.watchRoot) {
         startReloadWatcher(res.watchRoot, res.externalUrl);
@@ -683,7 +617,7 @@ async function startCandidatePreviewWithFallback(
 }
 
 /* ─────────────────────────────────────────────────────────
-   UI: Manuell projektväljare (QuickPick)
+   QuickPick
    ───────────────────────────────────────────────────────── */
 function toPickItems(candidates: Candidate[]): Array<vscode.QuickPickItem & { _c: Candidate }> {
   return candidates.map((c) => {
@@ -721,10 +655,8 @@ async function showProjectQuickPick(context: vscode.ExtensionContext) {
 
   pendingCandidate = chosen._c;
 
-  // Spara valet som globalt standardprojekt
   await rememberCandidate(pendingCandidate, context);
 
-  // Start
   lastUiPhase = "loading";
   panel.webview.postMessage({ type: "ui-phase", phase: "loading" });
   await tryAutoFullView(panel, context);
@@ -758,7 +690,6 @@ async function pickFolderAndStart(context: vscode.ExtensionContext) {
     }
     pendingCandidate = candidates[0];
 
-    // Spara valet som globalt standardprojekt
     await rememberCandidate(pendingCandidate, context);
 
     await tryAutoFullView(panel, context);
@@ -772,7 +703,7 @@ async function pickFolderAndStart(context: vscode.ExtensionContext) {
 }
 
 /* ─────────────────────────────────────────────────────────
-   Webview HTML + CSP (fallback om dist saknas)
+   Webview HTML + CSP
    ───────────────────────────────────────────────────────── */
 function getWebviewHtml(context: vscode.ExtensionContext, webview: vscode.Webview): string {
   const distDir = path.join(context.extensionPath, "dist-webview");
@@ -801,7 +732,7 @@ function getWebviewHtml(context: vscode.ExtensionContext, webview: vscode.Webvie
     `<head>
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'none';
-  img-src https: data:;
+  img-src http: https: data:;
   style-src 'unsafe-inline' ${cspSource};
   script-src ${cspSource};
   connect-src ${cspSource} http: https: ws: wss:;
@@ -821,7 +752,7 @@ function basicFallbackHtml(webview: vscode.Webview): string {
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'none';
-  img-src https: data:;
+  img-src http: https: data:;
   style-src 'unsafe-inline' ${cspSource};
   script-src ${cspSource};
   connect-src ${cspSource} http: https: ws: wss:;
@@ -840,6 +771,7 @@ function basicFallbackHtml(webview: vscode.Webview): string {
    Aktivering
    ───────────────────────────────────────────────────────── */
 export async function activate(context: vscode.ExtensionContext) {
+  extCtxRef = context; // ── Ny: spara context för verifierings-flöden
   log("Aktiverar extension …");
 
   const bundledModelPath = resolveBundledModelPath(context);
@@ -858,7 +790,6 @@ export async function activate(context: vscode.ExtensionContext) {
   statusItem.show();
   context.subscriptions.push(statusItem);
 
-  // Uppdatera statusbar baserat på ihågkommet projekt (om finns)
   (async () => {
     const rem = await tryGetRememberedCandidate(context);
     updateStatusBar(rem);
@@ -866,7 +797,6 @@ export async function activate(context: vscode.ExtensionContext) {
 
   const scanCmd = vscode.commands.registerCommand("ai-figma-codegen.scanAndPreview", async () => {
     try {
-      // Försök först med ihågkommet projekt
       const remembered = await tryGetRememberedCandidate(context);
       if (remembered) {
         const panel = ensurePanel(context);
@@ -923,7 +853,6 @@ export async function activate(context: vscode.ExtensionContext) {
     const panel = ensurePanel(context);
     panel.reveal(vscode.ViewColumn.One);
 
-    // AUTO: om vi har ett ihågkommet projekt – starta direkt
     const remembered = await tryGetRememberedCandidate(context);
     if (remembered) {
       pendingCandidate = remembered;
@@ -935,7 +864,6 @@ export async function activate(context: vscode.ExtensionContext) {
       return;
     }
 
-    // Annars: försök hitta kandidater och ev. starta
     if (!pendingCandidate) {
       const candidates = await detectProjects([]);
       lastCandidates = candidates;
@@ -967,12 +895,10 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   );
 
-  // 🔹 Glöm sparat projekt
   const forgetCmd = vscode.commands.registerCommand("ai-figma-codegen.forgetProject", async () => {
     await forgetRemembered(context);
   });
 
-  // 🔹 URI-handler (Figma import)
   const uriHandler = vscode.window.registerUriHandler({
     handleUri: async (uri: vscode.Uri) => {
       try {
@@ -992,10 +918,8 @@ export async function activate(context: vscode.ExtensionContext) {
         panel.webview.postMessage(lastInitPayload);
         panel.reveal(vscode.ViewColumn.One);
 
-        // Skicka direkt en färsk bild-URL till webviewen
         await sendFreshFigmaImageUrlToWebview("init");
 
-        // Global autostart
         const cfg = vscode.workspace.getConfiguration(SETTINGS_NS);
         const autoStartImport = cfg.get<boolean>("autoStartOnImport", true);
 

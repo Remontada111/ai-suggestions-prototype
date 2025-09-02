@@ -1,11 +1,10 @@
 // webview/main.tsx
 // Målsättning:
-// - Laptop-UI (projekt-preview) i fast 1280×800-stage som skalas för att passa panelen.
-// - Figma-preview är ett flyttbart och resizbart fönster OVANFÖR laptop-UI.
-// - Endast Figma-fönstret kan justeras. AR låst till 1280×800.
-// - Tangentbord: pilar (flytt), Ctrl/Cmd+pilar (resize), Shift=större steg, Space=visa overlay, R=reset, F=full view.
-// - Wheel-zoom: Ctrl/Cmd + hjul = resize overlay runt centrum.
-// - Figma-URL hämtas via extension. Webview sparar ej token/URL. Refresh på fel.
+// - Laptop-UI i fast 1280×800-stage som skalas för att passa panelen.
+// - Figma-fönstret behåller sin egen aspect ratio. Inget beskärs.
+// - Justeringspunkter syns bara när Figma-fönstret är valt. Klick utanför döljer dem.
+// - Tangentbord fungerar endast när fönstret är valt: pilar (flytt), Ctrl/Cmd+pilar (resize), Shift=större steg, Space=visa overlay, R=reset, F=full view.
+// - Wheel-zoom: Ctrl/Cmd + hjul = resize runt centrum när fönstret är valt.
 
 import React, {
   useCallback,
@@ -31,8 +30,8 @@ const vscode = acquireVsCodeApi();
 const PROJECT_BASE = { w: 1280, h: 800 };
 const PREVIEW_MIN_SCALE = 0.3;
 const PREVIEW_MAX_SCALE = 1.0;
-const OVERLAY_MIN_FACTOR = 0.3; // min overlay-storlek relativt 1280×800
-const CANVAS_MARGIN = 16; // panelpadding
+const OVERLAY_MIN_FACTOR = 0.15;
+const CANVAS_MARGIN = 16;
 
 type UiPhase = "default" | "onboarding" | "loading";
 type IncomingMsg =
@@ -111,10 +110,7 @@ function ChooseProjectCard(props: { visible: boolean; compact?: boolean; busy?: 
           .fp-tip { background: linear-gradient(135deg, #ff9a56, #ff6f56); width: 80px; height: 20px; border-radius: 12px 12px 0 0; position: absolute; top: -10px; z-index: 2; box-shadow: 0 5px 15px rgba(0,0,0,.2); }
           .fp-cover { background: linear-gradient(135deg, #ffe563, #ffc663); width: var(--folder-W); height: var(--folder-H); border-radius: 10px; box-shadow: 0 15px 30px rgba(0,0,0,.3); }
           .fp-cta { display:flex; gap:8px; position:absolute; bottom:12px; left:12px; right:12px; }
-          .fp-btn {
-            flex:1; padding:10px 12px; border-radius:10px; border:none; cursor:pointer; color:#123; font-weight:600;
-            background: rgba(255,255,255,.9); transition: transform .12s ease, background .2s ease;
-          }
+          .fp-btn { flex:1; padding:10px 12px; border-radius:10px; border:none; cursor:pointer; color:#123; font-weight:600; background: rgba(255,255,255,.9); transition: transform .12s ease, background .2s ease; }
           .fp-btn:hover { transform: translateY(-1px); background: #fff; }
           .fp-sub { position:absolute; bottom: 48px; left: 12px; right: 12px; font-size: 12px; opacity: .9 }
           .fp-ghost { position:absolute; inset:0; border-radius:16px; border:1px dashed rgba(255,255,255,.35) }
@@ -155,38 +151,38 @@ function ChooseProjectCard(props: { visible: boolean; compact?: boolean; busy?: 
 // App
 // ─────────────────────────────────────────────────────────
 function App() {
-  // UI-phase, devurl, figma, overlay
   const [phase, setPhase] = useState<UiPhase>("default");
   const [devUrl, setDevUrl] = useState<string | null>(null);
   const [figmaErr, setFigmaErr] = useState<string | null>(null);
   const [figmaSrc, setFigmaSrc] = useState<string | null>(null);
   const [figmaN, setFigmaN] = useState<{ w: number; h: number } | null>(null);
+  
 
-  // Endast för att spegla “visa overlay under interaktion”
   const [showOverlay, setShowOverlay] = useState(false);
+  const [selected, setSelected] = useState(false);
 
-  // Stage (panelmått)
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const overlayRef = useRef<HTMLDivElement | null>(null);
+  const selectedRef = useRef(false);
+
   const [containerW, setContainerW] = useState(0);
   const [containerH, setContainerH] = useState(0);
 
-  // Overlay i projektets koordinater (1280×800)
   type StageRect = { x: number; y: number; w: number; h: number };
   const [overlayStage, setOverlayStage] = useState<StageRect | null>(null);
 
-  // För att undvika refresh-loopar
   const refreshAttempts = useRef(0);
-
-  // Interaktion
   const dragState = useRef<{
     mode: "move" | "nw" | "ne" | "se" | "sw" | null;
-    startPt: Vec2;    // klientpx
+    startPt: Vec2;
     startRect: StageRect;
   } | null>(null);
   const spaceHeld = useRef(false);
   const fullViewRequested = useRef(false);
 
-  // Persist
+  useEffect(() => { selectedRef.current = selected; }, [selected]);
+
+  // persist
   useEffect(() => {
     const st = vscode.getState?.() || {};
     if (st.overlayStage) setOverlayStage(st.overlayStage);
@@ -194,16 +190,11 @@ function App() {
     if (st.fullViewRequested) fullViewRequested.current = true;
   }, []);
   const persistState = useCallback((extra?: Record<string, any>) => {
-    const current = {
-      overlayStage,
-      showOverlay,
-      fullViewRequested: fullViewRequested.current,
-      ...extra,
-    };
+    const current = { overlayStage, showOverlay, fullViewRequested: fullViewRequested.current, ...extra };
     try { vscode.setState?.(current); } catch {}
   }, [overlayStage, showOverlay]);
 
-  // Följ editorstorlek
+  // editorstorlek
   useLayoutEffect(() => {
     if (!rootRef.current) return;
     const ro = new ResizeObserver((entries) => {
@@ -216,49 +207,36 @@ function App() {
     return () => ro.disconnect();
   }, []);
 
-  // Meddelanden från extension
+  // inkommande meddelanden
   const sentReadyRef = useRef(false);
   useEffect(() => {
     function onMsg(ev: MessageEvent) {
       const msg = ev.data as IncomingMsg;
       if (!msg || typeof msg !== "object") return;
 
-      if (msg.type === "devurl") {
-        setDevUrl(msg.url);
-        return;
-      }
+      if (msg.type === "devurl") { setDevUrl(msg.url); return; }
       if (msg.type === "ui-phase") { setPhase(msg.phase); return; }
-
       if (msg.type === "figma-image-url" && typeof msg.url === "string") {
-        setFigmaSrc(msg.url);
-        setFigmaErr(null);
-        refreshAttempts.current = 0;
-        return;
+        setFigmaSrc(msg.url); setFigmaErr(null); refreshAttempts.current = 0; return;
       }
-
+     
       if (msg.type === "ui-error") {
-        setFigmaErr(msg.message || "Okänt fel vid hämtning av Figma-bild.");
-        setFigmaSrc(null);
-        return;
+        setFigmaErr(msg.message || "Okänt fel vid hämtning av Figma-bild."); setFigmaSrc(null); return;
       }
-
       if (msg.type === "init") {
         setFigmaSrc(null);
         setFigmaErr(null);
+                
         refreshAttempts.current = 0;
         return;
       }
     }
     window.addEventListener("message", onMsg);
-
-    if (!sentReadyRef.current) {
-      vscode.postMessage({ type: "ready" });
-      sentReadyRef.current = true;
-    }
+    if (!sentReadyRef.current) { vscode.postMessage({ type: "ready" }); sentReadyRef.current = true; }
     return () => window.removeEventListener("message", onMsg);
   }, []);
 
-  // Stage-dimensioner (laptop-UI)
+  // stage-dimensioner
   const stageDims = useMemo(() => {
     const s = Math.min(containerW / PROJECT_BASE.w, containerH / PROJECT_BASE.h);
     const scale = clamp(s, PREVIEW_MIN_SCALE, PREVIEW_MAX_SCALE);
@@ -269,25 +247,37 @@ function App() {
     return { w, h, left, top, scale };
   }, [containerW, containerH]);
 
-  // Initiera overlay när Figma laddas (80% av stage, centrerat)
-  const onFigmaLoad = useCallback((ev: React.SyntheticEvent<HTMLImageElement>) => {
-    const el = ev.currentTarget;
-    const natural = { w: el.naturalWidth || el.width, h: el.naturalHeight || el.height };
-    setFigmaN(natural);
+  // overlay AR från bilden
+  const overlayAR = useMemo(() => {
+    if (!figmaN) return PROJECT_BASE.w / PROJECT_BASE.h;
+    const ar = figmaN.w / figmaN.h;
+    return ar > 0 ? ar : PROJECT_BASE.w / PROJECT_BASE.h;
+  }, [figmaN]);
 
-    if (!overlayStage) {
-      const margin = 0.1;
-      const w = round(PROJECT_BASE.w * (1 - margin * 2));
-      const h = round(PROJECT_BASE.h * (1 - margin * 2));
+  // init overlay när bild finns
+  useEffect(() => {
+    if ((figmaSrc || figmaN) && !overlayStage) {
+      const availW = PROJECT_BASE.w * 0.9;
+      const availH = PROJECT_BASE.h * 0.9;
+      const fitted = arFit(availW, availH, overlayAR);
+      const w = round(fitted.w);
+      const h = round(fitted.h);
       const x = round((PROJECT_BASE.w - w) / 2);
       const y = round((PROJECT_BASE.h - h) / 2);
       const rect: StageRect = { x, y, w, h };
       setOverlayStage(rect);
-      setShowOverlay(true);
-      persistState({ overlayStage: rect, showOverlay: true });
+      setShowOverlay(false);
+      setSelected(false);
+      persistState({ overlayStage: rect, showOverlay: false });
     }
-  }, [overlayStage, persistState]);
+  }, [figmaSrc, figmaN, overlayAR, overlayStage, persistState]);
 
+  // onload/onerror
+  const onFigmaLoad = useCallback((ev: React.SyntheticEvent<HTMLImageElement>) => {
+    const el = ev.currentTarget;
+    const natural = { w: el.naturalWidth || el.width, h: el.naturalHeight || el.height };
+    setFigmaN(natural);
+  }, []);
   const onFigmaError = useCallback(() => {
     if (refreshAttempts.current < 3) {
       refreshAttempts.current += 1;
@@ -298,27 +288,21 @@ function App() {
     }
   }, []);
 
-  // Hjälpare för overlay-clamp i stage-koordinater
+  // clamp overlay (behåll AR, håll inom 1280×800)
   const minOverlay = useMemo(() => ({
     w: PROJECT_BASE.w * OVERLAY_MIN_FACTOR,
     h: PROJECT_BASE.h * OVERLAY_MIN_FACTOR,
   }), []);
-  const ar = useMemo(() => PROJECT_BASE.w / PROJECT_BASE.h, []);
-
   function clampOverlayToStage(r: StageRect): StageRect {
-    let x = clamp(r.x, 0, PROJECT_BASE.w - r.w);
-    let y = clamp(r.y, 0, PROJECT_BASE.h - r.h);
     let w = clamp(r.w, minOverlay.w, PROJECT_BASE.w);
-    let h = clamp(r.h, minOverlay.h, PROJECT_BASE.h);
-    // håll AR
-    const fitted = arFit(w, h, ar);
-    w = fitted.w; h = fitted.h;
-    x = clamp(x, 0, PROJECT_BASE.w - w);
-    y = clamp(y, 0, PROJECT_BASE.h - h);
+    let h = w / overlayAR;
+    if (h > PROJECT_BASE.h) { h = PROJECT_BASE.h; w = h * overlayAR; }
+    let x = clamp(r.x, 0, PROJECT_BASE.w - w);
+    let y = clamp(r.y, 0, PROJECT_BASE.h - h);
     return { x: round(x), y: round(y), w: round(w), h: round(h) };
   }
 
-  // Begär full view en gång
+  // full view
   const requestFullViewIfNeeded = useCallback(() => {
     if (!fullViewRequested.current) {
       vscode.postMessage({ cmd: "enterFullView" });
@@ -327,9 +311,10 @@ function App() {
     }
   }, [persistState]);
 
-  // Interaktion start/slut
+  // start/stop interaktion
   const beginInteraction = useCallback((e?: React.PointerEvent) => {
     requestFullViewIfNeeded();
+    setSelected(true);
     setShowOverlay(true);
     persistState({ showOverlay: true });
     if (e) (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
@@ -337,16 +322,15 @@ function App() {
     const end = () => {
       dragState.current = null;
       document.body.classList.remove("dragging");
-      if (!spaceHeld.current) {
-        setTimeout(() => { setShowOverlay(false); persistState({ showOverlay: false }); }, 120);
+      if (!spaceHeld.current && !selectedRef.current) {
+        setTimeout(() => { setShowOverlay(false); persistState({ showOverlay: false }); }, 80);
       }
-      // Sänd placement till extension
       if (overlayStage && figmaN) {
         vscode.postMessage({
           type: "placementAccepted",
           payload: {
             projectBase: { ...PROJECT_BASE },
-            overlayStage: { ...overlayStage }, // exakt pos och size i 1280×800
+            overlayStage: { ...overlayStage },
             imageNatural: { ...figmaN },
             ts: Date.now(),
             source: "webview/main.tsx",
@@ -358,7 +342,21 @@ function App() {
     window.addEventListener("pointercancel", end, { once: true });
   }, [overlayStage, figmaN, persistState, requestFullViewIfNeeded]);
 
-  // Flytt
+  // klick utanför → avmarkera och dölj UI
+  useEffect(() => {
+    function onGlobalPointerDown(e: PointerEvent) {
+      const inside = overlayRef.current?.contains(e.target as Node) ?? false;
+      if (!inside) {
+        setSelected(false);
+        setShowOverlay(false);
+        persistState({ showOverlay: false });
+      }
+    }
+    window.addEventListener("pointerdown", onGlobalPointerDown, { capture: true });
+    return () => window.removeEventListener("pointerdown", onGlobalPointerDown, { capture: true } as any);
+  }, [persistState]);
+
+  // flytt
   const onOverlayPointerDown = useCallback((e: React.PointerEvent) => {
     if (!overlayStage) return;
     beginInteraction(e);
@@ -382,28 +380,29 @@ function App() {
         ...st.startRect,
         x: st.startRect.x + dx,
         y: st.startRect.y + dy,
+        w: st.startRect.w,
+        h: st.startRect.h,
       });
       setOverlayStage(next);
       persistState({ overlayStage: next });
     } else {
-      // resize
       let { x, y, w, h } = st.startRect;
       if (st.mode === "nw") {
-        let newW = st.startRect.w - dx; let newH = newW / ar;
+        const newW = st.startRect.w - dx; const newH = newW / overlayAR;
         const fitted = clampOverlayToStage({ x, y, w: newW, h: newH }); w = fitted.w; h = fitted.h;
         x = st.startRect.x + (st.startRect.w - w);
         y = st.startRect.y + (st.startRect.h - h);
       } else if (st.mode === "ne") {
-        let newW = st.startRect.w + dx; let newH = newW / ar;
+        const newW = st.startRect.w + dx; const newH = newW / overlayAR;
         const fitted = clampOverlayToStage({ x, y, w: newW, h: newH }); w = fitted.w; h = fitted.h;
         x = st.startRect.x;
         y = st.startRect.y + (st.startRect.h - h);
       } else if (st.mode === "se") {
-        let newW = st.startRect.w + dx; let newH = newW / ar;
+        const newW = st.startRect.w + dx; const newH = newW / overlayAR;
         const fitted = clampOverlayToStage({ x, y, w: newW, h: newH }); w = fitted.w; h = fitted.h;
         x = st.startRect.x; y = st.startRect.y;
       } else if (st.mode === "sw") {
-        let newW = st.startRect.w - dx; let newH = newW / ar;
+        const newW = st.startRect.w - dx; const newH = newW / overlayAR;
         const fitted = clampOverlayToStage({ x, y, w: newW, h: newH }); w = fitted.w; h = fitted.h;
         x = st.startRect.x + (st.startRect.w - w);
         y = st.startRect.y;
@@ -412,38 +411,34 @@ function App() {
       setOverlayStage(next);
       persistState({ overlayStage: next });
     }
-  }, [overlayStage, stageDims.scale, ar, persistState]);
+  }, [overlayStage, stageDims.scale, overlayAR, persistState]);
 
-  // Resize-handle start
+  // resize-handle start
   const startResize = (mode: "nw" | "ne" | "se" | "sw") => (e: React.PointerEvent) => {
     if (!overlayStage) return;
     e.stopPropagation();
     beginInteraction(e);
-    dragState.current = {
-      mode,
-      startPt: { x: e.clientX, y: e.clientY },
-      startRect: { ...overlayStage },
-    };
+    dragState.current = { mode, startPt: { x: e.clientX, y: e.clientY }, startRect: { ...overlayStage } };
   };
 
-  // Wheel = resize runt centrum
+  // wheel = resize runt centrum (endast när valt)
   const onWheel = useCallback((e: React.WheelEvent) => {
-    if (!overlayStage) return;
+    if (!overlayStage || !selected) return;
     if (!(e.ctrlKey || e.metaKey)) return;
     e.preventDefault();
     const factor = e.deltaY > 0 ? 0.98 : 1.02;
     const newW = overlayStage.w * factor;
-    const newH = newW / ar;
+    const newH = newW / overlayAR;
     const sized = clampOverlayToStage(withCenterResize(overlayStage, newW, newH));
     setOverlayStage(sized);
     persistState({ overlayStage: sized, showOverlay: true });
     setShowOverlay(true);
-  }, [overlayStage, ar, persistState]);
+  }, [overlayStage, overlayAR, selected, persistState]);
 
-  // Tangentbord
+  // tangentbord endast när valt
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      if (!overlayStage) return;
+      if (!overlayStage || !selected) return;
 
       if (e.code === "Space" && !e.repeat) {
         spaceHeld.current = true;
@@ -466,19 +461,19 @@ function App() {
       } else {
         if (e.key === "ArrowRight" || e.key === "ArrowDown") {
           const factor = 1 + (e.shiftKey ? 0.05 : 0.02);
-          const newW = next.w * factor; const newH = newW / ar;
+          const newW = next.w * factor; const newH = newW / overlayAR;
           next = withCenterResize(next, newW, newH); changed = true;
         } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
           const factor = 1 - (e.shiftKey ? 0.05 : 0.02);
-          const newW = next.w * factor; const newH = newW / ar;
+          const newW = next.w * factor; const newH = newW / overlayAR;
           next = withCenterResize(next, newW, newH); changed = true;
         }
       }
 
       if (e.key === "r" || e.key === "R") {
-        const sized = arFit(PROJECT_BASE.w, PROJECT_BASE.h, ar);
-        const w = round(Math.min(sized.w, PROJECT_BASE.w));
-        const h = round(Math.min(sized.h, PROJECT_BASE.h));
+        const fitted = arFit(PROJECT_BASE.w, PROJECT_BASE.h, overlayAR);
+        const w = round(Math.min(fitted.w, PROJECT_BASE.w));
+        const h = round(Math.min(fitted.h, PROJECT_BASE.h));
         next = { w, h, x: round((PROJECT_BASE.w - w) / 2), y: round((PROJECT_BASE.h - h) / 2) };
         changed = true;
       }
@@ -495,8 +490,10 @@ function App() {
     function onKeyUp(e: KeyboardEvent) {
       if (e.code === "Space") {
         spaceHeld.current = false;
-        setShowOverlay(false);
-        persistState({ showOverlay: false });
+        if (!selectedRef.current) {
+          setShowOverlay(false);
+          persistState({ showOverlay: false });
+        }
         e.preventDefault();
       }
     }
@@ -506,9 +503,9 @@ function App() {
       window.removeEventListener("keydown", onKeyDown, { capture: true } as any);
       window.removeEventListener("keyup", onKeyUp, { capture: true } as any);
     };
-  }, [overlayStage, ar, persistState]);
+  }, [overlayStage, overlayAR, selected, persistState]);
 
-  // Auto-onboarding triggers
+  // auto-onboarding
   const [requestedProjectOnce, setRequestedProjectOnce] = useState(false);
   useEffect(() => {
     const t = setTimeout(() => {
@@ -530,56 +527,136 @@ function App() {
       style={{ position: "fixed", inset: 0, padding: CANVAS_MARGIN }}
       onWheel={onWheel}
     >
-     {/* Laptop-UI */}
-<div
-  className="laptop-shell"
-  style={{
-    position: "absolute",
-    left: stageDims.left + CANVAS_MARGIN,
-    top:  stageDims.top  + CANVAS_MARGIN,
-    width: stageDims.w,            // klippruta
-    height: stageDims.h,
-    zIndex: 5,
-    visibility: devUrl ? "visible" : "hidden",
-    overflow: "hidden",
-  }}
->
-  {(!devUrl || phase !== "default") && (
-    <div className="skeleton" aria-hidden="true" style={{ width: "100%", height: "100%", borderRadius: 12 }} />
-  )}
-
-  {devUrl && (
-    <div
-      style={{
-        position: "absolute",
-        left: 0, top: 0,
-        width: PROJECT_BASE.w,
-        height: PROJECT_BASE.h,
-        transform: `scale(${stageDims.scale})`,
-        transformOrigin: "top left",
-      }}
-    >
-      <iframe
-        title="preview"
-        src={devUrl}
-        sandbox="allow-scripts allow-forms allow-same-origin"
+      {/* Laptop-UI */}
+      <div
+        className="laptop-shell"
         style={{
-          width: PROJECT_BASE.w,
-          height: PROJECT_BASE.h,
-          border: 0,
-          pointerEvents: "none",
-          background: "#fff",
-          display: "block",
+          position: "absolute",
+          left: stageDims.left + CANVAS_MARGIN,
+          top:  stageDims.top  + CANVAS_MARGIN,
+          width: stageDims.w,
+          height: stageDims.h,
+          zIndex: 5,
+          visibility: devUrl ? "visible" : "hidden",
+          overflow: "hidden",
+          borderRadius: 12,
         }}
-      />
-    </div>
-  )}
-</div>
+      >
+        {(!devUrl || phase !== "default") && (
+          <div className="skeleton" aria-hidden="true" style={{ width: "100%", height: "100%", borderRadius: 12 }} />
+        )}
 
-      {/* ÖVERLAGER: Onboarding-kort */}
+        {devUrl && (
+          <div
+            style={{
+              position: "absolute",
+              left: 0, top: 0,
+              width: PROJECT_BASE.w,
+              height: PROJECT_BASE.h,
+              transform: `scale(${stageDims.scale})`,
+              transformOrigin: "top left",
+            }}
+          >
+            <iframe
+              title="preview"
+              src={devUrl}
+              sandbox="allow-scripts allow-forms allow-same-origin"
+              style={{
+                width: PROJECT_BASE.w,
+                height: PROJECT_BASE.h,
+                border: 0,
+                pointerEvents: "none",
+                background: "#fff",
+                display: "block",
+              }}
+            />
+          </div>
+        )}
+
+        {/* Figma-fönster ovanpå laptop-UI */}
+        {figmaSrc && overlayStage && (
+          <div
+            ref={overlayRef}
+            onPointerDown={onOverlayPointerDown}
+            onPointerMove={onOverlayPointerMove}
+            style={{
+              position: "absolute",
+              left:  round(overlayStage.x * stageDims.scale),
+              top:   round(overlayStage.y * stageDims.scale),
+              width:  round(overlayStage.w * stageDims.scale),
+              height: round(overlayStage.h * stageDims.scale),
+              zIndex: 20,
+              borderRadius: 10,
+              boxShadow: selected ? "0 0 0 2px rgba(0,0,0,.06), 0 2px 10px rgba(0,0,0,.25)" : "none",
+              background: "transparent",
+              cursor: "move",
+              display: "grid",
+              overflow: "hidden",
+            }}
+          >
+            <img
+              src={figmaSrc}
+              alt="Figma node"
+              draggable={false}
+              onLoad={onFigmaLoad}
+              onError={onFigmaError}
+              style={{
+                width: "100%",
+                height: "100%",
+                display: "block",
+                objectFit: "contain",
+                userSelect: "none",
+                pointerEvents: "none",
+              }}
+            />
+
+            {/* Stödraster och handtag visas bara när valt */}
+            {showOverlay && selected && (
+              <>
+                <div
+                  aria-hidden
+                  style={{
+                    position: "absolute",
+                    inset: 6,
+                    border: "1px dashed color-mix(in srgb, var(--accent) 60%, transparent)",
+                    borderRadius: 8,
+                    pointerEvents: "none",
+                  }}
+                />
+                {(["nw", "ne", "se", "sw"] as const).map((pos) => {
+                  const size = 14;
+                  const base: React.CSSProperties = {
+                    position: "absolute",
+                    width: size, height: size,
+                    background: "var(--accent)",
+                    borderRadius: 999,
+                    boxShadow: "0 1px 4px rgba(0,0,0,.35)",
+                  };
+                  const styleMap: Record<typeof pos, React.CSSProperties> = {
+                    nw: { ...base, left: -size / 2, top: -size / 2, cursor: "nwse-resize" },
+                    ne: { ...base, right: -size / 2, top: -size / 2, cursor: "nesw-resize" },
+                    se: { ...base, right: -size / 2, bottom: -size / 2, cursor: "nwse-resize" },
+                    sw: { ...base, left: -size / 2, bottom: -size / 2, cursor: "nesw-resize" },
+                  };
+                  return (
+                    <div
+                      key={pos}
+                      onPointerDown={startResize(pos)}
+                      onPointerMove={onOverlayPointerMove}
+                      style={styleMap[pos]}
+                    />
+                  );
+                })}
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Onboarding-kort */}
       <ChooseProjectCard visible={showChooseCard} compact={!!devUrl && phase === "default"} busy={phase === "loading"} />
 
-      {/* Figma-fönster ovanpå laptop-UI */}
+      {/* Figma-fel */}
       {figmaErr && (
         <div
           style={{
@@ -621,88 +698,7 @@ function App() {
         </div>
       )}
 
-      {figmaSrc && overlayStage && (
-        <div
-          // Placera i stage-koordinater
-          onPointerDown={onOverlayPointerDown}
-          onPointerMove={onOverlayPointerMove}
-          onPointerUp={() => {}}
-          onPointerCancel={() => {}}
-          style={{
-            position: "absolute",
-            left: stageDims.left + CANVAS_MARGIN + round(overlayStage.x * stageDims.scale),
-            top:  stageDims.top  + CANVAS_MARGIN + round(overlayStage.y * stageDims.scale),
-            width:  round(overlayStage.w * stageDims.scale),
-            height: round(overlayStage.h * stageDims.scale),
-            zIndex: 20,
-            border: "2px solid var(--accent)",
-            borderRadius: 10,
-            boxShadow: "0 0 0 2px rgba(0,0,0,.06), 0 2px 10px rgba(0,0,0,.25)",
-            background: "#fff",
-            cursor: "move",
-            display: "grid",
-          }}
-        >
-          {/* Bilden fyller fönstret; Figma-node renderas som preview */}
-          <img
-            src={figmaSrc}
-            alt="Figma node"
-            draggable={false}
-            onLoad={onFigmaLoad}
-            onError={onFigmaError}
-            style={{
-              width: "100%",
-              height: "100%",
-              display: "block",
-              objectFit: "cover",
-              userSelect: "none",
-              pointerEvents: "none",
-            }}
-          />
-
-          {/* Inner dotted to aid alignment, endast när overlay visas */}
-          {showOverlay && (
-            <div
-              aria-hidden
-              style={{
-                position: "absolute",
-                inset: 6,
-                border: "1px dashed color-mix(in srgb, var(--accent) 60%, transparent)",
-                borderRadius: 8,
-                pointerEvents: "none",
-              }}
-            />
-          )}
-
-          {/* Hörn-handtag */}
-          {(["nw", "ne", "se", "sw"] as const).map((pos) => {
-            const size = 14;
-            const base: React.CSSProperties = {
-              position: "absolute",
-              width: size, height: size,
-              background: "var(--accent)",
-              borderRadius: 999,
-              boxShadow: "0 1px 4px rgba(0,0,0,.35)",
-            };
-            const styleMap: Record<typeof pos, React.CSSProperties> = {
-              nw: { ...base, left: -size / 2, top: -size / 2, cursor: "nwse-resize" },
-              ne: { ...base, right: -size / 2, top: -size / 2, cursor: "nesw-resize" },
-              se: { ...base, right: -size / 2, bottom: -size / 2, cursor: "nwse-resize" },
-              sw: { ...base, left: -size / 2, bottom: -size / 2, cursor: "nesw-resize" },
-            };
-            return (
-              <div
-                key={pos}
-                onPointerDown={startResize(pos)}
-                onPointerMove={onOverlayPointerMove}
-                style={styleMap[pos]}
-              />
-            );
-          })}
-        </div>
-      )}
-
-      {/* Placeholder om Figma inte är laddad men vi inte är i fel eller onboarding */}
+      {/* Placeholder */}
       {!figmaErr && !figmaSrc && phase !== "onboarding" && (
         <div
           style={{

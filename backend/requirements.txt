@@ -5,6 +5,9 @@ uvicorn[standard]==0.35.0
 # ─ Background-queue ─
 celery[redis]==5.5.3
 redis==5.2.1
+Pillow==10.4.0
+
+
 
 # ─ Git + HTTP ─
 GitPython==3.1.44
