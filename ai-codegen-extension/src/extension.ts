@@ -91,9 +91,10 @@ function startReloadWatcher(rootDir: string, baseUrl: string) {
 }
 
 /* ─────────────────────────────────────────────────────────
-   Hjälpare
+   Hjälpare – nätverksprober och URL-normalisering
    ───────────────────────────────────────────────────────── */
 async function headExists(url: string): Promise<boolean> {
+  // Behålls för bakåtkompabilitet på vissa ställen
   try {
     const u = new URL(url);
     const mod = u.protocol === "https:" ? https : http;
@@ -120,16 +121,97 @@ async function headExists(url: string): Promise<boolean> {
   }
 }
 
+// ── Ny: generell probe som kan göra HEAD eller GET
+async function probe(url: string, method: "HEAD" | "GET", timeoutMs = 2500): Promise<boolean> {
+  try {
+    const u = new URL(url);
+    const mod = u.protocol === "https:" ? https : http;
+    return await new Promise<boolean>((resolve) => {
+      const req = mod.request(
+        {
+          method,
+          hostname: u.hostname,
+          port: u.port,
+          path: (u.pathname || "/") + (u.search || ""),
+          timeout: timeoutMs,
+        },
+        (res) => {
+          // Läs inte kroppen – räcker med status
+          res.resume();
+          const code = res.statusCode ?? 500;
+          resolve(code >= 200 && code < 400);
+        }
+      );
+      req.on("timeout", () => { req.destroy(); resolve(false); });
+      req.on("error", () => resolve(false));
+      req.end();
+    });
+  } catch {
+    return false;
+  }
+}
+
+// ── Ny: säkerställ "/" i slutet när vi vill testa rot
+function withSlash(u: string): string {
+  try {
+    const url = new URL(u);
+    if (!url.pathname || !url.pathname.endsWith("/")) {
+      // Lägg bara till "/" om det inte ser ut som en fil (en enkel heuristik)
+      if (!/\.[a-z0-9]+$/i.test(url.pathname)) {
+        url.pathname = (url.pathname || "") + "/";
+      }
+    }
+    return url.toString();
+  } catch {
+    return u;
+  }
+}
+
+// ── Ny: snabbcheck (HEAD→GET) för enkel branchning
+async function quickCheck(url: string): Promise<boolean> {
+  if (await probe(url, "HEAD")) return true;
+  if (await probe(url, "GET")) return true;
+  return false;
+}
+
+// ── Ny: robust verifiering HEAD→GET + GET /index.html med lätt backoff
+async function verifyDevUrl(urlRaw: string): Promise<boolean> {
+  const root = withSlash(urlRaw);
+  const idx = new URL("index.html", root).toString();
+
+  // 3 rundor med backoff: 0.8s, 1.6s, 2.4s (≈5s totalt)
+  const delays = [800, 1600, 2400];
+
+  const tryRound = async () => {
+    // 1) HEAD på rot
+    if (await probe(root, "HEAD")) return true;
+    // 2) GET på rot
+    if (await probe(root, "GET")) return true;
+    // 3) GET på /index.html
+    if (await probe(idx, "GET")) return true;
+    return false;
+  };
+
+  for (let i = 0; i < delays.length; i++) {
+    if (await tryRound()) return true;
+    await new Promise((r) => setTimeout(r, delays[i]));
+  }
+  return false;
+}
+
 // ── Ny: verifiera devUrl och öppna projektväljaren vid ihållande 404/otillgänglig
 async function verifyDevUrlAndMaybeRechoose(url: string, reason: "initial" | "reload") {
   if (!extCtxRef) return;
-  // 3 försök med kort backoff för att ge dev-servern tid att spinna upp
-  for (let i = 0; i < 3; i++) {
-    const ok = await headExists(url);
-    if (ok) return;
-    await new Promise(r => setTimeout(r, 700));
-  }
-  warn(`Preview otillgänglig (${reason}) på ${url}. Öppnar projektväljare.`);
+
+  const ok = await verifyDevUrl(url);
+  if (ok) return;
+
+  const msg =
+    `Preview verkar otillgänglig (${reason}) på ${url}. ` +
+    `Testade HEAD/GET på "/" och GET på "/index.html".`;
+  warn(msg);
+  vscode.window.showWarningMessage(msg);
+
   try {
     await showProjectQuickPick(extCtxRef);
   } catch (e) {
@@ -507,7 +589,8 @@ async function startOrRespectfulFallback(
       }
 
       try {
-        const ok = await headExists(externalUrl);
+        // ── Ändrat: använd snabb HEAD→GET istället för HEAD-only
+        const ok = await quickCheck(externalUrl);
         if (!ok && c.entryHtml) {
           const base = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
           const url = base + encodeURI(normalizeRel(c.entryHtml));

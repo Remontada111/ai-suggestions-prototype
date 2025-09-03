@@ -1,0 +1,49 @@
+[35mHEAD:backend/.venv/Lib/site-packages/amqp/sasl.py[m[36m:[m[32m73[m[36m:[m        _write_table({b'LOGIN': self.username, b'[1;31mPASSWORD[m': self.password},
+[35mHEAD:backend/.venv/Lib/site-packages/celery/app/utils.py[m[36m:[m[32m38[m[36m:[m    'API|[1;31mTOKEN[m|KEY|[1;31mSECRET[m|PASS|PROFANITIES_LIST|SIGNATURE|DATABASE|BEAT_DBURI',
+[35mHEAD:backend/.venv/Lib/site-packages/git/util.py[m[36m:[m[32m583[m[36m:[m    DONE_[1;31mTOKEN[m = "done."
+[35mHEAD:backend/.venv/Lib/site-packages/git/util.py[m[36m:[m[32m584[m[36m:[m    [1;31mTOKEN[m_SEPARATOR = ", "
+[35mHEAD:backend/.venv/Lib/site-packages/git/util.py[m[36m:[m[32m677[m[36m:[m        if message.endswith(self.DONE_[1;31mTOKEN[m):
+[35mHEAD:backend/.venv/Lib/site-packages/git/util.py[m[36m:[m[32m679[m[36m:[m            message = message[: -len(self.DONE_[1;31mTOKEN[m)]
+[35mHEAD:backend/.venv/Lib/site-packages/git/util.py[m[36m:[m[32m681[m[36m:[m        message = message.strip(self.[1;31mTOKEN[m_SEPARATOR)
+[35mHEAD:backend/.venv/Lib/site-packages/httpcore/_async/socks_proxy.py[m[36m:[m[32m25[m[36m:[m    b"\x02": "USERNAME/[1;31mPASSWORD[m",
+[35mHEAD:backend/.venv/Lib/site-packages/httpcore/_async/socks_proxy.py[m[36m:[m[32m55[m[36m:[m        else socksio.socks5.SOCKS5AuthMethod.USERNAME_[1;31mPASSWORD[m
+[35mHEAD:backend/.venv/Lib/site-packages/httpcore/_async/socks_proxy.py[m[36m:[m[32m72[m[36m:[m    if response.method == socksio.socks5.SOCKS5AuthMethod.USERNAME_[1;31mPASSWORD[m:
+[35mHEAD:backend/.venv/Lib/site-packages/httpcore/_sync/socks_proxy.py[m[36m:[m[32m25[m[36m:[m    b"\x02": "USERNAME/[1;31mPASSWORD[m",
+[35mHEAD:backend/.venv/Lib/site-packages/httpcore/_sync/socks_proxy.py[m[36m:[m[32m55[m[36m:[m        else socksio.socks5.SOCKS5AuthMethod.USERNAME_[1;31mPASSWORD[m
+[35mHEAD:backend/.venv/Lib/site-packages/httpcore/_sync/socks_proxy.py[m[36m:[m[32m72[m[36m:[m    if response.method == socksio.socks5.SOCKS5AuthMethod.USERNAME_[1;31mPASSWORD[m:
+[35mHEAD:backend/.venv/Lib/site-packages/httptools/parser/cparser.pxd[m[36m:[m[32m64[m[36m:[m        HPE_INVALID_HEADER_[1;31mTOKEN[m,
+[35mHEAD:backend/.venv/Lib/site-packages/httpx/_urlparse.py[m[36m:[m[32m76[m[36m:[m[1;31mPASSWORD[m_SAFE = "".join(
+[35mHEAD:backend/.venv/Lib/site-packages/httpx/_urlparse.py[m[36m:[m[32m247[m[36m:[m        password = quote(kwargs.pop("password", "") or "", safe=[1;31mPASSWORD[m_SAFE)
+[35mHEAD:backend/.venv/Lib/site-packages/kombu/transport/SLMQ.py[m[36m:[m[32m158[m[36m:[m            api_key = os.environ.get('SL_[1;31mAPI_KEY[m', conninfo.password)
+[35mHEAD:backend/.venv/Lib/site-packages/kombu/transport/azurestoragequeues.py[m[36m:[m[32m23[m[36m:[m    azurestoragequeues://<SAS_[1;31mTOKEN[m>@<STORAGE_ACCOUNT_URL>
+[35mHEAD:backend/.venv/Lib/site-packages/kombu/transport/azurestoragequeues.py[m[36m:[m[32m211[m[36m:[m        #  azurestoragequeues://<SAS_[1;31mTOKEN[m>@<STORAGE_ACCOUNT_URL>
+[35mHEAD:backend/.venv/Lib/site-packages/kombu/transport/confluentkafka.py[m[36m:[m[32m28[m[36m:[m    confluentkafka://[USER:[1;31mPASSWORD[m@]KAFKA_ADDRESS[:PORT]
+[35mHEAD:backend/.venv/Lib/site-packages/kombu/transport/pyamqp.py[m[36m:[m[32m20[m[36m:[m    amqp://[USER:[1;31mPASSWORD[m@]BROKER_ADDRESS[:PORT][/VIRTUALHOST]
+[35mHEAD:backend/.venv/Lib/site-packages/kombu/transport/pyamqp.py[m[36m:[m[32m21[m[36m:[m    [USER:[1;31mPASSWORD[m@]BROKER_ADDRESS[:PORT][/VIRTUALHOST]
+[35mHEAD:backend/.venv/Lib/site-packages/kombu/transport/pyamqp.py[m[36m:[m[32m28[m[36m:[m    amqps://[USER:[1;31mPASSWORD[m@]BROKER_ADDRESS[:PORT][/VIRTUALHOST]
+[35mHEAD:backend/.venv/Lib/site-packages/kombu/transport/redis.py[m[36m:[m[32m18[m[36m:[m    redis://[USER:[1;31mPASSWORD[m@]REDIS_ADDRESS[:PORT][/VIRTUALHOST]
+[35mHEAD:backend/.venv/Lib/site-packages/kombu/transport/redis.py[m[36m:[m[32m19[m[36m:[m    rediss://[USER:[1;31mPASSWORD[m@]REDIS_ADDRESS[:PORT][/VIRTUALHOST]
+[35mHEAD:backend/.venv/Lib/site-packages/kombu/transport/redis.py[m[36m:[m[32m26[m[36m:[m    sentinel://[USER:[1;31mPASSWORD[m@]SENTINEL_ADDRESS[:PORT]
+[35mHEAD:backend/.venv/Lib/site-packages/openai-1.95.1.dist-info/METADATA[m[36m:[m[32m81[m[36m:[m    api_key=os.environ.get("OPENAI_[1;31mAPI_KEY[m"),
+[35mHEAD:backend/.venv/Lib/site-packages/openai-1.95.1.dist-info/METADATA[m[36m:[m[32m116[m[36m:[mto add `OPENAI_[1;31mAPI_KEY[m="My API Key"` to your `.env` file
+[35mHEAD:backend/.venv/Lib/site-packages/openai-1.95.1.dist-info/METADATA[m[36m:[m[32m179[m[36m:[m    api_key=os.environ.get("OPENAI_[1;31mAPI_KEY[m"),
+[35mHEAD:backend/.venv/Lib/site-packages/openai-1.95.1.dist-info/METADATA[m[36m:[m[32m217[m[36m:[m        api_key=os.environ.get("OPENAI_[1;31mAPI_KEY[m"),  # This is the default and can be omitted
+[35mHEAD:backend/.venv/Lib/site-packages/openai-1.95.1.dist-info/METADATA[m[36m:[m[32m473[m[36m:[mclient = OpenAI()  # OPENAI_WEBHOOK_[1;31mSECRET[m environment variable is used by default
+[35mHEAD:backend/.venv/Lib/site-packages/openai-1.95.1.dist-info/METADATA[m[36m:[m[32m512[m[36m:[mclient = OpenAI()  # OPENAI_WEBHOOK_[1;31mSECRET[m environment variable is used by default
+[35mHEAD:backend/.venv/Lib/site-packages/openai-1.95.1.dist-info/METADATA[m[36m:[m[32m847[m[36m:[m# gets the API Key from environment variable AZURE_OPENAI_[1;31mAPI_KEY[m
+[35mHEAD:backend/.venv/Lib/site-packages/openai-1.95.1.dist-info/METADATA[m[36m:[m[32m872[m[36m:[m- `azure_ad_token` (or the `AZURE_OPENAI_AD_[1;31mTOKEN[m` environment variable)
+[35mHEAD:backend/.venv/Lib/site-packages/openai/__init__.py[m[36m:[m[32m148[m[36m:[mazure_ad_token: str | None = _os.environ.get("AZURE_OPENAI_AD_[1;31mTOKEN[m")
+[35mHEAD:backend/.venv/Lib/site-packages/openai/__init__.py[m[36m:[m[32m281[m[36m:[m    return _os.environ.get("OPENAI_[1;31mAPI_KEY[m") is not None
+[35mHEAD:backend/.venv/Lib/site-packages/openai/__init__.py[m[36m:[m[32m285[m[36m:[m    return azure_endpoint is not None or _os.environ.get("AZURE_OPENAI_[1;31mAPI_KEY[m") is not None
+[35mHEAD:backend/.venv/Lib/site-packages/openai/__init__.py[m[36m:[m[32m290[m[36m:[m        _os.environ.get("AZURE_OPENAI_AD_[1;31mTOKEN[m") is not None
+[35mHEAD:backend/.venv/Lib/site-packages/openai/__init__.py[m[36m:[m[32m309[m[36m:[m            azure_ad_token = _os.environ.get("AZURE_OPENAI_AD_[1;31mTOKEN[m")
+[35mHEAD:backend/.venv/Lib/site-packages/openai/__init__.py[m[36m:[m[32m323[m[36m:[m                "AZURE_OPENAI_[1;31mAPI_KEY[m"
+[35mHEAD:backend/.venv/Lib/site-packages/openai/_client.py[m[36m:[m[32m122[m[36m:[m        - `api_key` from `OPENAI_[1;31mAPI_KEY[m`
+[35mHEAD:backend/.venv/Lib/site-packages/openai/_client.py[m[36m:[m[32m125[m[36m:[m        - `webhook_secret` from `OPENAI_WEBHOOK_[1;31mSECRET[m`
+[35mHEAD:backend/.venv/Lib/site-packages/openai/_client.py[m[36m:[m[32m128[m[36m:[m            api_key = os.environ.get("OPENAI_[1;31mAPI_KEY[m")
+[35mHEAD:backend/.venv/Lib/site-packages/openai/_client.py[m[36m:[m[32m131[m[36m:[m                "The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_[1;31mAPI_KEY[m environment variable"
+[35mHEAD:backend/.venv/Lib/site-packages/openai/_client.py[m[36m:[m[32m144[m[36m:[m            webhook_secret = os.environ.get("OPENAI_WEBHOOK_[1;31mSECRET[m")
+[35mHEAD:backend/.venv/Lib/site-packages/openai/_client.py[m[36m:[m[32m441[m[36m:[m        - `api_key` from `OPENAI_[1;31mAPI_KEY[m`
+[35mHEAD:backend/.venv/Lib/site-packages/openai/_client.py[m[36m:[m[32m444[m[36m:[m        - `webhook_secret` from `OPENAI_WEBHOOK_[1;31mSECRET[m`
+[35mHEAD:backend/.venv/Lib/site-packages/openai/_client.py[m[36m:[m[32m447[m[36m:[m            api_key = os.environ.get("OPENAI_[1;31mAPI_KEY[m")
+[35mHEAD:backend/.venv/Lib/site-packages/openai/_client.py[m[36m:[m[32m450[m[36m:[m                "The api_key client option mu

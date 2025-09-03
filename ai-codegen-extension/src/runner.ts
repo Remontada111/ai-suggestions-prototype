@@ -115,9 +115,10 @@ function headPing(url: string, timeoutMs = 900): Promise<boolean> {
           timeout: timeoutMs
         },
         (res) => {
-          // Alla svar räcker för “levande”
+          // Godkänn endast 2xx/3xx som "reachable" för att undvika falska positiva (t.ex. 404)
           res.resume();
-          resolve(true);
+          const ok = (res.statusCode ?? 500) < 400;
+          resolve(ok);
         }
       );
       req.on("timeout", () => {
