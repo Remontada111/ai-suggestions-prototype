@@ -148,7 +148,6 @@ async function probe(url, method, timeoutMs = 2500) {
                 timeout: timeoutMs,
             }, (res) => {
                 var _a;
-                // Läs inte kroppen – räcker med status
                 res.resume();
                 const code = (_a = res.statusCode) !== null && _a !== void 0 ? _a : 500;
                 resolve(code >= 200 && code < 400);
@@ -167,7 +166,6 @@ function withSlash(u) {
     try {
         const url = new URL(u);
         if (!url.pathname || !url.pathname.endsWith("/")) {
-            // Lägg bara till "/" om det inte ser ut som en fil (en enkel heuristik)
             if (!/\.[a-z0-9]+$/i.test(url.pathname)) {
                 url.pathname = (url.pathname || "") + "/";
             }
@@ -178,7 +176,19 @@ function withSlash(u) {
         return u;
     }
 }
-// ── Ny: snabbcheck (HEAD→GET) för enkel branchning
+// ── Ny: enkel cache-bust som garanterar faktisk iframe-reload
+function addBust(u) {
+    try {
+        const url = new URL(u);
+        url.searchParams.set("__ext_bust", Date.now().toString(36));
+        return url.toString();
+    }
+    catch (_a) {
+        const sep = u.includes("?") ? "&" : "?";
+        return `${u}${sep}__ext_bust=${Date.now().toString(36)}`;
+    }
+}
+// ── Ny: snabbcheck (HEAD→GET)
 async function quickCheck(url) {
     if (await probe(url, "HEAD"))
         return true;
@@ -186,42 +196,26 @@ async function quickCheck(url) {
         return true;
     return false;
 }
-// ── Ny: robust verifiering HEAD→GET + GET /index.html med lätt backoff
-async function verifyDevUrl(urlRaw) {
+// ── Ny: endast rotverifiering. Ingen auto-append av /index.html.
+async function rootReachable(urlRaw) {
     const root = withSlash(urlRaw);
-    const idx = new URL("index.html", root).toString();
-    // 3 rundor med backoff: 0.8s, 1.6s, 2.4s (≈5s totalt)
-    const delays = [800, 1600, 2400];
-    const tryRound = async () => {
-        // 1) HEAD på rot
-        if (await probe(root, "HEAD"))
-            return true;
-        // 2) GET på rot
-        if (await probe(root, "GET"))
-            return true;
-        // 3) GET på /index.html
-        if (await probe(idx, "GET"))
-            return true;
-        return false;
-    };
-    for (let i = 0; i < delays.length; i++) {
-        if (await tryRound())
-            return true;
-        await new Promise((r) => setTimeout(r, delays[i]));
-    }
+    if (await probe(root, "HEAD"))
+        return true;
+    if (await probe(root, "GET"))
+        return true;
     return false;
 }
-// ── Ny: verifiera devUrl och öppna projektväljaren vid ihållande 404/otillgänglig
+// ── Ny: 404 → öppna projektväljaren
 async function verifyDevUrlAndMaybeRechoose(url, reason) {
     if (!extCtxRef)
         return;
-    const ok = await verifyDevUrl(url);
+    const ok = await rootReachable(url);
     if (ok)
         return;
-    const msg = `Preview verkar otillgänglig (${reason}) på ${url}. ` +
-        `Testade HEAD/GET på "/" och GET på "/index.html".`;
+    const msg = `Preview verkar otillgänglig (${reason}) på ${url}.`;
     warn(msg);
     vscode.window.showWarningMessage(msg);
+    lastUiPhase = "onboarding";
     try {
         await showProjectQuickPick(extCtxRef);
     }
@@ -631,7 +625,7 @@ async function startOrRespectfulFallback(c, context) {
                 return { externalUrl, mode: "http", watchRoot: c.dir };
             }
             try {
-                // ── Ändrat: använd snabb HEAD→GET istället för HEAD-only
+                // ── Ändrat: använd snabb HEAD→GET
                 const ok = await quickCheck(externalUrl);
                 if (!ok && c.entryHtml) {
                     const base = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
@@ -703,16 +697,17 @@ async function startCandidatePreviewWithFallback(c, context, opts) {
     if (!silent) {
         const storageDir = await ensureStoragePreview(context);
         placeholder = await (0, runner_1.runInlineStaticServer)(storageDir);
-        lastDevUrl = placeholder.externalUrl;
+        lastDevUrl = addBust(placeholder.externalUrl);
         panel.webview.postMessage({ type: "devurl", url: lastDevUrl });
     }
     (async () => {
         try {
             const res = await startOrRespectfulFallback(c, context);
-            lastDevUrl = res.externalUrl;
-            panel.webview.postMessage({ type: "devurl", url: res.externalUrl });
+            const busted = addBust(res.externalUrl);
+            lastDevUrl = busted;
+            panel.webview.postMessage({ type: "devurl", url: busted });
             // ── Ny: verifiera att URL:en svarar, annars öppna projektväljaren
-            void verifyDevUrlAndMaybeRechoose(res.externalUrl, "initial");
+            void verifyDevUrlAndMaybeRechoose(busted, "initial");
             if ((res.mode === "inline" || res.mode === "http") && res.watchRoot) {
                 startReloadWatcher(res.watchRoot, res.externalUrl);
             }
@@ -754,14 +749,13 @@ function toPickItems(candidates) {
 async function showProjectQuickPick(context) {
     const panel = ensurePanel(context);
     panel.reveal(vscode.ViewColumn.One);
-    if (!lastCandidates.length) {
-        try {
-            lastCandidates = await (0, detector_1.detectProjects)([]);
-        }
-        catch (e) {
-            vscode.window.showErrorMessage(`Kunde inte hitta kandidater: ${(e === null || e === void 0 ? void 0 : e.message) || String(e)}`);
-            return;
-        }
+    // ── Ny: rescan varje gång
+    try {
+        lastCandidates = await (0, detector_1.detectProjects)([]);
+    }
+    catch (e) {
+        vscode.window.showErrorMessage(`Kunde inte hitta kandidater: ${(e === null || e === void 0 ? void 0 : e.message) || String(e)}`);
+        return;
     }
     if (!lastCandidates.length) {
         vscode.window.showWarningMessage("Hittade inga kandidater att välja bland.");

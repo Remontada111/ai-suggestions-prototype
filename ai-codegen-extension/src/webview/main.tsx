@@ -156,7 +156,6 @@ function App() {
   const [figmaErr, setFigmaErr] = useState<string | null>(null);
   const [figmaSrc, setFigmaSrc] = useState<string | null>(null);
   const [figmaN, setFigmaN] = useState<{ w: number; h: number } | null>(null);
-  
 
   const [showOverlay, setShowOverlay] = useState(false);
   const [selected, setSelected] = useState(false);
@@ -215,18 +214,28 @@ function App() {
       if (!msg || typeof msg !== "object") return;
 
       if (msg.type === "devurl") { setDevUrl(msg.url); return; }
-      if (msg.type === "ui-phase") { setPhase(msg.phase); return; }
+      if (msg.type === "ui-phase") {
+        setPhase(msg.phase);
+        if (msg.phase === "onboarding") {
+          // Rensa så att ChooseProjectCard visas och overlay döljs
+          setDevUrl(null);
+          setFigmaSrc(null);
+          setFigmaErr(null);
+          setSelected(false);
+          setShowOverlay(false);
+          persistState({ showOverlay: false });
+        }
+        return;
+      }
       if (msg.type === "figma-image-url" && typeof msg.url === "string") {
         setFigmaSrc(msg.url); setFigmaErr(null); refreshAttempts.current = 0; return;
       }
-     
       if (msg.type === "ui-error") {
         setFigmaErr(msg.message || "Okänt fel vid hämtning av Figma-bild."); setFigmaSrc(null); return;
       }
       if (msg.type === "init") {
         setFigmaSrc(null);
         setFigmaErr(null);
-                
         refreshAttempts.current = 0;
         return;
       }
@@ -234,7 +243,7 @@ function App() {
     window.addEventListener("message", onMsg);
     if (!sentReadyRef.current) { vscode.postMessage({ type: "ready" }); sentReadyRef.current = true; }
     return () => window.removeEventListener("message", onMsg);
-  }, []);
+  }, [persistState]);
 
   // stage-dimensioner
   const stageDims = useMemo(() => {
@@ -558,6 +567,7 @@ function App() {
             }}
           >
             <iframe
+              key={devUrl}
               title="preview"
               src={devUrl}
               sandbox="allow-scripts allow-forms allow-same-origin"
