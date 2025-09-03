@@ -16,3 +16,25 @@ build/
 .env.*
 *.key
 *.pem
+# Python
+backend/.venv/
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Node/build
+node_modules/
+dist/
+build/
+
+# Logs & secrets
+*.log
+.env
+.env.*
+*.key
+*.pem
