@@ -1,36 +1,19 @@
-node_modules/
-dist/
-*.vsix
-backend/.venv/
-.venv/
-venv/
-__pycache__/
-.pytest_cache/
-.vscode/
-node_modules/
-dist/
-build/
-*.log
-.env
-*.env
-.env.*
-*.key
-*.pem
 # Python
 backend/.venv/
 .venv/
 venv/
 __pycache__/
 .pytest_cache/
-
-# IDE
-.vscode/
-.idea/
+*.py[cod]
 
 # Node/build
 node_modules/
 dist/
 build/
+
+# IDE
+.vscode/
+.idea/
 
 # Logs & secrets
 *.log
