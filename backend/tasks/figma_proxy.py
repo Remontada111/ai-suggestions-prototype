@@ -24,10 +24,16 @@ ASSUME_P3_IF_NO_ICC = os.getenv("ASSUME_P3_IF_NO_ICC", "1") == "1"
 P3_ICC_PATH = os.getenv("P3_ICC_PATH", "backend/color/DisplayP3.icc")
 
 
-def _auth_headers() -> dict:
+def _auth_headers(token_override: Optional[str] = None) -> dict:
     """
-    Föredra OAuth Bearer om satt, annars PAT via X-Figma-Token.
+    Föredra token från anropet om angiven, annars env (OAuth först, sedan PAT).
+    Vi skickar både Authorization och X-Figma-Token för kompatibilitet.
     """
+    if token_override:
+        return {
+            "Authorization": f"Bearer {token_override}",
+            "X-Figma-Token": token_override,
+        }
     if FIGMA_OAUTH:
         return {"Authorization": f"Bearer {FIGMA_OAUTH}"}
     if FIGMA_PAT:
@@ -35,7 +41,7 @@ def _auth_headers() -> dict:
     raise HTTPException(500, "Ingen Figma-token konfigurerad (FIGMA_TOKEN eller FIGMA_OAUTH_TOKEN).")
 
 
-def _figma_image_url(file_key: str, node_id: str, scale: str) -> str:
+def _figma_image_url(file_key: str, node_id: str, scale: str, token: Optional[str] = None) -> str:
     """
     Hämtar presignad bild-URL från Figma Images API för given node.
     """
@@ -47,7 +53,7 @@ def _figma_image_url(file_key: str, node_id: str, scale: str) -> str:
         "scale": scale or "2",
     }
     try:
-        r = requests.get(u, headers=_auth_headers(), params=params, timeout=15)
+        r = requests.get(u, headers=_auth_headers(token), params=params, timeout=15)
     except RequestException as e:
         raise HTTPException(502, f"figma images nätverksfel: {e}")
     if r.status_code != 200:
@@ -122,11 +128,11 @@ def _to_srgb_png(src_bytes: bytes) -> bytes:
 
 # Denna funktion registreras som route i backend.app.main:
 # app.add_api_route("/api/figma-image", figma_image_handler, methods=["GET"])
-def figma_image(fileKey: str, nodeId: str, scale: str = "2"):
+def figma_image(fileKey: str, nodeId: str, scale: str = "2", token: Optional[str] = None):
     # Säkerställ att vi har någon form av token
-    _ = _auth_headers()  # kommer kasta 500 om saknas
+    _ = _auth_headers(token)  # kommer kasta 500 om saknas
 
-    url = _figma_image_url(fileKey, nodeId, scale)
+    url = _figma_image_url(fileKey, nodeId, scale, token)
 
     try:
         r = requests.get(url, timeout=30)

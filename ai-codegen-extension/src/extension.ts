@@ -356,7 +356,7 @@ async function tryAutoFullView(panel: vscode.WebviewPanel, context: vscode.Exten
 /* ─────────────────────────────────────────────────────────
    FIGMA via backend-proxy (sRGB-normalisering)
    ───────────────────────────────────────────────────────── */
-function buildProxyUrl(fileKey: string, nodeId: string, scale = "2"): string | null {
+function buildProxyUrl(fileKey: string, nodeId: string, scale = "2", token?: string): string | null {
   const base = vscode.workspace.getConfiguration(SETTINGS_NS).get<string>("backendBaseUrl");
   if (!base) return null;
   let u: URL;
@@ -368,13 +368,14 @@ function buildProxyUrl(fileKey: string, nodeId: string, scale = "2"): string | n
   u.searchParams.set("fileKey", fileKey);
   u.searchParams.set("nodeId", nodeId);
   u.searchParams.set("scale", scale);
+  if (token) u.searchParams.set("token", token);
   return u.toString();
 }
 
 async function sendFreshFigmaImageUrlToWebview(source: "init" | "refresh") {
   if (!currentPanel || !lastInitPayload) return;
-  const { fileKey, nodeId } = lastInitPayload;
-  const url = buildProxyUrl(fileKey, nodeId, "2");
+  const { fileKey, nodeId, figmaToken } = lastInitPayload;
+  const url = buildProxyUrl(fileKey, nodeId, "2", figmaToken);
   if (!url) {
     currentPanel.webview.postMessage({
       type: "ui-error",
