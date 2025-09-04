@@ -227,9 +227,11 @@ function App() {
           setDevUrl(null);
           setFigmaSrc(null);
           setFigmaErr(null);
+          setFigmaN(null);
+          setOverlayStage(null);
           setSelected(false);
           setShowOverlay(false);
-          persistState({ showOverlay: false });
+          persistState({ overlayStage: null, showOverlay: false });
         }
         return;
       }
@@ -242,6 +244,11 @@ function App() {
       if (msg.type === "init") {
         setFigmaSrc(null);
         setFigmaErr(null);
+        setFigmaN(null);
+        setOverlayStage(null);
+        setSelected(false);
+        setShowOverlay(false);
+        persistState({ overlayStage: null, showOverlay: false });
         refreshAttempts.current = 0;
         return;
       }
@@ -271,7 +278,7 @@ function App() {
 
   // init overlay när bild finns
   useEffect(() => {
-    if ((figmaSrc || figmaN) && !overlayStage) {
+    if (figmaSrc && figmaN && !overlayStage) {
       const availW = PROJECT_BASE.w * 0.9;
       const availH = PROJECT_BASE.h * 0.9;
       const fitted = arFit(availW, availH, overlayAR);
