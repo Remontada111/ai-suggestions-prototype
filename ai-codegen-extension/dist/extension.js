@@ -215,13 +215,13 @@ async function verifyDevUrlAndMaybeRechoose(url, reason) {
     const msg = `Preview verkar otillgänglig (${reason}) på ${url}.`;
     warn(msg);
     vscode.window.showWarningMessage(msg);
+    // Visa endast webviewns folder-UI. Ingen QuickPick här.
     lastUiPhase = "onboarding";
+    pendingCandidate = null;
     try {
-        await showProjectQuickPick(extCtxRef);
+        currentPanel === null || currentPanel === void 0 ? void 0 : currentPanel.webview.postMessage({ type: "ui-phase", phase: "onboarding" });
     }
-    catch (e) {
-        warn("Kunde inte öppna projektväljaren:", e);
-    }
+    catch (_a) { }
 }
 function normalizeDevCmdPorts(raw) {
     let cmd = raw;
@@ -625,12 +625,17 @@ async function startOrRespectfulFallback(c, context) {
                 return { externalUrl, mode: "http", watchRoot: c.dir };
             }
             try {
-                // ── Ändrat: använd snabb HEAD→GET
+                // ── Ändrat: använd snabb HEAD→GET + index.html-fallback
                 const ok = await quickCheck(externalUrl);
-                if (!ok && c.entryHtml) {
+                if (!ok) {
                     const base = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
-                    const url = base + encodeURI(normalizeRel(c.entryHtml));
-                    return { externalUrl: url, mode: "dev" };
+                    if (await quickCheck(base + "index.html")) {
+                        return { externalUrl: base + "index.html", mode: "dev" };
+                    }
+                    if (c.entryHtml) {
+                        const url = base + encodeURI(normalizeRel(c.entryHtml));
+                        return { externalUrl: url, mode: "dev" };
+                    }
                 }
             }
             catch (_a) { }
@@ -736,15 +741,24 @@ async function startCandidatePreviewWithFallback(c, context, opts) {
 /* ─────────────────────────────────────────────────────────
    QuickPick
    ───────────────────────────────────────────────────────── */
+// Hjälpare: visa relativ path om möjligt
+function relToWorkspace(p) {
+    var _a, _b;
+    const roots = (_b = (_a = vscode.workspace.workspaceFolders) === null || _a === void 0 ? void 0 : _a.map(f => f.uri.fsPath)) !== null && _b !== void 0 ? _b : [];
+    for (const r of roots) {
+        const rel = path.relative(r, p);
+        if (!rel.startsWith(".."))
+            return rel.replace(/\\/g, "/");
+    }
+    return p.replace(/\\/g, "/"); // fallback: absolut path
+}
+// Ren lista: "Project 1" på första raden, path på andra
 function toPickItems(candidates) {
-    return candidates.map((c) => {
-        var _a, _b, _d, _e;
-        const label = c.pkgName || path.basename(c.dir);
-        const cmd = (_e = (_a = selectLaunchCommand(c)) !== null && _a !== void 0 ? _a : (_d = (_b = c.runCandidates) === null || _b === void 0 ? void 0 : _b[0]) === null || _d === void 0 ? void 0 : _d.cmd) !== null && _e !== void 0 ? _e : "auto";
-        const description = `${c.framework} • ${cmd}`;
-        const detail = c.dir;
-        return { label, description, detail, _c: c };
-    });
+    return candidates.map((c, i) => ({
+        label: `Project ${i + 1}`,
+        detail: relToWorkspace(c.dir),
+        _c: c,
+    }));
 }
 async function showProjectQuickPick(context) {
     const panel = ensurePanel(context);
@@ -763,8 +777,8 @@ async function showProjectQuickPick(context) {
     }
     const chosen = await vscode.window.showQuickPick(toPickItems(lastCandidates), {
         placeHolder: "Välj projekt att förhandsvisa",
-        matchOnDescription: true,
-        matchOnDetail: true,
+        matchOnDescription: false, // ingen “unknown • npx …”
+        matchOnDetail: true, // sök på path-raden
         ignoreFocusOut: true,
     });
     if (!chosen)

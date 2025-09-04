@@ -203,16 +203,14 @@ async function verifyDevUrlAndMaybeRechoose(url: string, reason: "initial" | "re
   warn(msg);
   vscode.window.showWarningMessage(msg);
 
+  // Visa endast webviewns folder-UI. Ingen QuickPick här.
   lastUiPhase = "onboarding";
+  pendingCandidate = null;
   try {
     currentPanel?.webview.postMessage({ type: "ui-phase", phase: "onboarding" });
   } catch {}
-  try {
-    await showProjectQuickPick(extCtxRef);
-  } catch (e) {
-    warn("Kunde inte öppna projektväljaren:", e);
-  }
 }
+
 
 function normalizeDevCmdPorts(raw: string): string {
   let cmd = raw;
@@ -703,14 +701,23 @@ async function startCandidatePreviewWithFallback(
 /* ─────────────────────────────────────────────────────────
    QuickPick
    ───────────────────────────────────────────────────────── */
+// Hjälpare: visa relativ path om möjligt
+function relToWorkspace(p: string): string {
+  const roots = vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [];
+  for (const r of roots) {
+    const rel = path.relative(r, p);
+    if (!rel.startsWith("..")) return rel.replace(/\\/g, "/");
+  }
+  return p.replace(/\\/g, "/"); // fallback: absolut path
+}
+
+// Ren lista: "Project 1" på första raden, path på andra
 function toPickItems(candidates: Candidate[]): Array<vscode.QuickPickItem & { _c: Candidate }> {
-  return candidates.map((c) => {
-    const label = c.pkgName || path.basename(c.dir);
-    const cmd = selectLaunchCommand(c) ?? c.runCandidates?.[0]?.cmd ?? "auto";
-    const description = `${c.framework} • ${cmd}`;
-    const detail = c.dir;
-    return { label, description, detail, _c: c };
-  });
+  return candidates.map((c, i) => ({
+    label: `Project ${i + 1}`,
+    detail: relToWorkspace(c.dir),
+    _c: c,
+  }));
 }
 
 async function showProjectQuickPick(context: vscode.ExtensionContext) {
@@ -729,11 +736,11 @@ async function showProjectQuickPick(context: vscode.ExtensionContext) {
   }
 
   const chosen = await vscode.window.showQuickPick(toPickItems(lastCandidates), {
-    placeHolder: "Välj projekt att förhandsvisa",
-    matchOnDescription: true,
-    matchOnDetail: true,
-    ignoreFocusOut: true,
-  });
+  placeHolder: "Välj projekt att förhandsvisa",
+  matchOnDescription: false, // ingen “unknown • npx …”
+  matchOnDetail: true,       // sök på path-raden
+  ignoreFocusOut: true,
+});
   if (!chosen) return;
 
   pendingCandidate = chosen._c;

@@ -29,7 +29,7 @@ const vscode = acquireVsCodeApi();
 // ─────────────────────────────────────────────────────────
 const PROJECT_BASE = { w: 1280, h: 800 };
 const PREVIEW_MIN_SCALE = 0.3;
-const PREVIEW_MAX_SCALE = 1.0;
+const PREVIEW_MAX_SCALE = Number.POSITIVE_INFINITY; // låt scenen skala upp till panelens storlek
 const OVERLAY_MIN_FACTOR = 0.15;
 const CANVAS_MARGIN = 16;
 
@@ -59,16 +59,13 @@ function withCenterResize(rect: Rect, newW: number, newH: number): Rect {
 }
 
 // ─────────────────────────────────────────────────────────
-// UI: “Välj projekt/folder”-kort
+// UI: “Pick project”-kort (förbättrad, en knapp, inga overflow-glitches)
 // ─────────────────────────────────────────────────────────
 function ChooseProjectCard(props: { visible: boolean; compact?: boolean; busy?: boolean }) {
   const { visible, compact, busy } = props;
   if (!visible) return null;
 
-  const onChooseProject = () => vscode.postMessage({ cmd: "chooseProject" });
-  const onPickFolder   = () => vscode.postMessage({ cmd: "pickFolder" });
-  const onStartTop     = () => vscode.postMessage({ cmd: "acceptCandidate" });
-  const onForget       = () => vscode.postMessage({ cmd: "forgetProject" });
+  const onPickProject = () => vscode.postMessage({ cmd: "pickFolder" });
 
   return (
     <div
@@ -84,64 +81,73 @@ function ChooseProjectCard(props: { visible: boolean; compact?: boolean; busy?: 
       <div
         style={{
           pointerEvents: "auto",
-          width: compact ? 280 : 360,
-          height: compact ? 160 : 200,
-          padding: 12,
+          width: compact ? 300 : 380,
+          height: compact ? 170 : 220,
+          padding: 14,
           borderRadius: 16,
           background: "linear-gradient(135deg, #6dd5ed, #2193b0)",
           boxShadow: "0 15px 30px rgba(0,0,0,.25)",
           position: "relative",
           color: "white",
-          overflow: "hidden",
+          overflow: "hidden", // hindra overflow utanför blått område
         }}
       >
         <style>{`
-          .fp-container { --transition: 350ms; --folder-W: 120px; --folder-H: 80px; }
-          .fp-folder { position: absolute; top: -20px; left: calc(50% - 60px); animation: fp-float 2.5s infinite ease-in-out; transition: transform var(--transition) ease; }
-          .fp-container:hover .fp-folder { transform: scale(1.05); }
-          .fp-front, .fp-back { position: absolute; transform-origin: bottom center; transition: transform var(--transition); }
-          .fp-back::before, .fp-back::after {
-            content: ""; display: block; background: white; opacity: .5; width: var(--folder-W); height: var(--folder-H);
-            position: absolute; transform-origin: bottom center; border-radius: 15px; transition: transform 350ms; z-index: 0;
+          .pp-wrap { position: absolute; inset: 0; display: grid; place-items: center; }
+          .pp-folder {
+            position: relative;
+            width: 150px; height: 110px;
+            transform-origin: 50% 80%;
+            transition: transform .28s ease;
           }
-          .fp-container:hover .fp-back::before { transform: rotateX(-5deg) skewX(5deg); }
-          .fp-container:hover .fp-back::after  { transform: rotateX(-15deg) skewX(12deg); }
-          .fp-container:hover .fp-front { transform: rotateX(-40deg) skewX(15deg); }
-          .fp-tip { background: linear-gradient(135deg, #ff9a56, #ff6f56); width: 80px; height: 20px; border-radius: 12px 12px 0 0; position: absolute; top: -10px; z-index: 2; box-shadow: 0 5px 15px rgba(0,0,0,.2); }
-          .fp-cover { background: linear-gradient(135deg, #ffe563, #ffc663); width: var(--folder-W); height: var(--folder-H); border-radius: 10px; box-shadow: 0 15px 30px rgba(0,0,0,.3); }
-          .fp-cta { display:flex; gap:8px; position:absolute; bottom:12px; left:12px; right:12px; }
-          .fp-btn { flex:1; padding:10px 12px; border-radius:10px; border:none; cursor:pointer; color:#123; font-weight:600; background: rgba(255,255,255,.9); transition: transform .12s ease, background .2s ease; }
-          .fp-btn:hover { transform: translateY(-1px); background: #fff; }
-          .fp-sub { position:absolute; bottom: 48px; left: 12px; right: 12px; font-size: 12px; opacity: .9 }
-          .fp-ghost { position:absolute; inset:0; border-radius:16px; border:1px dashed rgba(255,255,255,.35) }
-          @keyframes fp-float { 0%{transform:translateY(0)} 50%{transform:translateY(-14px)} 100%{transform:translateY(0)} }
+          .pp-folder .body {
+            position:absolute; inset:0; border-radius:14px;
+            background: linear-gradient(135deg,#ffe563,#ffc663);
+            box-shadow: 0 10px 25px rgba(0,0,0,.25);
+          }
+          .pp-folder .lid {
+            position:absolute; left:18px; top:-14px; width:94px; height:26px;
+            border-radius:12px 12px 0 0;
+            background: linear-gradient(135deg,#ff9a56,#ff6f56);
+            box-shadow: 0 6px 14px rgba(0,0,0,.2);
+            transform-origin: 12px 26px;
+            transition: transform .28s ease;
+          }
+          .pp-card:hover .pp-folder { transform: translateY(-2px) scale(1.02); }
+          .pp-card:hover .lid { transform: rotate(-12deg); }
+          .pp-cta {
+            position:absolute; left:14px; right:14px; bottom:14px;
+            display:flex; gap:10px; align-items:center; justify-content:center;
+          }
+          .pp-btn {
+            appearance:none; border:none; cursor:pointer;
+            padding:12px 14px; border-radius:10px; font-weight:700;
+            color:#123; background: rgba(255,255,255,.94);
+            box-shadow: 0 4px 10px rgba(0,0,0,.18);
+            transition: transform .12s ease, background .2s ease, box-shadow .2s ease;
+          }
+          .pp-btn:hover { transform: translateY(-1px); background:#fff; box-shadow: 0 6px 16px rgba(0,0,0,.22); }
+          .pp-sub {
+            position:absolute; left:14px; right:14px; bottom:64px; font-size:12px; opacity:.95; text-align:center;
+          }
         `}</style>
 
-        <div className="fp-ghost" />
-        <div className="fp-container">
-          <div className="fp-folder">
-            <div className="fp-front">
-              <div className="fp-tip" />
-              <div className="fp-cover" />
+        <div className="pp-card" style={{ position: "absolute", inset: 0 }}>
+          <div className="pp-wrap" aria-hidden>
+            <div className="pp-folder">
+              <div className="body" />
+              <div className="lid" />
             </div>
-            <div className="fp-back fp-cover" />
           </div>
+
         </div>
 
-        <div className="fp-sub">
-          {busy ? "Startar förhandsvisning…" : "Välj ett projekt att förhandsvisa (jag minns valet)."}
+        <div className="pp-sub">
+          {busy ? "Startar förhandsvisning…" : "Välj ett projekt att förhandsvisa. Ditt val sparas."}
         </div>
-        <div className="fp-cta">
-          <button className="fp-btn" onClick={onChooseProject}>Välj projekt…</button>
-          <button className="fp-btn" onClick={onPickFolder}>Välj folder…</button>
+        <div className="pp-cta">
+          <button className="pp-btn" onClick={onPickProject}>Pick project</button>
         </div>
-
-        {compact && (
-          <div style={{ position: "absolute", top: 10, right: 10, display: "flex", gap: 6 }}>
-            <button className="fp-btn" style={{ padding: "6px 8px" }} onClick={onStartTop}>Starta föreslagen</button>
-            <button className="fp-btn" style={{ padding: "6px 8px" }} onClick={onForget}>Glöm</button>
-          </div>
-        )}
       </div>
     </div>
   );
@@ -514,13 +520,13 @@ function App() {
     };
   }, [overlayStage, overlayAR, selected, persistState]);
 
-  // auto-onboarding
+  // auto-onboarding: öppna inte QuickPick automatiskt
   const [requestedProjectOnce, setRequestedProjectOnce] = useState(false);
   useEffect(() => {
     const t = setTimeout(() => {
       if (!requestedProjectOnce && !devUrl && !figmaSrc && phase === "onboarding") {
+        // Valfritt: testa tyst toppkandidat
         vscode.postMessage({ cmd: "acceptCandidate" });
-        setTimeout(() => { if (!devUrl && !figmaSrc && phase === "onboarding") vscode.postMessage({ cmd: "chooseProject" }); }, 400);
         setRequestedProjectOnce(true);
       }
     }, 600);
@@ -528,12 +534,13 @@ function App() {
   }, [devUrl, figmaSrc, phase, requestedProjectOnce]);
 
   const showChooseCard = !devUrl && !figmaSrc && phase === "onboarding";
+  const rootPadding = (!devUrl && !figmaSrc) ? CANVAS_MARGIN : 0;
 
   return (
     <div
       ref={rootRef}
       className="panel-root"
-      style={{ position: "fixed", inset: 0, padding: CANVAS_MARGIN }}
+      style={{ position: "fixed", inset: 0, padding: rootPadding }}
       onWheel={onWheel}
     >
       {/* Laptop-UI */}
@@ -541,8 +548,8 @@ function App() {
         className="laptop-shell"
         style={{
           position: "absolute",
-          left: stageDims.left + CANVAS_MARGIN,
-          top:  stageDims.top  + CANVAS_MARGIN,
+          left: stageDims.left + rootPadding,
+          top:  stageDims.top  + rootPadding,
           width: stageDims.w,
           height: stageDims.h,
           zIndex: 5,
@@ -697,7 +704,7 @@ function App() {
               <div style={{ marginTop: 8 }}>{figmaErr}</div>
               <div style={{ marginTop: 12 }}>
                 <button
-                  className="fp-btn"
+                  className="pp-btn"
                   onClick={() => { refreshAttempts.current = 0; setFigmaErr("Försöker hämta ny bild-URL…"); vscode.postMessage({ cmd: "refreshFigmaImage" }); }}
                 >
                   Försök igen
