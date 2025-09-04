@@ -205,6 +205,9 @@ async function verifyDevUrlAndMaybeRechoose(url: string, reason: "initial" | "re
 
   lastUiPhase = "onboarding";
   try {
+    currentPanel?.webview.postMessage({ type: "ui-phase", phase: "onboarding" });
+  } catch {}
+  try {
     await showProjectQuickPick(extCtxRef);
   } catch (e) {
     warn("Kunde inte öppna projektväljaren:", e);
@@ -581,12 +584,17 @@ async function startOrRespectfulFallback(
       }
 
       try {
-        // ── Ändrat: använd snabb HEAD→GET
+        // ── Ändrat: använd snabb HEAD→GET + index.html-fallback
         const ok = await quickCheck(externalUrl);
-        if (!ok && c.entryHtml) {
+        if (!ok) {
           const base = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
-          const url = base + encodeURI(normalizeRel(c.entryHtml));
-          return { externalUrl: url, mode: "dev" };
+          if (await quickCheck(base + "index.html")) {
+            return { externalUrl: base + "index.html", mode: "dev" };
+          }
+          if (c.entryHtml) {
+            const url = base + encodeURI(normalizeRel(c.entryHtml));
+            return { externalUrl: url, mode: "dev" };
+          }
         }
       } catch {}
 
