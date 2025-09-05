@@ -651,7 +651,8 @@ async function startOrRespectfulFallback(c, context) {
     if (html) {
         const { externalUrl } = await (0, runner_1.runInlineStaticServer)(html.root);
         const base = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
-        return { externalUrl, mode: "inline", watchRoot: html.root };
+        const url = base + encodeURI(html.relHtml); // ⬅️ peka på faktisk HTML
+        return { externalUrl: url, mode: "inline", watchRoot: html.root };
     }
     const storageDir = await ensureStoragePreview(context);
     const { externalUrl } = await (0, runner_1.runInlineStaticServer)(storageDir);

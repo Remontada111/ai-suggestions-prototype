@@ -1,19 +1,20 @@
 // src/detector.ts
-// Extremt robust kandidatdetektering för frontend-projekt.
-// Förbättringar (MVP++ + ML-integration):
-// - Intent-medveten HTML-detektion (root/public boost, src/tests/examples penalties)
-// - DOM-signalering från entry-filer (React/Vue/Svelte/Angular/#app)
-// - Lättviktiga overrides via frontend.detector.json
-// - ML (GBDT) ovanpå heuristiken: bygger FeatureVector → p(frontend) → kombinerar score
-// - Bibehåller monorepo-stöd, cache, deterministisk rangordning och fallbacks
+// Robust kandidatdetektering för frontend-projekt.
+// Nyheter:
+// - “Extension-like”-detektion: hård-exkludera bara riktiga VS Code extensions.
+// - Runnability-gate: släpp igenom endast mappar som rimligen går att starta (dev-script,
+//   känd config/dep eller faktiskt HTML att serva).
+// - Intent-medveten HTML-prioritering + DOM-signal (React/Vue/Svelte/Angular).
+// - Förbättrade runCandidates: föreslå npx-kommandon även utan scripts vid dep/config.
+// - Overrides via frontend.detector.json (forceInclude/forceExclude).
+// - ML-krok: bygg feature vector → p(frontend) → kombinera med heuristikscore.
 
 import * as vscode from "vscode";
 import * as path from "node:path";
 import * as fs from "node:fs";
-import fg from "fast-glob"; // npm i fast-glob
-import YAML from "yaml";    // npm i yaml
+import fg from "fast-glob";
+import YAML from "yaml";
 
-// ⬇️ ML-importer
 import { buildFeatureVector, type HtmlIntent, type DomIntent } from "./ml/features";
 import { predictFrontendProb, combineHeuristicAndML } from "./ml/classifier";
 
@@ -21,15 +22,14 @@ import { predictFrontendProb, combineHeuristicAndML } from "./ml/classifier";
 export type Candidate = {
   dir: string;
   manager: "pnpm" | "yarn" | "npm" | "bun" | "unknown";
-  devCmd?: string; // valt primärt kommando att köra
+  devCmd?: string;
   framework: string;
   confidence: number;
   reason: string[];
   pkgName?: string;
 
-  // Ledtrådar för att kunna starta/visa något även utan dev-script
   entryHtml?: string; // relativ sökväg till en HTML-fil vi kan serva (om finns)
-  entryFile?: string; // t.ex. src/main.tsx (för heuristik)
+  entryFile?: string; // t.ex. src/main.tsx
   runCandidates?: { name?: string; cmd: string; source: string }[];
   configHints?: string[];
 };
@@ -41,26 +41,13 @@ const IGNORE_GLOBS =
 
 // ──────────────── Enkel modul-lokal cache ────────────────
 let _cache: { at: number; list: Candidate[] } | null = null;
-const CACHE_TTL_MS = 15000; // 15s känns lagom för upptäcktscache
+const CACHE_TTL_MS = 15000;
 
 // ──────────────── Utilities ────────────────
-function unique<T>(a: T[]): T[] {
-  return Array.from(new Set(a));
-}
-function readJson(file: string): any | null {
-  try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch {
-    return null;
-  }
-}
-function readText(file: string): string | null {
-  try {
-    return fs.readFileSync(file, "utf8");
-  } catch {
-    return null;
-  }
-}
+function unique<T>(a: T[]): T[] { return Array.from(new Set(a)); }
+function readJson(file: string): any | null { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; } }
+function readText(file: string): string | null { try { return fs.readFileSync(file, "utf8"); } catch { return null; } }
+
 function detectManager(dir: string): Candidate["manager"] {
   if (fs.existsSync(path.join(dir, "pnpm-lock.yaml"))) return "pnpm";
   if (fs.existsSync(path.join(dir, "yarn.lock"))) return "yarn";
@@ -68,27 +55,35 @@ function detectManager(dir: string): Candidate["manager"] {
   if (fs.existsSync(path.join(dir, "package-lock.json"))) return "npm";
   return "unknown";
 }
+
 function hasDep(pkg: any, names: string[]) {
-  const d = {
-    ...(pkg?.dependencies || {}),
-    ...(pkg?.devDependencies || {}),
-    ...(pkg?.peerDependencies || {}),
-  };
-  const lower = new Set(Object.keys(d).map((k) => k.toLowerCase()));
-  return names.some((n) => lower.has(n.toLowerCase()));
+  const d = { ...(pkg?.dependencies || {}), ...(pkg?.devDependencies || {}), ...(pkg?.peerDependencies || {}) };
+  const lower = new Set(Object.keys(d).map(k => k.toLowerCase()));
+  return names.some(n => lower.has(n.toLowerCase()));
 }
+
 function chooseScript(pkg: any): string | undefined {
   const s = pkg?.scripts || {};
   for (const k of ["dev", "start", "serve", "preview"]) if (s[k]) return k;
   const keys = Object.keys(s);
-  const rx =
-    /(next|vite|nuxt|svelte-kit|remix|solid-start|astro|webpack-dev-server|storybook|story|expo|ng\s+serve)\b/i;
-  const hit = keys.find((k) => rx.test(String(s[k])));
+  const rx = /(next|vite|nuxt|svelte-kit|remix|solid-start|astro|webpack(-dev-server)?|storybook|expo|ng\s+serve)\b/i;
+  const hit = keys.find(k => rx.test(String(s[k])));
   return hit;
 }
+
 function isUnder(dir: string, excludedRoots: string[]) {
   const norm = path.resolve(dir);
-  return excludedRoots.some((root) => norm.startsWith(path.resolve(root) + path.sep));
+  return excludedRoots.some(root => norm.startsWith(path.resolve(root) + path.sep));
+}
+
+/** “Extension-like”: engines.vscode + tydlig VS Code-shape */
+function isVSCExtensionLike(pkg: any): boolean {
+  if (!pkg?.engines?.vscode) return false;
+  const hasVsceShape =
+    !!pkg?.contributes ||
+    !!pkg?.activationEvents ||
+    /extension\.(c?m?js|ts)$/i.test(String(pkg?.main || ""));
+  return hasVsceShape;
 }
 
 /** Samla potentiella rötter: workspace + öppna filer (även utanför workspace) */
@@ -99,43 +94,23 @@ function collectCandidateRoots(): string[] {
     if (ed?.document?.uri?.scheme === "file") roots.push(path.dirname(ed.document.uri.fsPath));
   const active = vscode.window.activeTextEditor;
   if (active?.document?.uri?.scheme === "file") roots.push(path.dirname(active.document.uri.fsPath));
-  return unique(roots.map((p) => path.resolve(p)));
+  return unique(roots.map(p => path.resolve(p)));
 }
 
 /** Liten DFS utan VS Code globber – funkar även utanför workspace */
 function* walk(dir: string, maxDepth = 5): Generator<string> {
   const stack: Array<{ dir: string; depth: number }> = [{ dir, depth: 0 }];
-  const IGNORE = new Set([
-    "node_modules",
-    "dist",
-    "dist-webview",
-    "build",
-    "out",
-    ".next",
-    ".svelte-kit",
-    ".output",
-    ".git",
-    "coverage",
-    ".venv",
-    "venv",
-    "__pycache__",
-  ]);
+  const IGNORE = new Set(["node_modules","dist","dist-webview","build","out",".next",".svelte-kit",".output",".git","coverage",".venv","venv","__pycache__"]);
   while (stack.length) {
     const { dir: cur, depth } = stack.pop()!;
     if (depth > maxDepth) continue;
     let ents: fs.Dirent[] = [];
-    try {
-      ents = fs.readdirSync(cur, { withFileTypes: true });
-    } catch {
-      continue;
-    }
+    try { ents = fs.readdirSync(cur, { withFileTypes: true }); } catch { continue; }
     for (const e of ents) {
       const full = path.join(cur, e.name);
       if (e.isDirectory()) {
         if (!IGNORE.has(e.name)) stack.push({ dir: full, depth: depth + 1 });
-      } else if (e.isFile()) {
-        yield full;
-      }
+      } else if (e.isFile()) yield full;
     }
   }
 }
@@ -143,9 +118,9 @@ function* walk(dir: string, maxDepth = 5): Generator<string> {
 /** Intent-medveten HTML-sökning – prioriterar rot/public och nedvärderar src/tests/examples */
 async function findAnyHtmlDeep(dir: string): Promise<string | undefined> {
   const ignore = [
-    "**/node_modules/**", "**/dist/**", "**/build/**", "**/out/**", "**/.next/**",
-    "**/.svelte-kit/**", "**/.output/**", "**/.git/**", "**/coverage/**",
-    "**/.venv/**", "**/venv/**", "**/__pycache__/**", "**/dist-webview/**",
+    "**/node_modules/**","**/dist/**","**/build/**","**/out/**","**/.next/**",
+    "**/.svelte-kit/**","**/.output/**","**/.git/**","**/coverage/**",
+    "**/.venv/**","**/venv/**","**/__pycache__/**","**/dist-webview/**",
   ];
 
   const rootIdx = path.join(dir, "index.html");
@@ -161,9 +136,9 @@ async function findAnyHtmlDeep(dir: string): Promise<string | undefined> {
     const base = path.basename(norm).toLowerCase();
     const isIndex = base === "index.html";
     const depth = norm.split("/").length;
-    let s = (isIndex ? 1000 : 0) - depth; // större = bättre
-    if (norm === "public/index.html") s += 25; // vanligt i CRA m.fl.
-    if (PENALIZE.test(norm)) s -= 50;        // t.ex. src/index.html som transpile-harness
+    let s = (isIndex ? 1000 : 0) - depth;
+    if (norm === "public/index.html") s += 25;
+    if (PENALIZE.test(norm)) s -= 50;
     return s;
   };
 
@@ -174,23 +149,10 @@ async function findAnyHtmlDeep(dir: string): Promise<string | undefined> {
 /** Hitta typiska SPA-entryfiler (snabb, deterministisk) */
 function findEntryFile(dir: string): string | undefined {
   const patterns = [
-    "src/main.tsx",
-    "src/main.ts",
-    "src/main.jsx",
-    "src/main.js",
-    "src/App.tsx",
-    "src/App.ts",
-    "src/App.jsx",
-    "src/App.js",
-    "pages/_app.tsx",
-    "pages/_app.jsx",
-    "app/layout.tsx",
-    "app/layout.jsx",
-    // vanliga fall utanför src
-    "main.tsx",
-    "main.ts",
-    "main.jsx",
-    "main.js",
+    "src/main.tsx","src/main.ts","src/main.jsx","src/main.js",
+    "src/App.tsx","src/App.ts","src/App.jsx","src/App.js",
+    "pages/_app.tsx","pages/_app.jsx","app/layout.tsx","app/layout.jsx",
+    "main.tsx","main.ts","main.jsx","main.js",
   ];
   for (const rel of patterns) {
     const p = path.join(dir, rel);
@@ -221,7 +183,7 @@ function detectConfigs(dir: string): string[] {
   return hits;
 }
 
-/** Extrahera körkandidater */
+/** Extrahera körkandidater (även utan scripts via dep/config) */
 function buildRunCandidates(
   pkg: any,
   dir: string,
@@ -231,52 +193,63 @@ function buildRunCandidates(
 ): { name?: string; cmd: string; source: string }[] {
   const out: { name?: string; cmd: string; source: string }[] = [];
   const s = pkg?.scripts || {};
+  const runPrefix =
+    mgr === "pnpm" ? "pnpm" : mgr === "yarn" ? "yarn" : mgr === "bun" ? "bun" : "npm run";
+
+  // Scripts som liknar dev-servers
   for (const [name, val] of Object.entries<string>(s)) {
-    const rx =
-      /\b(next|vite|nuxt|svelte-kit|remix|solid-start|astro|webpack(-dev-server)?|ng\s+serve|storybook|expo)\b/i;
-    if (rx.test(val)) {
-      const prefix =
-        mgr === "pnpm" ? "pnpm" : mgr === "yarn" ? "yarn" : mgr === "bun" ? "bun" : "npm run";
-      out.push({ name, cmd: `${prefix} ${name}`, source: "package.json" });
+    const rx = /\b(next|vite|nuxt|svelte-kit|remix|solid-start|astro|webpack(-dev-server)?|ng\s+serve|storybook|expo)\b/i;
+    if (rx.test(val) || /^(dev|start|serve|preview)$/i.test(name)) {
+      out.push({ name, cmd: `${runPrefix} ${name}`, source: "package.json" });
     }
   }
-  const push = (cmd: string, why: string) => out.push({ cmd, source: why });
-  if (configHints.some((x) => x.startsWith("vite.config"))) push("npx -y vite", "vite.config.*");
-  if (framework === "next" || configHints.some((x) => x.startsWith("next.config")))
-    push("npx -y next dev", framework === "next" ? "dep: next" : "next.config.*");
-  if (framework === "sveltekit" || configHints.some((x) => x.startsWith("svelte.config")))
-    push("npx -y vite", "sveltekit/svelte.config.*");
-  if (framework === "nuxt" || configHints.some((x) => x.startsWith("nuxt.config")))
-    push("npx -y nuxi dev", "nuxt.config.*");
-  if (framework === "remix" || configHints.some((x) => x.startsWith("remix.config")))
-    push("npx -y remix dev", "remix.config.*");
-  if (framework === "solid" || configHints.some((x) => x.startsWith("solid.config")))
-    push("npx -y solid-start dev", "solid.config.*");
-  if (framework === "astro" || configHints.some((x) => x.startsWith("astro.config")))
-    push("npx -y astro dev", "astro.config.*");
-  if (configHints.includes("angular.json")) push("npx -y ng serve", "angular.json");
-  if (configHints.some((x) => x.startsWith("webpack"))) push("npx -y webpack serve", "webpack config");
 
-  // Sista utväg: statisk server – endast om index.html i roten
+  const push = (cmd: string, why: string) => out.push({ cmd, source: why });
+
+  // Från configHints
+  if (configHints.some(x => x.startsWith("vite.config"))) push("npx -y vite", "vite.config.*");
+  if (framework === "next" || configHints.some(x => x.startsWith("next.config"))) push("npx -y next dev", framework === "next" ? "dep:next" : "next.config.*");
+  if (framework === "sveltekit" || configHints.some(x => x.startsWith("svelte.config"))) push("npx -y vite", "sveltekit/svelte.config.*");
+  if (framework === "nuxt" || configHints.some(x => x.startsWith("nuxt.config"))) push("npx -y nuxi dev", "nuxt.config.*");
+  if (framework === "remix" || configHints.some(x => x.startsWith("remix.config"))) push("npx -y remix dev", "remix.config.*");
+  if (framework === "solid" || configHints.some(x => x.startsWith("solid.config"))) push("npx -y solid-start dev", "solid.config.*");
+  if (framework === "astro" || configHints.some(x => x.startsWith("astro.config"))) push("npx -y astro dev", "astro.config.*");
+  if (configHints.includes("angular.json")) push("npx -y ng serve", "angular.json");
+  if (configHints.some(x => x.startsWith("webpack"))) push("npx -y webpack serve", "webpack config");
+
+  // Från dependencies även om config saknas
+  const dep = (names: string[]) => hasDep(pkg, names);
+  if (dep(["vite"])) push("npx -y vite", "dep:vite");
+  if (dep(["next"])) push("npx -y next dev", "dep:next");
+  if (dep(["@sveltejs/kit"])) push("npx -y vite", "dep:sveltekit");
+  if (dep(["nuxt"])) push("npx -y nuxi dev", "dep:nuxt");
+  if (dep(["remix","@remix-run/dev"])) push("npx -y remix dev", "dep:remix");
+  if (dep(["solid-start"])) push("npx -y solid-start dev", "dep:solid-start");
+  if (dep(["astro"])) push("npx -y astro dev", "dep:astro");
+  if (dep(["@angular/cli"])) push("npx -y ng serve", "dep:@angular/cli");
+  if (dep(["webpack-dev-server","webpack"])) push("npx -y webpack serve", "dep:webpack");
+  if (dep(["storybook","@storybook/react","@storybook/vue","@storybook/svelte"])) push("npx -y storybook dev -p 0", "dep:storybook");
+
+  // Sista utväg: statisk server om index.html i roten
   const html = fs.existsSync(path.join(dir, "index.html")) ? "index.html" : undefined;
   if (html) push("npx -y http-server -p 0", `static (${html})`);
 
   // Unika
-  return unique(out.map((j) => JSON.stringify(j))).map((s) => JSON.parse(s));
+  return unique(out.map(j => JSON.stringify(j))).map(s => JSON.parse(s));
 }
 
 /** Klassificera ramverk */
 function detectFramework(pkg: any, configHints: string[]): string {
   const has = (names: string[]) => hasDep(pkg, names);
-  if (has(["next"]) || configHints.some((c) => c.startsWith("next.config"))) return "next";
-  if (has(["@sveltejs/kit"]) || configHints.some((c) => c.startsWith("svelte.config"))) return "sveltekit";
+  if (has(["next"]) || configHints.some(c => c.startsWith("next.config"))) return "next";
+  if (has(["@sveltejs/kit"]) || configHints.some(c => c.startsWith("svelte.config"))) return "sveltekit";
   if (has(["vite"])) return "vite";
   if (has(["react"])) return "react";
-  if (has(["vue", "nuxt"]) || configHints.some((c) => c.startsWith("nuxt.config"))) return "vue";
+  if (has(["vue","nuxt"]) || configHints.some(c => c.startsWith("nuxt.config"))) return "vue";
   if (has(["@angular/core"]) || configHints.includes("angular.json")) return "angular";
-  if (has(["remix", "@remix-run/dev"]) || configHints.some((c) => c.startsWith("remix.config"))) return "remix";
-  if (has(["solid-start"]) || configHints.some((c) => c.startsWith("solid.config"))) return "solid";
-  if (has(["astro"]) || configHints.some((c) => c.startsWith("astro.config"))) return "astro";
+  if (has(["remix","@remix-run/dev"]) || configHints.some(c => c.startsWith("remix.config"))) return "remix";
+  if (has(["solid-start"]) || configHints.some(c => c.startsWith("solid.config"))) return "solid";
+  if (has(["astro"]) || configHints.some(c => c.startsWith("astro.config"))) return "astro";
   return "unknown";
 }
 
@@ -296,9 +269,7 @@ function parsePnpmWorkspaceYaml(file: string): string[] {
     const y = YAML.parse(txt);
     const arr = Array.isArray(y?.packages) ? y.packages : [];
     return arr.filter((s: any) => typeof s === "string");
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
 /** lerna.json → packages */
@@ -325,17 +296,11 @@ function readNxProjects(root: string): string[] {
 function readGitignore(root: string): string[] {
   const txt = readText(path.join(root, ".gitignore"));
   if (!txt) return [];
-  return txt
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith("#"));
+  return txt.split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith("#"));
 }
 
 /** AST-lös, snabb HTML-intent-inspektion */
-function inspectHtmlIntent(
-  dir: string,
-  relHtml: string
-): HtmlIntent {
+function inspectHtmlIntent(dir: string, relHtml: string): HtmlIntent {
   const hints: string[] = [];
   let score = 0;
   const htmlPath = path.join(dir, relHtml);
@@ -351,14 +316,13 @@ function inspectHtmlIntent(
   if (/\bid=["']app["']\b/i.test(html)) { score += 2; hints.push("html#app"); }
   if (/\b\/@vite\/client\b/.test(html)) { score += 4; hints.push("html@vite"); }
 
-  // <script type="module" src="...">
   const m = html.match(/<script[^>]*type=["']module["'][^>]*src=["']([^"']+)["'][^>]*>/i);
   if (m?.[1]) {
     const srcRaw = m[1];
     const src = srcRaw.replace(/^\.\//, "");
     hints.push(`html:script=${src}`);
-    if (/\.(jsx?|tsx?)$/i.test(src)) { score += 2; }
-    if (/\.ts$/i.test(src)) { score -= 2; hints.push("ts-in-html"); } // ofta transpile-harness
+    if (/\.(jsx?|tsx?)$/i.test(src)) score += 2;
+    if (/\.ts$/i.test(src)) { score -= 2; hints.push("ts-in-html"); }
     const p = path.join(dir, src);
     if (fs.existsSync(p)) { hints.push("entry:from-html"); score += 1; }
     return { score, hints };
@@ -372,7 +336,6 @@ function inspectEntryDom(dir: string, relEntry?: string): DomIntent {
   const p = path.join(dir, relEntry);
   const code = readText(p) ?? "";
   let score = 0; const hints: string[] = [];
-
   const tests: Array<[RegExp, string, number]> = [
     [/document\.getElementById\s*\(\s*["']app["']\s*\)/i, "dom:#app", 2],
     [/ReactDOM\.(createRoot|render)\s*\(/, "dom:react", 3],
@@ -381,9 +344,7 @@ function inspectEntryDom(dir: string, relEntry?: string): DomIntent {
     [/\bnew\s+App\s*\(\s*{[^}]*target\s*:/i, "dom:svelte", 3],
     [/\bangular\.bootstrap\b/i, "dom:angular", 2],
   ];
-  for (const [rx, tag, pts] of tests) {
-    if (rx.test(code)) { score += pts; hints.push(tag); }
-  }
+  for (const [rx, tag, pts] of tests) if (rx.test(code)) { score += pts; hints.push(tag); }
   return { score, hints };
 }
 
@@ -419,7 +380,8 @@ function scoreCandidate(
   const has = (...names: string[]) => names.some(n => Object.prototype.hasOwnProperty.call(deps, n));
   const base = path.basename(dir).toLowerCase();
 
-  if (pkg?.engines?.vscode) return { score: -9999, reasons: ["vscode-extension"] };
+  // Tung minus om “felmärkt” frontend med engines.vscode men inte VS Code-shape
+  if (pkg?.engines?.vscode && !isVSCExtensionLike(pkg)) { s -= 100; reasons.push("vscode-engines-without-extension-shape"); }
 
   const devKey = ["dev","start","serve","preview"].find(k => scripts[k]);
   if (devKey) { s += 8; reasons.push(`script:${devKey}`); }
@@ -446,8 +408,15 @@ function scoreCandidate(
 
   if (/(^|[-_/])(frontend|web|client|app)([-_/]|$)/i.test(base)) { s += 2; reasons.push("name:intent"); }
 
+  // Backend-tyngd utan frontend
   if ((has("express","fastify","koa","nestjs")) && !(has("react","vue","nuxt","next","@angular/core","@sveltejs/kit","vite","astro","remix","solid-start"))) {
     s -= 4; reasons.push("backend-heavy");
+  }
+
+  // Särskild nedviktning för typiska VS Code webview-mappar
+  const normDir = dir.replace(/\\/g, "/").toLowerCase();
+  if (/\/extension\/src\/webview(\/|$)/.test(normDir) || /\/src\/webview(\/|$)/.test(normDir)) {
+    s -= 20; reasons.push("penalty:webview-folder");
   }
 
   const depth = path.resolve(dir).split(path.sep).length;
@@ -457,12 +426,24 @@ function scoreCandidate(
   return { score: s, reasons };
 }
 
+/** Runnability-gate: kan vi realistiskt starta eller serva detta? */
+function isRunnable(dir: string, pkg: any, configHints: string[], entryHtml?: string): boolean {
+  const hasScript = !!chooseScript(pkg);
+  const hasHtml = !!entryHtml || fs.existsSync(path.join(dir,"index.html")) || fs.existsSync(path.join(dir,"public","index.html"));
+  const hasKnownConfig = configHints.length > 0;
+  const hasKnownDep = hasDep(pkg, ["vite","next","nuxt","@sveltejs/kit","astro","remix","solid-start","@angular/cli","webpack","webpack-dev-server","storybook"]);
+  return hasScript || hasHtml || hasKnownConfig || hasKnownDep;
+}
+
 /** Bygg en kandidat för en rotkatalog (ASYNC p.g.a. djup HTML-sök) */
 async function makeCandidateForDir(dir: string, excludeAbsDirs: string[]): Promise<Candidate | null> {
   if (isUnder(dir, excludeAbsDirs)) return null;
+
   const pkgPath = path.join(dir, "package.json");
   const pkg = fs.existsSync(pkgPath) ? readJson(pkgPath) : null;
-  if (pkg?.engines?.vscode) return null;
+
+  // Hård-exkludera bara riktiga VS Code extensions
+  if (pkg && isVSCExtensionLike(pkg)) return null;
 
   const manager = detectManager(dir);
   const configHints = detectConfigs(dir);
@@ -478,36 +459,34 @@ async function makeCandidateForDir(dir: string, excludeAbsDirs: string[]): Promi
   const entryHtml = await findAnyHtmlDeep(dir);
   const entryFileDetected = findEntryFile(dir);
 
-  // Intent från HTML + dom-signal
+  // Gate: om inga rimliga startmöjligheter → ge upp tidigt
+  if (!isRunnable(dir, pkg, configHints, entryHtml)) return null;
+
+  // Intent från HTML + DOM
   const htmlIntent = entryHtml ? inspectHtmlIntent(dir, entryHtml) : { score: 0, hints: [] as string[] };
-  let finalEntryFile = entryFileDetected;
-  const domIntent = inspectEntryDom(dir, finalEntryFile);
+  const domIntent = inspectEntryDom(dir, entryFileDetected);
 
   // Baspoäng
-  const base = scoreCandidate(dir, pkg, configHints, entryHtml, finalEntryFile);
+  const base = scoreCandidate(dir, pkg, configHints, entryHtml, entryFileDetected);
   if (base.score <= -9999) return null;
 
   // Extra heuristikpoäng (HTML/DOM)
-  const heuristicExtra = htmlIntent.score + domIntent.score;
-  let heuristicFinal = base.score + heuristicExtra;
+  let heuristicFinal = base.score + htmlIntent.score + domIntent.score;
 
-  // ⬇️ ML: bygg feature-vektor och prediktera p(frontend)
+  // ML: bygg features och kombinera
   const fv = buildFeatureVector({
     dir,
     pkg,
     configHints,
     entryHtml,
-    entryFile: finalEntryFile,
+    entryFile: entryFileDetected,
     heuristicBaseScore: base.score,
     htmlIntent,
     domIntent,
   });
 
-  const mlProb = predictFrontendProb(fv); // null om ingen modell laddad
-  if (mlProb != null) {
-    // Kombinera heuristikscore + ML-prob. Default weight=10 ⇒ ±5 poäng kring 0.5
-    heuristicFinal = combineHeuristicAndML(heuristicFinal, mlProb, { weight: 10 });
-  }
+  const mlProb = predictFrontendProb(fv); // null om ingen modell
+  if (mlProb != null) heuristicFinal = combineHeuristicAndML(heuristicFinal, mlProb, { weight: 10 });
 
   const reasons = [...base.reasons, ...htmlIntent.hints, ...domIntent.hints];
   if (mlProb != null) reasons.push(`ml:p=${mlProb.toFixed(3)}`);
@@ -521,7 +500,7 @@ async function makeCandidateForDir(dir: string, excludeAbsDirs: string[]): Promi
     reason: reasons,
     pkgName: pkg?.name,
     entryHtml,
-    entryFile: finalEntryFile,
+    entryFile: entryFileDetected,
     runCandidates: buildRunCandidates(pkg, dir, manager, framework, configHints),
     configHints,
   };
@@ -539,9 +518,10 @@ function cmp(a: Candidate, b: Candidate) {
   const intent = (s: string) => /(^|[-_/])(frontend|web|client|app)([-_/]|$)/i.test(path.basename(s)) ? 1 : 0;
   const ai = intent(a.dir), bi = intent(b.dir);
   if (bi !== ai) return bi - ai;
+  // Grundare vinner
   const depth = (s: string) => path.resolve(s).split(path.sep).length;
   const ad = depth(a.dir), bd = depth(b.dir);
-  if (ad !== bd) return ad - bd; // grundare vinner
+  if (ad !== bd) return ad - bd;
   try { return fs.statSync(b.dir).mtimeMs - fs.statSync(a.dir).mtimeMs; } catch { return 0; }
 }
 
@@ -554,32 +534,20 @@ async function enumerateWorkspacePackageDirs(root: string): Promise<string[]> {
   const nx = readNxProjects(root);
 
   const patterns = [...ws, ...pnpm, ...lerna]
-    .map((p) => p.replace(/\\/g, "/"))
-    .map((p) => (p.endsWith("/") ? p : p + "/"))
-    .map((p) => p + "package.json");
+    .map(p => p.replace(/\\/g, "/"))
+    .map(p => (p.endsWith("/") ? p : p + "/"))
+    .map(p => p + "package.json");
 
   const ignore = [
-    "**/node_modules/**",
-    "**/dist/**",
-    "**/dist-webview/**",
-    "**/build/**",
-    "**/out/**",
-    "**/.next/**",
-    "**/.svelte-kit/**",
-    "**/.output/**",
-    "**/.git/**",
-    "**/coverage/**",
-    "**/.venv/**",
-    "**/venv/**",
-    "**/__pycache__/**",
+    "**/node_modules/**","**/dist/**","**/dist-webview/**","**/build/**","**/out/**",
+    "**/.next/**","**/.svelte-kit/**","**/.output/**","**/.git/**","**/coverage/**",
+    "**/.venv/**","**/venv/**","**/__pycache__/**",
   ];
   ignore.push(...readGitignore(root));
 
   const files = patterns.length ? await fg(patterns, { cwd: root, absolute: true, dot: false, ignore }) : [];
-
-  const fromPatterns = files.map((f) => path.dirname(f));
-  const fromNx = nx.map((d) => path.resolve(root, d));
-
+  const fromPatterns = files.map(f => path.dirname(f));
+  const fromNx = nx.map(d => path.resolve(root, d));
   return Array.from(new Set([...fromPatterns, ...fromNx]));
 }
 
@@ -588,7 +556,6 @@ async function detectInLooseDir(root: string, excludeAbsDirs: string[]): Promise
   const out: Candidate[] = [];
   const seen = new Set<string>();
 
-  // 0) Läs overrides
   const overrides = readOverrides(root);
 
   // 1) Monorepo-uppräkning
@@ -600,19 +567,14 @@ async function detectInLooseDir(root: string, excludeAbsDirs: string[]): Promise
       if (cand) { out.push(cand); seen.add(dir); }
     });
     await Promise.all(promises);
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
 
   // 2) Fallback: snabb DFS – ta dir för varje fil
   for (const file of walk(root, 5)) {
     const dir = path.dirname(file);
     if (seen.has(dir)) continue;
     const cand = await makeCandidateForDir(dir, excludeAbsDirs);
-    if (cand) {
-      out.push(cand);
-      seen.add(dir);
-    }
+    if (cand) { out.push(cand); seen.add(dir); }
   }
 
   if (!seen.has(root)) {
@@ -620,7 +582,7 @@ async function detectInLooseDir(root: string, excludeAbsDirs: string[]): Promise
     if (rootCand) out.push(rootCand);
   }
 
-  // Overrides: exclude/boost
+  // Overrides
   let list = out;
   if (overrides.forceExclude?.length) {
     list = list.filter(c => !overrides.forceExclude!.some(tag => overrideMatches(root, c.dir, tag)));
@@ -628,10 +590,7 @@ async function detectInLooseDir(root: string, excludeAbsDirs: string[]): Promise
   if (overrides.forceInclude?.length) {
     list = list.map(c => {
       const hit = overrides.forceInclude!.some(tag => overrideMatches(root, c.dir, tag));
-      if (hit) {
-        return { ...c, confidence: c.confidence + 100, reason: [...c.reason, "override:forceInclude"] };
-      }
-      return c;
+      return hit ? { ...c, confidence: c.confidence + 100, reason: [...c.reason, "override:forceInclude"] } : c;
     });
   }
 
@@ -647,7 +606,6 @@ async function detectInWorkspaceFolder(
   const candidates: Candidate[] = [];
   const seen = new Set<string>();
 
-  // 0) Overrides
   const root = f.uri.fsPath;
   const overrides = readOverrides(root);
 
@@ -660,9 +618,7 @@ async function detectInWorkspaceFolder(
       if (cand) { candidates.push(cand); seen.add(dir); }
     });
     await Promise.all(promises);
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
 
   // B) package.json via VS Code globbing
   const pkgUris = await vscode.workspace.findFiles(
@@ -674,10 +630,7 @@ async function detectInWorkspaceFolder(
     const dir = path.dirname(uri.fsPath);
     if (seen.has(dir)) continue;
     const cand = await makeCandidateForDir(dir, excludeAbsDirs);
-    if (cand) {
-      candidates.push(cand);
-      seen.add(dir);
-    }
+    if (cand) { candidates.push(cand); seen.add(dir); }
   }
 
   // C) HTML-fallback för rena statiska projekt
@@ -690,26 +643,20 @@ async function detectInWorkspaceFolder(
     const dir = path.dirname(uri.fsPath);
     if (seen.has(dir)) continue;
     const cand = await makeCandidateForDir(dir, excludeAbsDirs);
-    if (cand) {
-      candidates.push(cand);
-      seen.add(dir);
-    }
+    if (cand) { candidates.push(cand); seen.add(dir); }
   }
 
   // De-dupe per dir
   let list = Array.from(new Map<string, Candidate>(candidates.map(c => [c.dir, c])).values());
 
-  // Overrides: exclude/boost
+  // Overrides
   if (overrides.forceExclude?.length) {
     list = list.filter(c => !overrides.forceExclude!.some(tag => overrideMatches(root, c.dir, tag)));
   }
   if (overrides.forceInclude?.length) {
     list = list.map(c => {
       const hit = overrides.forceInclude!.some(tag => overrideMatches(root, c.dir, tag));
-      if (hit) {
-        return { ...c, confidence: c.confidence + 100, reason: [...c.reason, "override:forceInclude"] };
-      }
-      return c;
+      return hit ? { ...c, confidence: c.confidence + 100, reason: [...c.reason, "override:forceInclude"] } : c;
     });
   }
 
@@ -753,14 +700,13 @@ async function scanAllProjectsUnfiltered(): Promise<Candidate[]> {
 export async function detectProjects(excludeAbsDirs: string[] = []): Promise<Candidate[]> {
   const now = Date.now();
   if (_cache && now - _cache.at < CACHE_TTL_MS) {
-    // Filtrera cache enligt excludeAbsDirs
-    const filtered = _cache.list.filter((c) => !isUnder(c.dir, excludeAbsDirs));
+    const filtered = _cache.list.filter(c => !isUnder(c.dir, excludeAbsDirs));
     return filtered.slice().sort(cmp);
   }
 
   const list = await scanAllProjectsUnfiltered();
   _cache = { at: Date.now(), list };
 
-  const filtered = list.filter((c) => !isUnder(c.dir, excludeAbsDirs));
+  const filtered = list.filter(c => !isUnder(c.dir, excludeAbsDirs));
   return filtered.slice().sort(cmp);
 }

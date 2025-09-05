@@ -604,11 +604,12 @@ async function startOrRespectfulFallback(
   }
 
   const html = await findExistingHtml(c);
-  if (html) {
-    const { externalUrl } = await runInlineStaticServer(html.root);
-    const base = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
-    return { externalUrl, mode: "inline", watchRoot: html.root };
-  }
+if (html) {
+  const { externalUrl } = await runInlineStaticServer(html.root);
+  const base = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
+  const url  = base + encodeURI(html.relHtml);       // ⬅️ peka på faktisk HTML
+  return { externalUrl: url, mode: "inline", watchRoot: html.root };
+}
 
   const storageDir = await ensureStoragePreview(context);
   const { externalUrl } = await runInlineStaticServer(storageDir);
