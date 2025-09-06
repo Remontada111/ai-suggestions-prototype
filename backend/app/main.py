@@ -64,7 +64,9 @@ app.add_middleware(
 app.include_router(analyze_router)
 
 # Registrera Figma-proxy-endpointen här så URL blir /api/figma-image
-app.add_api_route("/api/figma-image", figma_image_handler, methods=["GET"])
+app.add_api_route("/api/figma-image", figma_image_handler, methods=["GET","HEAD"])
+
+
 
 # ── Logga alla rutter vid uppstart (hjälper felsöka 404) ──────────────────
 @app.on_event("startup")

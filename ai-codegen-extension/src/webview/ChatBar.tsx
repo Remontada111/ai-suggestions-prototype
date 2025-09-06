@@ -43,6 +43,7 @@ type ChatBarProps = {
   maxChars?: number;      // hårt max (klipper input), default 8000
   maxRows?: number;       // max visuella rader innan scroll, default 10
   autoFocus?: boolean;
+  onHeightChange?: (px: number) => void;  // ⬅️ ny
 };
 
 const vscode = typeof acquireVsCodeApi === "function" ? acquireVsCodeApi() : { postMessage() {}, getState() { return {}; }, setState() {} };
@@ -59,7 +60,9 @@ export default function ChatBar({
   maxChars = DEFAULT_MAX_CHARS,
   maxRows = DEFAULT_MAX_ROWS,
   autoFocus = false,
+  onHeightChange,
 }: ChatBarProps) {
+
   const [value, setValue] = useState<string>("");
   const [isComposing, setIsComposing] = useState(false);
   const [lastSent, setLastSent] = useState<string>("");
@@ -268,8 +271,20 @@ export default function ChatBar({
     };
   }, [nearLimit]);
 
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+
+useLayoutEffect(() => {
+  if (!wrapRef.current || !onHeightChange) return;
+  const el = wrapRef.current;
+  const ro = new ResizeObserver(() => onHeightChange(el.offsetHeight));
+  ro.observe(el);
+  onHeightChange(el.offsetHeight); // initial mätning
+  return () => ro.disconnect();
+}, [onHeightChange]);
+
+
   return (
-    <div style={styles.wrap} aria-live="polite" aria-atomic>
+    <div ref={wrapRef} style={styles.wrap} aria-live="polite" aria-atomic>
       <div style={styles.inner}>
         <form ref={formRef} onSubmit={onSubmit} role="form" aria-label="Chat input">
           <div style={styles.shell}>

@@ -51,6 +51,25 @@ const LOG_NS = "ai-figma-codegen/ext";
 const log = (...args) => console.log(`[${LOG_NS}]`, ...args);
 const warn = (...args) => console.warn(`[${LOG_NS}]`, ...args);
 const errlog = (...args) => console.error(`[${LOG_NS}]`, ...args);
+// ── Logg-hjälpare
+const safeUrl = (u) => {
+    if (!u)
+        return u;
+    try {
+        const x = new URL(u);
+        if (x.searchParams.has("token"))
+            x.searchParams.set("token", "***");
+        if (x.searchParams.has("figmaToken"))
+            x.searchParams.set("figmaToken", "***");
+        if (x.searchParams.has("auth"))
+            x.searchParams.set("auth", "***");
+        return x.toString();
+    }
+    catch (_a) {
+        return u;
+    }
+};
+const redactPath = (p) => (p ? p.replace(process.cwd() || "", ".") : p);
 let lastInitPayload = null;
 let lastDevUrl = null;
 let pendingCandidate = null;
@@ -76,6 +95,7 @@ function stopReloadWatcher() {
         clearTimeout(reloadTimer);
         reloadTimer = undefined;
     }
+    log("Auto-reload watcher stoppad");
     reloadBaseUrl = null;
 }
 function startReloadWatcher(rootDir, baseUrl) {
@@ -83,6 +103,7 @@ function startReloadWatcher(rootDir, baseUrl) {
     reloadBaseUrl = baseUrl;
     const pattern = new vscode.RelativePattern(rootDir, "**/*.{html,htm,css,js,jsx,tsx,vue,svelte}");
     reloadWatcher = vscode.workspace.createFileSystemWatcher(pattern);
+    log("Auto-reload watcher startad", { rootDir: redactPath(rootDir), baseUrl: safeUrl(baseUrl) });
     const onEvt = (uri) => {
         const p = uri.fsPath.replace(/\\/g, "/");
         if (/\/(node_modules|\.git|dist|build|out)\//.test(p))
@@ -95,6 +116,7 @@ function startReloadWatcher(rootDir, baseUrl) {
             const bust = `${reloadBaseUrl}${reloadBaseUrl.includes("?") ? "&" : "?"}` +
                 `__ext_bust=${Date.now().toString(36)}`;
             lastDevUrl = bust;
+            log("Auto-reload posting devurl (file change)", { path: p, url: safeUrl(bust) });
             currentPanel.webview.postMessage({ type: "devurl", url: bust });
             // ── Ny: verifiera att URL:en faktiskt svarar, annars öppna väljare
             void verifyDevUrlAndMaybeRechoose(bust, "reload");
@@ -103,7 +125,6 @@ function startReloadWatcher(rootDir, baseUrl) {
     reloadWatcher.onDidChange(onEvt);
     reloadWatcher.onDidCreate(onEvt);
     reloadWatcher.onDidDelete(onEvt);
-    log("Auto-reload watcher startad:", { rootDir, baseUrl });
 }
 /* ─────────────────────────────────────────────────────────
    Hjälpare – nätverksprober och URL-normalisering
@@ -190,19 +211,33 @@ function addBust(u) {
 }
 // ── Ny: snabbcheck (HEAD→GET)
 async function quickCheck(url) {
-    if (await probe(url, "HEAD"))
+    const h = await probe(url, "HEAD");
+    if (h) {
+        log("quickCheck OK (HEAD)", { url: safeUrl(url) });
         return true;
-    if (await probe(url, "GET"))
+    }
+    const g = await probe(url, "GET");
+    if (g) {
+        log("quickCheck OK (GET)", { url: safeUrl(url) });
         return true;
+    }
+    warn("quickCheck FAIL", { url: safeUrl(url) });
     return false;
 }
 // ── Ny: endast rotverifiering. Ingen auto-append av /index.html.
 async function rootReachable(urlRaw) {
     const root = withSlash(urlRaw);
-    if (await probe(root, "HEAD"))
+    const h = await probe(root, "HEAD");
+    if (h) {
+        log("rootReachable OK (HEAD)", { url: safeUrl(root) });
         return true;
-    if (await probe(root, "GET"))
+    }
+    const g = await probe(root, "GET");
+    if (g) {
+        log("rootReachable OK (GET)", { url: safeUrl(root) });
         return true;
+    }
+    warn("rootReachable FAIL", { url: safeUrl(root) });
     return false;
 }
 // ── Ny: 404 → öppna projektväljaren
@@ -281,12 +316,13 @@ async function rememberCandidate(c, context) {
     const payload = { dir: c.dir, savedAt: Date.now() };
     await context.globalState.update(STORAGE_KEYS.remembered, payload);
     updateStatusBar(c);
-    log("Sparade valt projekt:", c.dir);
+    log("Sparade valt projekt", { dir: redactPath(c.dir) });
 }
 async function forgetRemembered(context) {
     await context.globalState.update(STORAGE_KEYS.remembered, undefined);
     updateStatusBar(null);
     vscode.window.showInformationMessage("Glömde sparat projekt.");
+    log("Glömde sparat projekt");
 }
 async function tryGetRememberedCandidate(context) {
     const rec = context.globalState.get(STORAGE_KEYS.remembered);
@@ -306,7 +342,9 @@ async function tryGetRememberedCandidate(context) {
         if (cands === null || cands === void 0 ? void 0 : cands.length)
             return cands[0];
     }
-    catch (_b) { }
+    catch (e) {
+        warn("tryGetRememberedCandidate detectProjects fel", e);
+    }
     return null;
 }
 /** Visa panelen i editor-kolumnen. */
@@ -358,7 +396,7 @@ async function tryAutoFullView(panel, context) {
         try {
             const zenCfg = vscode.workspace.getConfiguration("zenMode");
             await zenCfg.update("fullScreen", false, vscode.ConfigurationTarget.Workspace);
-            await zenCfg.update("centerLayout", true, vscode.ConfigurationTarget.Workspace);
+            await zenCfg.update("centerLayout", false, vscode.ConfigurationTarget.Workspace);
             await zenCfg.update("hideActivityBar", true, vscode.ConfigurationTarget.Workspace);
             await zenCfg.update("hideStatusBar", true, vscode.ConfigurationTarget.Workspace);
             await zenCfg.update("restore", true, vscode.ConfigurationTarget.Workspace);
@@ -399,6 +437,7 @@ async function tryAutoFullView(panel, context) {
    ───────────────────────────────────────────────────────── */
 function buildProxyUrl(fileKey, nodeId, scale = "2", token) {
     const base = vscode.workspace.getConfiguration(SETTINGS_NS).get("backendBaseUrl");
+    log("buildProxyUrl()", { base, fileKey, nodeId, scale, hasToken: !!token });
     if (!base)
         return null;
     let u;
@@ -406,6 +445,7 @@ function buildProxyUrl(fileKey, nodeId, scale = "2", token) {
         u = new URL("/api/figma-image", base);
     }
     catch (_a) {
+        errlog("Ogiltig backendBaseUrl", { base });
         return null;
     }
     u.searchParams.set("fileKey", fileKey);
@@ -413,38 +453,45 @@ function buildProxyUrl(fileKey, nodeId, scale = "2", token) {
     u.searchParams.set("scale", scale);
     if (token)
         u.searchParams.set("token", token);
-    return u.toString();
+    const built = u.toString();
+    log("buildProxyUrl →", { url: safeUrl(built) });
+    return built;
 }
 async function sendFreshFigmaImageUrlToWebview(source) {
-    if (!currentPanel || !lastInitPayload)
+    if (!currentPanel || !lastInitPayload) {
+        warn("sendFreshFigmaImageUrlToWebview utan panel/payload");
         return;
+    }
     const { fileKey, nodeId, figmaToken } = lastInitPayload;
-    const url = buildProxyUrl(fileKey, nodeId, "2", figmaToken);
-    if (!url) {
+    log("figma-image request", { source, fileKey, nodeId, hasToken: !!figmaToken });
+    const raw = buildProxyUrl(fileKey, nodeId, "2", figmaToken);
+    if (!raw) {
+        errlog("Saknar giltig backendBaseUrl");
         currentPanel.webview.postMessage({
             type: "ui-error",
             message: "Saknar giltig backendBaseUrl i inställningarna.",
         });
         return;
     }
+    const url = addBust(raw); // ⬅️ säkerställer ny fetch trots immutable caching
+    log("Postar figma-image-url till webview", { url: safeUrl(url) });
     currentPanel.webview.postMessage({ type: "figma-image-url", url });
     lastUiPhase = "default";
     currentPanel.webview.postMessage({ type: "ui-phase", phase: "default" });
-    log(`Proxy image-url (${source}) skickad.`);
 }
 /* ─────────────────────────────────────────────────────────
    Panel och meddelanden
    ───────────────────────────────────────────────────────── */
 function ensurePanel(context) {
     if (!currentPanel) {
-        log("Skapar ny Webview-panel …");
+        log("Skapar ny Webview-panel");
         currentPanel = vscode.window.createWebviewPanel("aiFigmaCodegen.panel", "🎯 Project Preview", vscode.ViewColumn.One, {
             enableScripts: true,
             retainContextWhenHidden: true,
             localResourceRoots: [vscode.Uri.file(path.join(context.extensionPath, "dist-webview"))],
         });
         currentPanel.onDidDispose(async () => {
-            log("Panel stängdes – städar upp servrar och state.");
+            log("Panel stängdes – städar upp servrar och state");
             currentPanel = undefined;
             lastDevUrl = null;
             lastInitPayload = null;
@@ -477,14 +524,18 @@ function ensurePanel(context) {
         });
         currentPanel.webview.onDidReceiveMessage(async (msg) => {
             var _a, _b;
-            log("Meddelande från webview:", (_b = (_a = msg === null || msg === void 0 ? void 0 : msg.type) !== null && _a !== void 0 ? _a : msg === null || msg === void 0 ? void 0 : msg.cmd) !== null && _b !== void 0 ? _b : msg);
+            log("[wv→ext] message", (_b = (_a = msg === null || msg === void 0 ? void 0 : msg.type) !== null && _a !== void 0 ? _a : msg === null || msg === void 0 ? void 0 : msg.cmd) !== null && _b !== void 0 ? _b : msg);
             if ((msg === null || msg === void 0 ? void 0 : msg.type) === "ready") {
+                log("[wv→ext] ready");
                 if (lastInitPayload) {
+                    log("Skickar tidigare initPayload till webview", { fileKey: lastInitPayload.fileKey, nodeId: lastInitPayload.nodeId, hasToken: !!lastInitPayload.figmaToken });
                     currentPanel.webview.postMessage(lastInitPayload);
                     await sendFreshFigmaImageUrlToWebview("init");
                 }
-                if (lastDevUrl)
+                if (lastDevUrl) {
+                    log("Skickar tidigare devurl till webview", { url: safeUrl(lastDevUrl) });
                     currentPanel.webview.postMessage({ type: "devurl", url: lastDevUrl });
+                }
                 if (lastUiPhase === "onboarding") {
                     currentPanel.webview.postMessage({ type: "ui-phase", phase: "onboarding" });
                 }
@@ -500,8 +551,8 @@ function ensurePanel(context) {
                     if (persist) {
                         const key = "lastPlacement.v1";
                         await vscode.workspace.getConfiguration().update(`${SETTINGS_NS}.${key}`, msg.payload, vscode.ConfigurationTarget.Workspace);
+                        log("Placement persisterad", { key });
                     }
-                    log("Placement accepted:", msg.payload);
                     vscode.window.showInformationMessage("Placement mottagen. Redo för ML-analys.");
                 }
                 catch (e) {
@@ -510,6 +561,7 @@ function ensurePanel(context) {
                 return;
             }
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "acceptCandidate") {
+                log("WV bad om acceptCandidate");
                 if (!pendingCandidate) {
                     try {
                         const cands = await (0, detector_1.detectProjects)([]);
@@ -521,7 +573,7 @@ function ensurePanel(context) {
                     }
                 }
                 if (!pendingCandidate) {
-                    warn("acceptCandidate utan kandidat – ignorerar.");
+                    warn("acceptCandidate utan kandidat – ignorerar");
                     return;
                 }
                 await rememberCandidate(pendingCandidate, context);
@@ -529,22 +581,27 @@ function ensurePanel(context) {
                 return;
             }
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "forgetProject") {
+                log("WV bad om forgetProject");
                 await forgetRemembered(context);
                 return;
             }
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "chooseProject") {
+                log("WV bad om chooseProject");
                 await showProjectQuickPick(context);
                 return;
             }
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "pickFolder") {
+                log("WV bad om pickFolder");
                 await pickFolderAndStart(context);
                 return;
             }
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "openPR" && typeof msg.url === "string") {
+                log("Öppnar PR-url via system", { url: msg.url });
                 vscode.env.openExternal(vscode.Uri.parse(msg.url));
                 return;
             }
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "enterFullView") {
+                log("WV bad om enterFullView");
                 await enterFullView(currentPanel);
                 try {
                     await new Promise(r => setTimeout(r, 60));
@@ -554,6 +611,7 @@ function ensurePanel(context) {
                 return;
             }
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "refreshFigmaImage") {
+                log("WV bad om refreshFigmaImage");
                 await sendFreshFigmaImageUrlToWebview("refresh");
                 return;
             }
@@ -563,7 +621,7 @@ function ensurePanel(context) {
             }
         });
         currentPanel.webview.html = getWebviewHtml(context, currentPanel.webview);
-        log("Webview HTML laddad.");
+        log("Webview HTML laddad");
     }
     else {
         currentPanel.reveal(vscode.ViewColumn.One);
@@ -578,7 +636,7 @@ function selectLaunchCommand(c) {
     var _a, _b, _d;
     const raw = (_a = c.devCmd) !== null && _a !== void 0 ? _a : (_d = (_b = c.runCandidates) === null || _b === void 0 ? void 0 : _b[0]) === null || _d === void 0 ? void 0 : _d.cmd;
     if (!raw) {
-        warn("Inget devCmd funnet för kandidat:", c.dir);
+        warn("Inget devCmd funnet för kandidat", { dir: redactPath(c.dir) });
         return undefined;
     }
     if (/\bhttp-server\b/i.test(raw)) {
@@ -587,14 +645,19 @@ function selectLaunchCommand(c) {
             .replace(/\s-p\s+\d+/i, " -p 0");
         if (!/(\s--port|\s-p)\s+\d+/i.test(patched))
             patched += " -p 0";
+        log("Valt devCmd (http-server)", { cmd: patched });
         return patched;
     }
     const norm = normalizeDevCmdPorts(raw);
+    log("Valt devCmd", { raw, normalized: norm });
     return norm;
 }
 async function findExistingHtml(c) {
-    if (c.entryHtml)
-        return { relHtml: normalizeRel(c.entryHtml), root: c.dir };
+    if (c.entryHtml) {
+        const found = { relHtml: normalizeRel(c.entryHtml), root: c.dir };
+        log("Hittade entryHtml i kandidat", found);
+        return found;
+    }
     const candidates = [
         "index.html",
         "public/index.html",
@@ -604,9 +667,12 @@ async function findExistingHtml(c) {
     for (const rel of candidates) {
         const p = path.join(c.dir, rel);
         if (fs.existsSync(p) && fs.statSync(p).isFile()) {
-            return { relHtml: normalizeRel(rel), root: c.dir };
+            const found = { relHtml: normalizeRel(rel), root: c.dir };
+            log("Hittade statisk HTML", found);
+            return found;
         }
     }
+    log("Ingen statisk HTML hittad", { dir: redactPath(c.dir) });
     return null;
 }
 function normalizeRel(rel) {
@@ -616,12 +682,15 @@ async function startOrRespectfulFallback(c, context) {
     const cmd = selectLaunchCommand(c);
     if (cmd) {
         try {
+            log("Startar dev-server", { cmd, cwd: redactPath(c.dir) });
             const { externalUrl } = await (0, runner_1.runDevServer)(cmd, c.dir);
+            log("Dev-server startad", { externalUrl: safeUrl(externalUrl) });
             if (/\bhttp-server\b/i.test(cmd)) {
                 const html = await findExistingHtml(c);
                 if (html) {
                     const base = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
                     const url = base + encodeURI(html.relHtml);
+                    log("http-server URL uppräknad mot HTML", { url: safeUrl(url) });
                     return { externalUrl: url, mode: "http", watchRoot: html.root };
                 }
                 return { externalUrl, mode: "http", watchRoot: c.dir };
@@ -632,15 +701,20 @@ async function startOrRespectfulFallback(c, context) {
                 if (!ok) {
                     const base = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
                     if (await quickCheck(base + "index.html")) {
-                        return { externalUrl: base + "index.html", mode: "dev" };
+                        const url = base + "index.html";
+                        log("Föll tillbaka till index.html", { url: safeUrl(url) });
+                        return { externalUrl: url, mode: "dev" };
                     }
                     if (c.entryHtml) {
                         const url = base + encodeURI(normalizeRel(c.entryHtml));
+                        log("Föll tillbaka till entryHtml", { url: safeUrl(url) });
                         return { externalUrl: url, mode: "dev" };
                     }
                 }
             }
-            catch (_a) { }
+            catch (e) {
+                warn("quickCheck-fel ignoreras", e);
+            }
             return { externalUrl, mode: "dev" };
         }
         catch (e) {
@@ -649,12 +723,15 @@ async function startOrRespectfulFallback(c, context) {
     }
     const html = await findExistingHtml(c);
     if (html) {
+        log("Startar inline static server för HTML-root", { root: redactPath(html.root) });
         const { externalUrl } = await (0, runner_1.runInlineStaticServer)(html.root);
         const base = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
-        const url = base + encodeURI(html.relHtml); // ⬅️ peka på faktisk HTML
+        const url = base + encodeURI(html.relHtml);
+        log("Inline static server URL", { url: safeUrl(url) });
         return { externalUrl: url, mode: "inline", watchRoot: html.root };
     }
     const storageDir = await ensureStoragePreview(context);
+    log("Startar inline static server (storage preview)", { dir: redactPath(storageDir) });
     const { externalUrl } = await (0, runner_1.runInlineStaticServer)(storageDir);
     return { externalUrl, mode: "inline", watchRoot: storageDir };
 }
@@ -684,6 +761,7 @@ async function ensureStoragePreview(context) {
   <body><div class="mini"></div></body>
 </html>`;
     await fsp.writeFile(indexPath, html, "utf8");
+    log("Skapade storage preview-index", { path: redactPath(indexPath) });
     return previewDir;
 }
 /**
@@ -693,10 +771,12 @@ async function startCandidatePreviewWithFallback(c, context, opts) {
     const panel = ensurePanel(context);
     try {
         await (0, runner_1.stopDevServer)();
+        log("Stoppade ev. tidigare dev-server");
     }
     catch (_a) { }
     try {
         await (0, runner_1.stopInlineServer)();
+        log("Stoppade ev. tidigare inline-server");
     }
     catch (_b) { }
     stopReloadWatcher();
@@ -706,13 +786,18 @@ async function startCandidatePreviewWithFallback(c, context, opts) {
         const storageDir = await ensureStoragePreview(context);
         placeholder = await (0, runner_1.runInlineStaticServer)(storageDir);
         lastDevUrl = addBust(placeholder.externalUrl);
+        log("Placeholder preview startad", { url: safeUrl(lastDevUrl) });
         panel.webview.postMessage({ type: "devurl", url: lastDevUrl });
+    }
+    else {
+        log("Silent start: väntar med placeholder");
     }
     (async () => {
         try {
             const res = await startOrRespectfulFallback(c, context);
             const busted = addBust(res.externalUrl);
             lastDevUrl = busted;
+            log("Postar devurl", { url: safeUrl(busted), mode: res.mode, watchRoot: redactPath(res.watchRoot) });
             panel.webview.postMessage({ type: "devurl", url: busted });
             // ── Ny: verifiera att URL:en svarar, annars öppna projektväljaren
             void verifyDevUrlAndMaybeRechoose(busted, "initial");
@@ -725,6 +810,7 @@ async function startCandidatePreviewWithFallback(c, context, opts) {
             if (placeholder) {
                 try {
                     await placeholder.stop();
+                    log("Stoppade placeholder-server");
                 }
                 catch (e) {
                     warn("Kunde inte stoppa placeholder-server:", e);
@@ -769,24 +855,30 @@ async function showProjectQuickPick(context) {
     // ── Ny: rescan varje gång
     try {
         lastCandidates = await (0, detector_1.detectProjects)([]);
+        log("Detekterade kandidater", { count: lastCandidates.length });
     }
     catch (e) {
         vscode.window.showErrorMessage(`Kunde inte hitta kandidater: ${(e === null || e === void 0 ? void 0 : e.message) || String(e)}`);
+        errlog("Detektering misslyckades i QuickPick:", (e === null || e === void 0 ? void 0 : e.message) || e);
         return;
     }
     if (!lastCandidates.length) {
         vscode.window.showWarningMessage("Hittade inga kandidater att välja bland.");
+        warn("QuickPick: inga kandidater");
         return;
     }
     const chosen = await vscode.window.showQuickPick(toPickItems(lastCandidates), {
         placeHolder: "Välj projekt att förhandsvisa",
-        matchOnDescription: false, // ingen “unknown • npx …”
-        matchOnDetail: true, // sök på path-raden
+        matchOnDescription: false,
+        matchOnDetail: true,
         ignoreFocusOut: true,
     });
-    if (!chosen)
+    if (!chosen) {
+        log("QuickPick avbruten");
         return;
+    }
     pendingCandidate = chosen._c;
+    log("QuickPick val", { dir: redactPath(pendingCandidate.dir) });
     await rememberCandidate(pendingCandidate, context);
     lastUiPhase = "loading";
     panel.webview.postMessage({ type: "ui-phase", phase: "loading" });
@@ -803,14 +895,18 @@ async function pickFolderAndStart(context) {
         title: "Välj folder",
         openLabel: "Välj folder",
     });
-    if (!uris || !uris.length)
+    if (!uris || !uris.length) {
+        log("Folder-pick avbruten");
         return;
+    }
     const folderPath = uris[0].fsPath;
+    log("Folder vald", { folderPath: redactPath(folderPath) });
     lastUiPhase = "loading";
     panel.webview.postMessage({ type: "ui-phase", phase: "loading" });
     try {
         const candidates = await (0, detector_1.detectProjects)([folderPath]);
         lastCandidates = candidates;
+        log("Detekterade kandidater i vald folder", { count: candidates.length });
         if (!candidates.length) {
             vscode.window.showWarningMessage("Inga körbara frontend-kandidater hittades i vald folder.");
             lastUiPhase = "onboarding";
@@ -840,6 +936,7 @@ function getWebviewHtml(context, webview) {
         html = fs.readFileSync(htmlPath, "utf8");
     }
     catch (_a) {
+        warn("Kunde inte läsa dist-webview/index.html – använder basic fallback");
         return basicFallbackHtml(webview);
     }
     html = html.replace(/(src|href)=\"([^\"]+)\"/g, (_m, attr, value) => {
@@ -890,13 +987,13 @@ function basicFallbackHtml(webview) {
    Aktivering
    ───────────────────────────────────────────────────────── */
 async function activate(context) {
-    extCtxRef = context; // ── Ny: spara context för verifierings-flöden
+    extCtxRef = context;
     log("Aktiverar extension …");
     const bundledModelPath = resolveBundledModelPath(context);
     if (bundledModelPath)
-        log("Försöker ladda bundlad ML-modell:", bundledModelPath);
+        log("Försöker ladda bundlad ML-modell", { modelPath: redactPath(bundledModelPath) });
     else
-        log("Ingen bundlad ML-modell hittades (OK för MVP).");
+        log("Ingen bundlad ML-modell hittades (OK för MVP)");
     (0, classifier_1.loadModelIfAny)({
         globalStoragePath: context.globalStorageUri.fsPath,
         bundledModelPath,
@@ -910,9 +1007,11 @@ async function activate(context) {
     (async () => {
         const rem = await tryGetRememberedCandidate(context);
         updateStatusBar(rem);
+        log("Remembered candidate vid aktivering", { present: !!rem, dir: (rem === null || rem === void 0 ? void 0 : rem.dir) && redactPath(rem.dir) });
     })();
     const scanCmd = vscode.commands.registerCommand("ai-figma-codegen.scanAndPreview", async () => {
         var _a;
+        log("Cmd: scanAndPreview");
         try {
             const remembered = await tryGetRememberedCandidate(context);
             if (remembered) {
@@ -928,6 +1027,7 @@ async function activate(context) {
             }
             const candidates = await (0, detector_1.detectProjects)([]);
             lastCandidates = candidates;
+            log("scanAndPreview kandidater", { count: candidates.length });
             if (!candidates.length) {
                 vscode.window.showWarningMessage("Hittade inga kandidater (körbara frontend-projekt eller statiska mappar).");
                 return;
@@ -946,6 +1046,7 @@ async function activate(context) {
                 const pickNow = "Välj projekt…";
                 const startTop = "Starta föreslagen";
                 const choice = await vscode.window.showInformationMessage("Flera kandidater hittades. Vill du välja manuellt eller starta föreslagen?", pickNow, startTop);
+                log("scanAndPreview val", { choice });
                 if (choice === pickNow) {
                     await showProjectQuickPick(context);
                 }
@@ -965,6 +1066,7 @@ async function activate(context) {
     });
     const openCmd = vscode.commands.registerCommand("ai-figma-codegen.openPanel", async () => {
         var _a;
+        log("Cmd: openPanel");
         const panel = ensurePanel(context);
         panel.reveal(vscode.ViewColumn.One);
         const remembered = await tryGetRememberedCandidate(context);
@@ -980,6 +1082,7 @@ async function activate(context) {
         if (!pendingCandidate) {
             const candidates = await (0, detector_1.detectProjects)([]);
             lastCandidates = candidates;
+            log("openPanel detekterade kandidater", { count: candidates.length });
             if (candidates.length) {
                 pendingCandidate = candidates[0];
                 if (candidates.length === 1 || ((_a = pendingCandidate === null || pendingCandidate === void 0 ? void 0 : pendingCandidate.confidence) !== null && _a !== void 0 ? _a : 0) >= AUTO_START_SURE_THRESHOLD) {
@@ -993,9 +1096,11 @@ async function activate(context) {
         }
     });
     const chooseCmd = vscode.commands.registerCommand("ai-figma-codegen.chooseProject", async () => {
+        log("Cmd: chooseProject");
         await showProjectQuickPick(context);
     });
     const exportCmd = vscode.commands.registerCommand("ai-figma-codegen.exportFrontendDetectorDataset", async () => {
+        log("Cmd: exportFrontendDetectorDataset");
         try {
             await (0, exportDataset_1.exportDatasetCommand)();
         }
@@ -1005,14 +1110,17 @@ async function activate(context) {
         }
     });
     const forgetCmd = vscode.commands.registerCommand("ai-figma-codegen.forgetProject", async () => {
+        log("Cmd: forgetProject");
         await forgetRemembered(context);
     });
     const uriHandler = vscode.window.registerUriHandler({
         handleUri: async (uri) => {
+            var _a;
             try {
                 const params = new URLSearchParams(uri.query);
                 const fileKey = params.get("fileKey") || "";
                 const nodeId = params.get("nodeId") || "";
+                log("URI handler", { path: uri.path, fileKey, nodeId, qs: (_a = uri.query) === null || _a === void 0 ? void 0 : _a.length });
                 if (!fileKey || !nodeId) {
                     vscode.window.showErrorMessage("Saknar fileKey eller nodeId i URI.");
                     return;
@@ -1020,11 +1128,13 @@ async function activate(context) {
                 const token = vscode.workspace.getConfiguration(SETTINGS_NS).get("figmaToken") || undefined;
                 const panel = ensurePanel(context);
                 lastInitPayload = { type: "init", fileKey, nodeId, token, figmaToken: token };
+                log("InitPayload satt", { fileKey, nodeId, hasToken: !!token });
                 panel.webview.postMessage(lastInitPayload);
                 panel.reveal(vscode.ViewColumn.One);
                 await sendFreshFigmaImageUrlToWebview("init");
                 const cfg = vscode.workspace.getConfiguration(SETTINGS_NS);
                 const autoStartImport = cfg.get("autoStartOnImport", true);
+                log("autoStartOnImport", { autoStartImport });
                 if (autoStartImport) {
                     const remembered = await tryGetRememberedCandidate(context);
                     if (remembered) {
@@ -1038,6 +1148,7 @@ async function activate(context) {
                     else {
                         try {
                             const cands = await (0, detector_1.detectProjects)([]);
+                            log("URI detectProjects", { count: cands.length });
                             if (cands.length) {
                                 pendingCandidate = cands[0];
                                 await rememberCandidate(pendingCandidate, context);
@@ -1052,7 +1163,8 @@ async function activate(context) {
                                 panel.webview.postMessage({ type: "ui-phase", phase: "onboarding" });
                             }
                         }
-                        catch (_a) {
+                        catch (e) {
+                            warn("URI detectProjects error", e);
                             lastUiPhase = "onboarding";
                             panel.webview.postMessage({ type: "ui-phase", phase: "onboarding" });
                         }
@@ -1070,7 +1182,7 @@ async function activate(context) {
         },
     });
     context.subscriptions.push(scanCmd, openCmd, chooseCmd, exportCmd, uriHandler, forgetCmd);
-    log("Extension aktiverad.");
+    log("Extension aktiverad");
 }
 async function deactivate() {
     log("Avaktiverar extension – stänger ev. servrar …");

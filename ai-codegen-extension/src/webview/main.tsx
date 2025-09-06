@@ -16,6 +16,7 @@ import React, {
 } from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
+import ChatBar from "./ChatBar";
 
 declare function acquireVsCodeApi(): {
   postMessage: (msg: any) => void;
@@ -30,9 +31,10 @@ const maskToken = (t?: string) => (t ? `${t.slice(0, 4)}…` : undefined);
 // ─────────────────────────────────────────────────────────
 const PROJECT_BASE = { w: 1280, h: 800 };
 const PREVIEW_MIN_SCALE = 0.3;
-const PREVIEW_MAX_SCALE = Number.POSITIVE_INFINITY; // låt scenen skala upp till panelens storlek
+const PREVIEW_MAX_SCALE = Number.POSITIVE_INFINITY;
 const OVERLAY_MIN_FACTOR = 0.15;
 const CANVAS_MARGIN = 16;
+const BOTTOM_GAP = 16; // luft mellan preview och chat
 
 type UiPhase = "default" | "onboarding" | "loading";
 type IncomingMsg =
@@ -60,13 +62,15 @@ function withCenterResize(rect: Rect, newW: number, newH: number): Rect {
 }
 
 // ─────────────────────────────────────────────────────────
-// UI: “Pick project”-kort (förbättrad, en knapp, inga overflow-glitches)
+// UI: “Pick project”-kort
 // ─────────────────────────────────────────────────────────
 function ChooseProjectCard(props: { visible: boolean; compact?: boolean; busy?: boolean }) {
   const { visible, compact, busy } = props;
   if (!visible) return null;
 
-  const onPickProject = () => vscode.postMessage({ cmd: "pickFolder" });
+  const onPickProject = () => {
+    vscode.postMessage({ cmd: "pickFolder" });
+  };
 
   return (
     <div
@@ -90,47 +94,20 @@ function ChooseProjectCard(props: { visible: boolean; compact?: boolean; busy?: 
           boxShadow: "0 15px 30px rgba(0,0,0,.25)",
           position: "relative",
           color: "white",
-          overflow: "hidden", // hindra overflow utanför blått område
+          overflow: "hidden",
         }}
       >
         <style>{`
           .pp-wrap { position: absolute; inset: 0; display: grid; place-items: center; }
-          .pp-folder {
-            position: relative;
-            width: 150px; height: 110px;
-            transform-origin: 50% 80%;
-            transition: transform .28s ease;
-          }
-          .pp-folder .body {
-            position:absolute; inset:0; border-radius:14px;
-            background: linear-gradient(135deg,#ffe563,#ffc663);
-            box-shadow: 0 10px 25px rgba(0,0,0,.25);
-          }
-          .pp-folder .lid {
-            position:absolute; left:18px; top:-14px; width:94px; height:26px;
-            border-radius:12px 12px 0 0;
-            background: linear-gradient(135deg,#ff9a56,#ff6f56);
-            box-shadow: 0 6px 14px rgba(0,0,0,.2);
-            transform-origin: 12px 26px;
-            transition: transform .28s ease;
-          }
+          .pp-folder { position: relative; width: 150px; height: 110px; transform-origin: 50% 80%; transition: transform .28s ease; }
+          .pp-folder .body { position:absolute; inset:0; border-radius:14px; background: linear-gradient(135deg,#ffe563,#ffc663); box-shadow: 0 10px 25px rgba(0,0,0,.25); }
+          .pp-folder .lid { position:absolute; left:18px; top:-14px; width:94px; height:26px; border-radius:12px 12px 0 0; background: linear-gradient(135deg,#ff9a56,#ff6f56); box-shadow: 0 6px 14px rgba(0,0,0,.2); transform-origin: 12px 26px; transition: transform .28s ease; }
           .pp-card:hover .pp-folder { transform: translateY(-2px) scale(1.02); }
           .pp-card:hover .lid { transform: rotate(-12deg); }
-          .pp-cta {
-            position:absolute; left:14px; right:14px; bottom:14px;
-            display:flex; gap:10px; align-items:center; justify-content:center;
-          }
-          .pp-btn {
-            appearance:none; border:none; cursor:pointer;
-            padding:12px 14px; border-radius:10px; font-weight:700;
-            color:#123; background: rgba(255,255,255,.94);
-            box-shadow: 0 4px 10px rgba(0,0,0,.18);
-            transition: transform .12s ease, background .2s ease, box-shadow .2s ease;
-          }
+          .pp-cta { position:absolute; left:14px; right:14px; bottom:14px; display:flex; gap:10px; align-items:center; justify-content:center; }
+          .pp-btn { appearance:none; border:none; cursor:pointer; padding:12px 14px; border-radius:10px; font-weight:700; color:#123; background: rgba(255,255,255,.94); box-shadow: 0 4px 10px rgba(0,0,0,.18); transition: transform .12s ease, background .2s ease, box-shadow .2s ease; }
           .pp-btn:hover { transform: translateY(-1px); background:#fff; box-shadow: 0 6px 16px rgba(0,0,0,.22); }
-          .pp-sub {
-            position:absolute; left:14px; right:14px; bottom:64px; font-size:12px; opacity:.95; text-align:center;
-          }
+          .pp-sub { position:absolute; left:14px; right:14px; bottom:64px; font-size:12px; opacity:.95; text-align:center; }
         `}</style>
 
         <div className="pp-card" style={{ position: "absolute", inset: 0 }}>
@@ -140,7 +117,6 @@ function ChooseProjectCard(props: { visible: boolean; compact?: boolean; busy?: 
               <div className="lid" />
             </div>
           </div>
-
         </div>
 
         <div className="pp-sub">
@@ -174,6 +150,9 @@ function App() {
   const [containerW, setContainerW] = useState(0);
   const [containerH, setContainerH] = useState(0);
 
+  // chat-höjd
+  const [chatH, setChatH] = useState(0);
+
   type StageRect = { x: number; y: number; w: number; h: number };
   const [overlayStage, setOverlayStage] = useState<StageRect | null>(null);
 
@@ -200,35 +179,44 @@ function App() {
     try { vscode.setState?.(current); } catch {}
   }, [overlayStage, showOverlay]);
 
-  // editorstorlek
+  // editorstorlek: reservera plats för chatten
   useLayoutEffect(() => {
     if (!rootRef.current) return;
     const ro = new ResizeObserver((entries) => {
       const e = entries[entries.length - 1];
       if (!e) return;
-      setContainerW(Math.max(0, e.contentRect.width  - CANVAS_MARGIN * 2));
-      setContainerH(Math.max(0, e.contentRect.height - CANVAS_MARGIN * 2));
+      const w = Math.max(0, e.contentRect.width  - CANVAS_MARGIN * 2);
+      const hRaw = Math.max(0, e.contentRect.height - CANVAS_MARGIN * 2);
+      const reserved = chatH > 0 ? chatH + BOTTOM_GAP : 96; // fallback innan chatten mätts
+      const h = Math.max(0, hRaw - reserved);
+      setContainerW(w);
+      setContainerH(h);
     });
     ro.observe(rootRef.current);
     return () => ro.disconnect();
-  }, []);
+  }, [chatH]);
 
   // inkommande meddelanden
   const sentReadyRef = useRef(false);
   useEffect(() => {
     function onMsg(ev: MessageEvent) {
-      const safe: any = { ...(ev.data as any) };
+      const raw: any = ev.data;
+      if (!raw || typeof raw !== "object") return;
+
+      const safe: any = { ...raw };
       if (safe.token) safe.token = maskToken(safe.token);
       if (safe.figmaToken) safe.figmaToken = maskToken(safe.figmaToken);
-      console.log("[webview] incoming message:", safe);
-      const msg = ev.data as IncomingMsg;
-      if (!msg || typeof msg !== "object") return;
 
-      if (msg.type === "devurl") { setDevUrl(msg.url); return; }
+      const msg = raw as IncomingMsg;
+
+      if (msg.type === "devurl") {
+        setDevUrl(msg.url);
+        return;
+      }
+
       if (msg.type === "ui-phase") {
         setPhase(msg.phase);
         if (msg.phase === "onboarding") {
-          // Rensa så att ChooseProjectCard visas och overlay döljs
           setDevUrl(null);
           setFigmaSrc(null);
           setFigmaErr(null);
@@ -240,12 +228,19 @@ function App() {
         }
         return;
       }
+
       if (msg.type === "figma-image-url" && typeof msg.url === "string") {
-        setFigmaSrc(msg.url); setFigmaErr(null); refreshAttempts.current = 0; return;
+        setFigmaSrc(msg.url);
+        setFigmaErr(null);
+        return;
       }
+
       if (msg.type === "ui-error") {
-        setFigmaErr(msg.message || "Okänt fel vid hämtning av Figma-bild."); setFigmaSrc(null); return;
+        setFigmaErr(msg.message || "Okänt fel vid hämtning av Figma-bild.");
+        setFigmaSrc(null);
+        return;
       }
+
       if (msg.type === "init") {
         setFigmaSrc(null);
         setFigmaErr(null);
@@ -259,7 +254,10 @@ function App() {
       }
     }
     window.addEventListener("message", onMsg);
-    if (!sentReadyRef.current) { vscode.postMessage({ type: "ready" }); sentReadyRef.current = true; }
+    if (!sentReadyRef.current) {
+      vscode.postMessage({ type: "ready" });
+      sentReadyRef.current = true;
+    }
     return () => window.removeEventListener("message", onMsg);
   }, [persistState]);
 
@@ -303,21 +301,21 @@ function App() {
   const onFigmaLoad = useCallback((ev: React.SyntheticEvent<HTMLImageElement>) => {
     const el = ev.currentTarget;
     const natural = { w: el.naturalWidth || el.width, h: el.naturalHeight || el.height };
-    console.log("[webview] Figma-bild laddad:", natural);
     setFigmaN(natural);
   }, []);
   const onFigmaError = useCallback(() => {
-    console.error("[webview] Fel vid laddning av Figma-bild");
-    if (refreshAttempts.current < 3) {
-      refreshAttempts.current += 1;
-      setFigmaErr("Förlorad åtkomst till Figma-bilden (troligen utgången URL). Försöker igen…");
-      vscode.postMessage({ cmd: "refreshFigmaImage" });
+    const attempt = refreshAttempts.current + 1;
+    if (attempt <= 3) {
+      refreshAttempts.current = attempt;
+      const delay = 500 * Math.pow(2, attempt - 1);
+      setFigmaErr(`Förlorad åtkomst till Figma-bilden. Försök ${attempt}/3…`);
+      setTimeout(() => vscode.postMessage({ cmd: "refreshFigmaImage" }), delay);
     } else {
       setFigmaErr("Kunde inte ladda Figma-bilden efter flera försök. Kontrollera token/åtkomst.");
     }
   }, []);
 
-  // clamp overlay (behåll AR, håll inom 1280×800)
+  // clamp overlay
   const minOverlay = useMemo(() => ({
     w: PROJECT_BASE.w * OVERLAY_MIN_FACTOR,
     h: PROJECT_BASE.h * OVERLAY_MIN_FACTOR,
@@ -355,16 +353,14 @@ function App() {
         setTimeout(() => { setShowOverlay(false); persistState({ showOverlay: false }); }, 80);
       }
       if (overlayStage && figmaN) {
-        vscode.postMessage({
-          type: "placementAccepted",
-          payload: {
-            projectBase: { ...PROJECT_BASE },
-            overlayStage: { ...overlayStage },
-            imageNatural: { ...figmaN },
-            ts: Date.now(),
-            source: "webview/main.tsx",
-          },
-        });
+        const payload = {
+          projectBase: { ...PROJECT_BASE },
+          overlayStage: { ...overlayStage },
+          imageNatural: { ...figmaN },
+          ts: Date.now(),
+          source: "webview/main.tsx",
+        };
+        vscode.postMessage({ type: "placementAccepted", payload });
       }
     };
     window.addEventListener("pointerup", end, { once: true });
@@ -506,7 +502,9 @@ function App() {
         next = { w, h, x: round((PROJECT_BASE.w - w) / 2), y: round((PROJECT_BASE.h - h) / 2) };
         changed = true;
       }
-      if (e.key === "f" || e.key === "F") vscode.postMessage({ cmd: "enterFullView" });
+      if (e.key === "f" || e.key === "F") {
+        vscode.postMessage({ cmd: "enterFullView" });
+      }
 
       if (changed) {
         next = clampOverlayToStage(next);
@@ -534,12 +532,11 @@ function App() {
     };
   }, [overlayStage, overlayAR, selected, persistState]);
 
-  // auto-onboarding: öppna inte QuickPick automatiskt
+  // auto-onboarding
   const [requestedProjectOnce, setRequestedProjectOnce] = useState(false);
   useEffect(() => {
     const t = setTimeout(() => {
       if (!requestedProjectOnce && !devUrl && !figmaSrc && phase === "onboarding") {
-        // Valfritt: testa tyst toppkandidat
         vscode.postMessage({ cmd: "acceptCandidate" });
         setRequestedProjectOnce(true);
       }
@@ -604,7 +601,19 @@ function App() {
           </div>
         )}
 
-        {/* Figma-fönster ovanpå laptop-UI */}
+        {/* Figma-fönster */}
+        {/* 1) Dold probe för naturliga mått */}
+        {figmaSrc && !figmaN && (
+          <img
+            src={figmaSrc}
+            alt=""
+            onLoad={onFigmaLoad}
+            onError={onFigmaError}
+            style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
+          />
+        )}
+
+        {/* 2) Interaktiv overlay */}
         {figmaSrc && overlayStage && (
           <div
             ref={overlayRef}
@@ -617,33 +626,32 @@ function App() {
               width:  round(overlayStage.w * stageDims.scale),
               height: round(overlayStage.h * stageDims.scale),
               zIndex: 20,
+              cursor: "move",
+              background: "transparent",
               borderRadius: 10,
               boxShadow: selected ? "0 0 0 2px rgba(0,0,0,.06), 0 2px 10px rgba(0,0,0,.25)" : "none",
-              background: "transparent",
-              cursor: "move",
-              display: "grid",
-              overflow: "hidden",
+              overflow: "visible",
             }}
           >
-            <img
-              src={figmaSrc}
-              alt="Figma node"
-              draggable={false}
-              onLoad={onFigmaLoad}
-              onError={onFigmaError}
-              style={{
-                width: "100%",
-                height: "100%",
-                display: "block",
-                objectFit: "contain",
-                userSelect: "none",
-                pointerEvents: "none",
-              }}
-            />
-
-            {/* Stödraster och handtag visas bara när valt */}
-            {showOverlay && selected && (
-              <>
+            {/* Klipp endast innehållet/bilden */}
+            <div style={{ position: "absolute", inset: 0, borderRadius: 10, overflow: "hidden" }}>
+              <img
+                src={figmaSrc}
+                alt="Figma node"
+                draggable={false}
+                onLoad={onFigmaLoad}
+                onError={onFigmaError}
+                style={{
+                  width: "100%",
+                  height: "100%",
+                  display: "block",
+                  objectFit: "contain",
+                  userSelect: "none",
+                  pointerEvents: "none",
+                }}
+              />
+              {/* Stödraster visas när valt */}
+              {showOverlay && selected && (
                 <div
                   aria-hidden
                   style={{
@@ -654,20 +662,27 @@ function App() {
                     pointerEvents: "none",
                   }}
                 />
+              )}
+            </div>
+
+            {/* Hörnhandtag */}
+            {showOverlay && selected && (
+              <>
                 {(["nw", "ne", "se", "sw"] as const).map((pos) => {
-                  const size = 14;
+                  const size = 16;
                   const base: React.CSSProperties = {
                     position: "absolute",
                     width: size, height: size,
                     background: "var(--accent)",
                     borderRadius: 999,
                     boxShadow: "0 1px 4px rgba(0,0,0,.35)",
+                    pointerEvents: "auto",
                   };
                   const styleMap: Record<typeof pos, React.CSSProperties> = {
-                    nw: { ...base, left: -size / 2, top: -size / 2, cursor: "nwse-resize" },
-                    ne: { ...base, right: -size / 2, top: -size / 2, cursor: "nesw-resize" },
-                    se: { ...base, right: -size / 2, bottom: -size / 2, cursor: "nwse-resize" },
-                    sw: { ...base, left: -size / 2, bottom: -size / 2, cursor: "nesw-resize" },
+                    nw: { ...base, left: 0,  top: 0,    transform: "translate(-50%,-50%)", cursor: "nwse-resize" },
+                    ne: { ...base, right: 0, top: 0,    transform: "translate(50%,-50%)",  cursor: "nesw-resize" },
+                    se: { ...base, right: 0, bottom: 0, transform: "translate(50%,50%)",   cursor: "nwse-resize" },
+                    sw: { ...base, left: 0,  bottom: 0, transform: "translate(-50%,50%)",  cursor: "nesw-resize" },
                   };
                   return (
                     <div
@@ -719,7 +734,11 @@ function App() {
               <div style={{ marginTop: 12 }}>
                 <button
                   className="pp-btn"
-                  onClick={() => { refreshAttempts.current = 0; setFigmaErr("Försöker hämta ny bild-URL…"); vscode.postMessage({ cmd: "refreshFigmaImage" }); }}
+                  onClick={() => {
+                    refreshAttempts.current = 0;
+                    setFigmaErr("Försöker hämta ny bild-URL…");
+                    vscode.postMessage({ cmd: "refreshFigmaImage" });
+                  }}
                 >
                   Försök igen
                 </button>
@@ -755,6 +774,16 @@ function App() {
           </div>
         </div>
       )}
+
+      {/* Chat längst ned. Rapporterar höjd för att reservera yta. */}
+      <ChatBar
+        onSend={(text) => vscode.postMessage({ cmd: "chat", text })}
+        onStop={() => vscode.postMessage({ cmd: "stopChat" })}
+        busy={false}
+        disabled={false}
+        placeholder="Skriv ett meddelande…"
+        onHeightChange={setChatH}
+      />
     </div>
   );
 }
