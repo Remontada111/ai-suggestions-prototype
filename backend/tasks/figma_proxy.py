@@ -8,6 +8,7 @@ from requests.exceptions import RequestException
 from fastapi import HTTPException
 from fastapi.responses import Response
 from PIL import Image, ImageCms  # Kräver Pillow; för färghantering krävs lcms2 i OS
+import logging
 
 # ── Intent-typ för Pillow/Pylance ───────────────────────────────────────────
 _INTENT_PERCEPTUAL: Any
@@ -30,6 +31,13 @@ P3_ICC_PATH = os.getenv("P3_ICC_PATH", "backend/color/DisplayP3.icc")
 AUTO_FLATTEN_WITH_NODE_BG = os.getenv("AUTO_FLATTEN_WITH_NODE_BG", "1") == "1"
 FALLBACK_FLATTEN_BG = os.getenv("FALLBACK_FLATTEN_BG", "")  # t.ex. "#E5E5E5" för Figma-lik canvas
 
+logger = logging.getLogger("figma_proxy")
+
+def _mask_token(t: Optional[str]) -> str:
+    if not t:
+        return ""
+    return (t[:4] + "…") if len(t) > 4 else "…"
+
 # ── Hjälpare ────────────────────────────────────────────────────────────────
 def _auth_headers(token_override: Optional[str] = None) -> Dict[str, str]:
     """
@@ -37,13 +45,16 @@ def _auth_headers(token_override: Optional[str] = None) -> Dict[str, str]:
     Vi skickar både Authorization och X-Figma-Token för kompatibilitet.
     """
     if token_override:
+        logger.info("_auth_headers med override %s", _mask_token(token_override))
         return {
             "Authorization": f"Bearer {token_override}",
             "X-Figma-Token": token_override,
         }
     if FIGMA_OAUTH:
+        logger.info("_auth_headers använder FIGMA_OAUTH %s", _mask_token(FIGMA_OAUTH))
         return {"Authorization": f"Bearer {FIGMA_OAUTH}"}
     if FIGMA_PAT:
+        logger.info("_auth_headers använder FIGMA_PAT %s", _mask_token(FIGMA_PAT))
         return {"X-Figma-Token": str(FIGMA_PAT)}
     raise HTTPException(500, "Ingen Figma-token konfigurerad (FIGMA_TOKEN eller FIGMA_OAUTH_TOKEN).")
 
@@ -83,21 +94,27 @@ def _figma_image_url(file_key: str, node_id: str, scale: str, token: Optional[st
         "use_absolute_bounds": "true",
         "scale": scale or "2",
     }
+    logger.info("Hämtar Figma image-URL för %s/%s", file_key, node_id)
     try:
         r = requests.get(u, headers=_auth_headers(token), params=params, timeout=15)
     except RequestException as e:
+        logger.error("figma images nätverksfel: %s", e)
         raise HTTPException(502, f"figma images nätverksfel: {e}")
     if r.status_code != 200:
+        logger.error("figma images error %s: %s", r.status_code, r.text)
         raise HTTPException(502, f"figma images error {r.status_code}: {r.text}")
 
     try:
         j = r.json()
     except ValueError:
+        logger.error("figma images svarade inte med giltig JSON")
         raise HTTPException(502, "figma images svarade inte med giltig JSON")
 
     url = (j.get("images") or {}).get(node_id)
     if not url:
+        logger.error("figma images saknar image-url för angiven node")
         raise HTTPException(502, "figma images saknar image-url för angiven node (fel nodeId eller åtkomst).")
+    logger.info("Figma image-URL hämtad: %s", url)
     return url
 
 def _figma_node_bg_color(file_key: str, node_id: str, token: Optional[str]) -> Optional[Tuple[int, int, int]]:
@@ -108,19 +125,22 @@ def _figma_node_bg_color(file_key: str, node_id: str, token: Optional[str]) -> O
       2) Canvas (page) background om noden råkar vara canvas (ovanligt här).
     Returnerar (R, G, B) i 0..255 om hittad, annars None.
     """
+    logger.info("Hämtar nodens bakgrundsfärg för %s/%s", file_key, node_id)
     try:
         u = f"https://api.figma.com/v1/files/{file_key}/nodes"
         r = requests.get(u, headers=_auth_headers(token), params={"ids": node_id}, timeout=15)
     except RequestException as e:
-        # Misslyckas tyst – vi kan fortfarande leverera PNG utan auto-bg.
+        logger.warning("nodes nätverksfel: %s", e)
         return None
 
     if r.status_code != 200:
+        logger.warning("nodes svar %s", r.status_code)
         return None
 
     try:
         data = r.json()
     except ValueError:
+        logger.warning("nodes ogiltig JSON")
         return None
 
     nodes = (data.get("nodes") or {}).get(node_id) or {}
@@ -143,7 +163,9 @@ def _figma_node_bg_color(file_key: str, node_id: str, token: Optional[str]) -> O
         if f.get("type") == "SOLID":
             col = f.get("color")
             if isinstance(col, dict):
-                return _conv(col)
+                col_conv = _conv(col)
+                logger.info("Nodens SOLID bakgrund: %s", col_conv)
+                return col_conv
 
     # 2) Canvas/page background
     if node_type == "CANVAS":
@@ -152,7 +174,9 @@ def _figma_node_bg_color(file_key: str, node_id: str, token: Optional[str]) -> O
             if not bg.get("visible", True):
                 continue
             if bg.get("type") == "SOLID" and isinstance(bg.get("color"), dict):
-                return _conv(bg["color"])
+                col_conv = _conv(bg["color"])
+                logger.info("Canvas bakgrund: %s", col_conv)
+                return col_conv
 
     return None
 
@@ -254,28 +278,42 @@ def figma_image(
     flatten: Optional[str] = None,
     bg: Optional[str] = None,
 ):
+    logger.info(
+        "figma_image start fileKey=%s nodeId=%s scale=%s token=%s",
+        fileKey,
+        nodeId,
+        scale,
+        _mask_token(token),
+    )
     # Säkerställ att vi har någon form av token
     _ = _auth_headers(token)  # kastar 500 om saknas
 
     # 1) Hämta bild-URL för node
+    logger.info("Steg 1: hämta image-URL")
     url = _figma_image_url(fileKey, nodeId, scale, token)
 
     # 2) Ladda bildbytes
+    logger.info("Steg 2: hämta bildbytes från %s", url)
     try:
         r = requests.get(url, timeout=30)
     except RequestException as e:
+        logger.error("image fetch nätverksfel: %s", e)
         raise HTTPException(502, f"image fetch nätverksfel: {e}")
 
     if r.status_code != 200:
+        logger.error("image fetch error %s", r.status_code)
         raise HTTPException(502, f"image fetch error {r.status_code}")
 
     # 3) Konvertera till sRGB + RGBA
+    logger.info("Steg 3: konverterar till sRGB")
     try:
         img = _to_srgb_png(r.content)
     except Exception as e:
+        logger.error("convert error: %s", e)
         raise HTTPException(500, f"convert error: {e}")
 
     # 4) Bestäm flatten-policy
+    logger.info("Steg 4: bestämmer flatten-policy")
     #    a) Om query 'bg' finns → använd den
     #    b) Annars om AUTO_FLATTEN_WITH_NODE_BG → försök hämta nodens bakgrund via Nodes API
     #    c) Annars env FALLBACK_FLATTEN_BG
@@ -299,11 +337,14 @@ def figma_image(
     # - flatten="0" → aldrig flatten
     if flatten == "0":
         selected_bg = None  # hedrar explicit "ingen flatten"
+    logger.info("Bakgrundsval: forced=%s node_bg=%s selected=%s", forced_bg, node_bg, selected_bg)
 
     # 5) Flatten om nödvändigt (dvs. om PNG har alfa <255 någonstans) och vi har en bakgrund
+    logger.info("Steg 5: flatten om nödvändigt, bg=%s", selected_bg)
     img = _flatten_if_needed(img, selected_bg)
 
     # 6) Svara med PNG-bytes
+    logger.info("Steg 6: svarar med PNG %dx%d", img.width, img.height)
     headers = {
         "Content-Type": "image/png",
         "Cache-Control": "public, max-age=31536000, immutable",

@@ -23,6 +23,7 @@ declare function acquireVsCodeApi(): {
   setState: (state: any) => void;
 };
 const vscode = acquireVsCodeApi();
+const maskToken = (t?: string) => (t ? `${t.slice(0, 4)}…` : undefined);
 
 // ─────────────────────────────────────────────────────────
 // Konstanter / utils
@@ -216,6 +217,10 @@ function App() {
   const sentReadyRef = useRef(false);
   useEffect(() => {
     function onMsg(ev: MessageEvent) {
+      const safe: any = { ...(ev.data as any) };
+      if (safe.token) safe.token = maskToken(safe.token);
+      if (safe.figmaToken) safe.figmaToken = maskToken(safe.figmaToken);
+      console.log("[webview] incoming message:", safe);
       const msg = ev.data as IncomingMsg;
       if (!msg || typeof msg !== "object") return;
 
@@ -298,9 +303,11 @@ function App() {
   const onFigmaLoad = useCallback((ev: React.SyntheticEvent<HTMLImageElement>) => {
     const el = ev.currentTarget;
     const natural = { w: el.naturalWidth || el.width, h: el.naturalHeight || el.height };
+    console.log("[webview] Figma-bild laddad:", natural);
     setFigmaN(natural);
   }, []);
   const onFigmaError = useCallback(() => {
+    console.error("[webview] Fel vid laddning av Figma-bild");
     if (refreshAttempts.current < 3) {
       refreshAttempts.current += 1;
       setFigmaErr("Förlorad åtkomst till Figma-bilden (troligen utgången URL). Försöker igen…");

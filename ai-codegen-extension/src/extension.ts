@@ -17,6 +17,7 @@ const LOG_NS = "ai-figma-codegen/ext";
 const log = (...args: any[]) => console.log(`[${LOG_NS}]`, ...args);
 const warn = (...args: any[]) => console.warn(`[${LOG_NS}]`, ...args);
 const errlog = (...args: any[]) => console.error(`[${LOG_NS}]`, ...args);
+const maskToken = (t?: string) => (t ? `${t.slice(0, 4)}…` : undefined);
 
 type InitPayload = {
   type: "init";
@@ -369,7 +370,10 @@ function buildProxyUrl(fileKey: string, nodeId: string, scale = "2", token?: str
   u.searchParams.set("nodeId", nodeId);
   u.searchParams.set("scale", scale);
   if (token) u.searchParams.set("token", token);
-  return u.toString();
+  const urlStr = u.toString();
+  const safeUrl = token ? urlStr.replace(token, maskToken(token) || "") : urlStr;
+  log("Byggd proxy-URL:", safeUrl);
+  return urlStr;
 }
 
 async function sendFreshFigmaImageUrlToWebview(source: "init" | "refresh") {
@@ -406,6 +410,15 @@ function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
       }
     );
 
+    const origPost = currentPanel.webview.postMessage.bind(currentPanel.webview);
+    currentPanel.webview.postMessage = (msg: any) => {
+      const safe = { ...msg };
+      if (safe.token) safe.token = maskToken(safe.token);
+      if (safe.figmaToken) safe.figmaToken = maskToken(safe.figmaToken);
+      log("Skickar webview-meddelande:", safe);
+      return origPost(msg);
+    };
+
     currentPanel.onDidDispose(async () => {
       log("Panel stängdes – städar upp servrar och state.");
       currentPanel = undefined;
@@ -425,7 +438,10 @@ function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
     });
 
     currentPanel.webview.onDidReceiveMessage(async (msg: any) => {
-      log("Meddelande från webview:", msg?.type ?? msg?.cmd ?? msg);
+      const safe = { ...msg };
+      if (safe.token) safe.token = maskToken(safe.token);
+      if (safe.figmaToken) safe.figmaToken = maskToken(safe.figmaToken);
+      log("Meddelande från webview:", safe);
 
       if (msg?.type === "ready") {
         if (lastInitPayload) {
@@ -994,6 +1010,7 @@ export async function activate(context: vscode.ExtensionContext) {
   const uriHandler = vscode.window.registerUriHandler({
     handleUri: async (uri: vscode.Uri) => {
       try {
+        log("Init-URI mottagen:", uri.toString());
         const params = new URLSearchParams(uri.query);
         const fileKey = params.get("fileKey") || "";
         const nodeId = params.get("nodeId") || "";
@@ -1007,6 +1024,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
         const panel = ensurePanel(context);
         lastInitPayload = { type: "init", fileKey, nodeId, token, figmaToken: token };
+        log("Init payload:", { fileKey, nodeId, token: maskToken(token) });
         panel.webview.postMessage(lastInitPayload);
         panel.reveal(vscode.ViewColumn.One);
 
