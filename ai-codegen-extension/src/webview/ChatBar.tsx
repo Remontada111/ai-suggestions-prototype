@@ -28,11 +28,8 @@ import React, {
   useState,
 } from "react";
 
-declare function acquireVsCodeApi(): {
-  postMessage: (msg: any) => void;
-  getState: () => any;
-  setState: (state: any) => void;
-};
+import { getVsCodeApi } from "./vscodeApi";
+
 
 type ChatBarProps = {
   onSend: (text: string) => void | Promise<void>;
@@ -46,7 +43,7 @@ type ChatBarProps = {
   onHeightChange?: (px: number) => void;  // ⬅️ ny
 };
 
-const vscode = typeof acquireVsCodeApi === "function" ? acquireVsCodeApi() : { postMessage() {}, getState() { return {}; }, setState() {} };
+const vscode = getVsCodeApi();
 
 const DEFAULT_MAX_CHARS = 8000;
 const DEFAULT_MAX_ROWS = 10;

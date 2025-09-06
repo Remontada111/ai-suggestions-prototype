@@ -17,13 +17,9 @@ import React, {
 import { createRoot } from "react-dom/client";
 import "./index.css";
 import ChatBar from "./ChatBar";
+import { getVsCodeApi } from "./vscodeApi";
 
-declare function acquireVsCodeApi(): {
-  postMessage: (msg: any) => void;
-  getState: () => any;
-  setState: (state: any) => void;
-};
-const vscode = acquireVsCodeApi();
+const vscode = getVsCodeApi();
 const maskToken = (t?: string) => (t ? `${t.slice(0, 4)}…` : undefined);
 
 // ─────────────────────────────────────────────────────────
@@ -209,10 +205,7 @@ function App() {
 
       const msg = raw as IncomingMsg;
 
-      if (msg.type === "devurl") {
-        setDevUrl(msg.url);
-        return;
-      }
+      if (msg.type === "devurl") { setDevUrl(msg.url); return; }
 
       if (msg.type === "ui-phase") {
         setPhase(msg.phase);
@@ -229,25 +222,12 @@ function App() {
         return;
       }
 
-      if (msg.type === "figma-image-url" && typeof msg.url === "string") {
-        setFigmaSrc(msg.url);
-        setFigmaErr(null);
-        return;
-      }
-
-      if (msg.type === "ui-error") {
-        setFigmaErr(msg.message || "Okänt fel vid hämtning av Figma-bild.");
-        setFigmaSrc(null);
-        return;
-      }
+      if (msg.type === "figma-image-url" && typeof msg.url === "string") { setFigmaSrc(msg.url); setFigmaErr(null); return; }
+      if (msg.type === "ui-error") { setFigmaErr(msg.message || "Okänt fel vid hämtning av Figma-bild."); setFigmaSrc(null); return; }
 
       if (msg.type === "init") {
-        setFigmaSrc(null);
-        setFigmaErr(null);
-        setFigmaN(null);
-        setOverlayStage(null);
-        setSelected(false);
-        setShowOverlay(false);
+        setFigmaSrc(null); setFigmaErr(null); setFigmaN(null);
+        setOverlayStage(null); setSelected(false); setShowOverlay(false);
         persistState({ overlayStage: null, showOverlay: false });
         refreshAttempts.current = 0;
         return;
@@ -289,7 +269,7 @@ function App() {
       const h = round(fitted.h);
       const x = round((PROJECT_BASE.w - w) / 2);
       const y = round((PROJECT_BASE.h - h) / 2);
-      const rect: StageRect = { x, y, w, h };
+      const rect: { x: number; y: number; w: number; h: number } = { x, y, w, h };
       setOverlayStage(rect);
       setShowOverlay(false);
       setSelected(false);
@@ -320,7 +300,7 @@ function App() {
     w: PROJECT_BASE.w * OVERLAY_MIN_FACTOR,
     h: PROJECT_BASE.h * OVERLAY_MIN_FACTOR,
   }), []);
-  function clampOverlayToStage(r: StageRect): StageRect {
+  function clampOverlayToStage(r: { x: number; y: number; w: number; h: number }) {
     let w = clamp(r.w, minOverlay.w, PROJECT_BASE.w);
     let h = w / overlayAR;
     if (h > PROJECT_BASE.h) { h = PROJECT_BASE.h; w = h * overlayAR; }
@@ -475,7 +455,7 @@ function App() {
 
       const step = e.shiftKey ? 10 : 1;
       let changed = false;
-      let next: StageRect = { ...overlayStage };
+      let next: { x: number; y: number; w: number; h: number } = { ...overlayStage };
       const isMeta = e.ctrlKey || e.metaKey;
 
       if (!isMeta) {
