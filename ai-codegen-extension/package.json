@@ -8,7 +8,9 @@
     "vscode": "^1.102.0"
   },
   "categories": ["Other"],
-  "activationEvents": ["onUri"],
+  "activationEvents": [
+    "onUri"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
@@ -31,7 +33,11 @@
       {
         "command": "ai-figma-codegen.forgetProject",
         "title": "AI Figma Codegen: Glöm valt projekt"
-      }
+      },
+      {
+  "command": "ai-figma-codegen.sendPlacement",
+  "title": "AI Figma Codegen: Send Placement to Backend"
+}
     ],
     "configuration": {
       "title": "AI Figma Codegen",
@@ -40,6 +46,11 @@
           "type": "string",
           "default": "",
           "markdownDescription": "Din Figma Personal Access Token (Account → Settings → Developer tokens)."
+        },
+        "aiFigmaCodegen.backendBaseUrl": {
+          "type": "string",
+          "default": "http://localhost:8000",
+          "description": "Bas-URL till backend-proxy som returnerar sRGB-PNG."
         },
         "aiFigmaCodegen.autoFullView": {
           "type": "boolean",
@@ -62,15 +73,16 @@
           "description": "Starta automatiskt det senast valda (ihågkomna) projektet vid import av valfri Figma-URI (oavsett fileKey/node)."
         },
         "aiFigmaCodegen.autoCloseSidebar": {
-  "type": "boolean",
-  "default": true,
-  "description": "Stäng sidofältet automatiskt vid preview/import."
-},
-"aiFigmaCodegen.backendBaseUrl": {
-  "type": "string",
-  "default": "http://localhost:8000",
-  "description": "Bas-URL till backend-proxy som returnerar sRGB-PNG."
-}
+          "type": "boolean",
+          "default": true,
+          "description": "Stäng sidofältet automatiskt vid preview/import."
+        },
+        "aiFigmaCodegen.persistPlacements": {
+          "type": "boolean",
+          "default": true,
+          "description": "Spara senaste placerings-/analysdata i workspaceState."
+        }
+
       }
     }
   },

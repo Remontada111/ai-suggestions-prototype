@@ -14,7 +14,7 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { createRoot } from "react-dom/client";
+  import { createRoot } from "react-dom/client";
 import "./index.css";
 import ChatBar from "./ChatBar";
 import { getVsCodeApi } from "./vscodeApi";
@@ -38,7 +38,8 @@ type IncomingMsg =
   | { type: "ui-phase"; phase: UiPhase }
   | { type: "init"; fileKey: string; nodeId: string; token?: string; figmaToken?: string }
   | { type: "figma-image-url"; url: string }
-  | { type: "ui-error"; message: string };
+  | { type: "ui-error"; message: string }
+  | { type: "seed-placement"; payload: any };
 
 type Vec2 = { x: number; y: number };
 type Rect = { x: number; y: number; w: number; h: number };
@@ -55,6 +56,45 @@ function withCenterResize(rect: Rect, newW: number, newH: number): Rect {
   const cx = rect.x + rect.w / 2;
   const cy = rect.y + rect.h / 2;
   return { x: cx - newW / 2, y: cy - newH / 2, w: newW, h: newH };
+}
+
+// ── NYTT: analys-hjälpare
+function normRect(r: Rect, base = PROJECT_BASE) {
+  return { x: r.x / base.w, y: r.y / base.h, w: r.w / base.w, h: r.h / base.h };
+}
+function nearEdges(n: { x: number; y: number; w: number; h: number }, tol = 0.02) {
+  const right = n.x + n.w, bottom = n.y + n.h;
+  return { left: n.x < tol, right: 1 - right < tol, top: n.y < tol, bottom: 1 - bottom < tol };
+}
+// Snabb pixel-scan för att hitta icke-transparent innehåll (kräver CORS på bild-URL)
+function computeContentBoundsPx(img: HTMLImageElement): { x: number; y: number; w: number; h: number } | null {
+  try {
+    const w = img.naturalWidth, h = img.naturalHeight;
+    if (!w || !h) return null;
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    const ctx = c.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return null;
+    ctx.drawImage(img, 0, 0);
+    const data = ctx.getImageData(0, 0, w, h).data;
+    const alphaT = 8; // 0–255
+    let L = w, R = -1, T = h, B = -1;
+    const stride = Math.max(1, Math.floor(Math.min(w, h) / 400)); // speedup
+    for (let y = 0; y < h; y += stride) {
+      const rowOff = y * w * 4;
+      for (let x = 0; x < w; x += stride) {
+        const a = data[rowOff + x * 4 + 3];
+        if (a > alphaT) {
+          if (x < L) L = x;
+          if (x > R) R = x;
+          if (y < T) T = y;
+          if (y > B) B = y;
+        }
+      }
+    }
+    if (R < 0) return null;
+    return { x: L, y: T, w: R - L + 1, h: B - T + 1 };
+  } catch { return null; }
 }
 
 // ─────────────────────────────────────────────────────────
@@ -143,6 +183,9 @@ function App() {
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const selectedRef = useRef(false);
 
+  // ── ref till synliga figma-bilden för pixel-analys
+  const figmaImgRef = useRef<HTMLImageElement | null>(null);
+
   const [containerW, setContainerW] = useState(0);
   const [containerH, setContainerH] = useState(0);
 
@@ -161,19 +204,25 @@ function App() {
   const spaceHeld = useRef(false);
   const fullViewRequested = useRef(false);
 
+  // ── NYTT: hantera seed från extension eller lokal state
+  const pendingSeedRef = useRef<any | null>(null);
+
   useEffect(() => { selectedRef.current = selected; }, [selected]);
 
   // persist
   useEffect(() => {
     const st = vscode.getState?.() || {};
-    if (st.overlayStage) setOverlayStage(st.overlayStage);
+    // Återställ inte overlay direkt. Parkera som seed så vi kan normalisera när figmaN finns.
+    if (st.overlayStage) {
+      pendingSeedRef.current = { overlayStage: st.overlayStage, imageNatural: st.imageNatural };
+    }
     if (st.showOverlay) setShowOverlay(!!st.showOverlay);
     if (st.fullViewRequested) fullViewRequested.current = true;
   }, []);
   const persistState = useCallback((extra?: Record<string, any>) => {
-    const current = { overlayStage, showOverlay, fullViewRequested: fullViewRequested.current, ...extra };
+    const current = { overlayStage, showOverlay, fullViewRequested: fullViewRequested.current, imageNatural: figmaN, ...extra };
     try { vscode.setState?.(current); } catch {}
-  }, [overlayStage, showOverlay]);
+  }, [overlayStage, showOverlay, figmaN]);
 
   // editorstorlek: reservera plats för chatten
   useLayoutEffect(() => {
@@ -181,7 +230,7 @@ function App() {
     const ro = new ResizeObserver((entries) => {
       const e = entries[entries.length - 1];
       if (!e) return;
-      const w = Math.max(0, e.contentRect.width  - CANVAS_MARGIN * 2);
+      const w = Math.max(0, e.contentRect.width - CANVAS_MARGIN * 2);
       const hRaw = Math.max(0, e.contentRect.height - CANVAS_MARGIN * 2);
       const reserved = chatH > 0 ? chatH + BOTTOM_GAP : 96; // fallback innan chatten mätts
       const h = Math.max(0, hRaw - reserved);
@@ -194,6 +243,52 @@ function App() {
 
   // inkommande meddelanden
   const sentReadyRef = useRef(false);
+
+  const overlayAR = useMemo(() => {
+    if (!figmaN) return PROJECT_BASE.w / PROJECT_BASE.h;
+    const ar = figmaN.w / figmaN.h;
+    return ar > 0 ? ar : PROJECT_BASE.w / PROJECT_BASE.h;
+  }, [figmaN]);
+
+  const clampOverlayToStage = useCallback((r: { x: number; y: number; w: number; h: number }) => {
+    const minOverlay = {
+      w: PROJECT_BASE.w * OVERLAY_MIN_FACTOR,
+      h: PROJECT_BASE.h * OVERLAY_MIN_FACTOR,
+    };
+    let w = clamp(r.w, minOverlay.w, PROJECT_BASE.w);
+    let h = w / overlayAR;
+    if (h > PROJECT_BASE.h) { h = PROJECT_BASE.h; w = h * overlayAR; }
+    let x = clamp(r.x, 0, PROJECT_BASE.w - w);
+    let y = clamp(r.y, 0, PROJECT_BASE.h - h);
+    return { x: round(x), y: round(y), w: round(w), h: round(h) };
+  }, [overlayAR]);
+
+  const applySeed = useCallback((p: any) => {
+    if (!p?.overlayStage) return;
+    let rect = { ...p.overlayStage };
+    // Skala seed ifall tidigare naturliga mått finns
+    if (p.imageNatural && figmaN && p.imageNatural.w && p.imageNatural.h) {
+      const sx = figmaN.w / p.imageNatural.w;
+      const sy = figmaN.h / p.imageNatural.h;
+      const s = (isFinite(sx) && isFinite(sy)) ? (sx + sy) / 2 : 1;
+      rect = {
+        x: round(rect.x * s),
+        y: round(rect.y * s),
+        w: round(rect.w * s),
+        h: round(rect.h * s),
+      };
+    }
+    // Snäpp till aktuell bild-AR och clamp:a
+    const targetH = rect.w / overlayAR;
+    rect = withCenterResize(rect, rect.w, targetH);
+    const clamped = clampOverlayToStage(rect);
+
+    setOverlayStage(clamped);
+    setShowOverlay(false);
+    setSelected(false);
+    persistState({ overlayStage: clamped, showOverlay: false });
+  }, [figmaN, overlayAR, clampOverlayToStage, persistState]);
+
   useEffect(() => {
     function onMsg(ev: MessageEvent) {
       const raw: any = ev.data;
@@ -204,6 +299,12 @@ function App() {
       if (safe.figmaToken) safe.figmaToken = maskToken(safe.figmaToken);
 
       const msg = raw as IncomingMsg;
+
+      if (msg.type === "seed-placement" && msg.payload) {
+        if (figmaN) applySeed(msg.payload);
+        else pendingSeedRef.current = msg.payload;
+        return;
+      }
 
       if (msg.type === "devurl") { setDevUrl(msg.url); return; }
 
@@ -217,7 +318,7 @@ function App() {
           setOverlayStage(null);
           setSelected(false);
           setShowOverlay(false);
-          persistState({ overlayStage: null, showOverlay: false });
+          persistState({ overlayStage: null, showOverlay: false, imageNatural: null });
         }
         return;
       }
@@ -228,7 +329,7 @@ function App() {
       if (msg.type === "init") {
         setFigmaSrc(null); setFigmaErr(null); setFigmaN(null);
         setOverlayStage(null); setSelected(false); setShowOverlay(false);
-        persistState({ overlayStage: null, showOverlay: false });
+        persistState({ overlayStage: null, showOverlay: false, imageNatural: null });
         refreshAttempts.current = 0;
         return;
       }
@@ -239,7 +340,7 @@ function App() {
       sentReadyRef.current = true;
     }
     return () => window.removeEventListener("message", onMsg);
-  }, [persistState]);
+  }, [applySeed, persistState, figmaN]);
 
   // stage-dimensioner
   const stageDims = useMemo(() => {
@@ -248,20 +349,13 @@ function App() {
     const w = round(PROJECT_BASE.w * scale);
     const h = round(PROJECT_BASE.h * scale);
     const left = round((containerW - w) / 2);
-    const top  = round((containerH - h) / 2);
+    const top = round((containerH - h) / 2);
     return { w, h, left, top, scale };
   }, [containerW, containerH]);
 
-  // overlay AR från bilden
-  const overlayAR = useMemo(() => {
-    if (!figmaN) return PROJECT_BASE.w / PROJECT_BASE.h;
-    const ar = figmaN.w / figmaN.h;
-    return ar > 0 ? ar : PROJECT_BASE.w / PROJECT_BASE.h;
-  }, [figmaN]);
-
-  // init overlay när bild finns
+  // init overlay när bild finns (om vi inte fått seed)
   useEffect(() => {
-    if (figmaSrc && figmaN && !overlayStage) {
+    if (figmaSrc && figmaN && !overlayStage && !pendingSeedRef.current) {
       const availW = PROJECT_BASE.w * 0.9;
       const availH = PROJECT_BASE.h * 0.9;
       const fitted = arFit(availW, availH, overlayAR);
@@ -277,12 +371,32 @@ function App() {
     }
   }, [figmaSrc, figmaN, overlayAR, overlayStage, persistState]);
 
+  // applicera seed när naturliga mått finns
+  useEffect(() => {
+    if (figmaN && pendingSeedRef.current) {
+      applySeed(pendingSeedRef.current);
+      pendingSeedRef.current = null;
+    }
+  }, [figmaN, applySeed]);
+
+  // säkerställ korrekt AR direkt när figmaN blir känd
+  useEffect(() => {
+    if (!figmaN || !overlayStage) return;
+    const expectedH = round(overlayStage.w / overlayAR);
+    if (Math.abs(expectedH - overlayStage.h) > 1) {
+      const fixed = clampOverlayToStage(withCenterResize(overlayStage, overlayStage.w, expectedH));
+      setOverlayStage(fixed);
+      persistState({ overlayStage: fixed });
+    }
+  }, [figmaN, overlayAR, overlayStage, clampOverlayToStage, persistState]);
+
   // onload/onerror
   const onFigmaLoad = useCallback((ev: React.SyntheticEvent<HTMLImageElement>) => {
     const el = ev.currentTarget;
     const natural = { w: el.naturalWidth || el.width, h: el.naturalHeight || el.height };
     setFigmaN(natural);
-  }, []);
+    persistState({ imageNatural: natural });
+  }, [persistState]);
   const onFigmaError = useCallback(() => {
     const attempt = refreshAttempts.current + 1;
     if (attempt <= 3) {
@@ -294,20 +408,6 @@ function App() {
       setFigmaErr("Kunde inte ladda Figma-bilden efter flera försök. Kontrollera token/åtkomst.");
     }
   }, []);
-
-  // clamp overlay
-  const minOverlay = useMemo(() => ({
-    w: PROJECT_BASE.w * OVERLAY_MIN_FACTOR,
-    h: PROJECT_BASE.h * OVERLAY_MIN_FACTOR,
-  }), []);
-  function clampOverlayToStage(r: { x: number; y: number; w: number; h: number }) {
-    let w = clamp(r.w, minOverlay.w, PROJECT_BASE.w);
-    let h = w / overlayAR;
-    if (h > PROJECT_BASE.h) { h = PROJECT_BASE.h; w = h * overlayAR; }
-    let x = clamp(r.x, 0, PROJECT_BASE.w - w);
-    let y = clamp(r.y, 0, PROJECT_BASE.h - h);
-    return { x: round(x), y: round(y), w: round(w), h: round(h) };
-  }
 
   // full view
   const requestFullViewIfNeeded = useCallback(() => {
@@ -333,10 +433,42 @@ function App() {
         setTimeout(() => { setShowOverlay(false); persistState({ showOverlay: false }); }, 80);
       }
       if (overlayStage && figmaN) {
+        const img = figmaImgRef.current || undefined;
+        const contentPx = img ? computeContentBoundsPx(img) : null;
+
+        const arImg = figmaN.w / figmaN.h;
+        const arOverlay = overlayStage.w / overlayStage.h;
+        const arDeltaPct = Math.abs(arOverlay - arImg) / arImg;
+
+        const norm = normRect(overlayStage);
+        const edges = nearEdges(norm);
+        const center = { x: norm.x + norm.w / 2, y: norm.y + norm.h / 2 };
+        const sizePct = norm.w * norm.h;
+
+        let contentInProject: Rect | null = null;
+        if (contentPx) {
+          const sx = figmaN.w / overlayStage.w;
+          const sy = figmaN.h / overlayStage.h;
+          contentInProject = {
+            x: overlayStage.x + contentPx.x / sx,
+            y: overlayStage.y + contentPx.y / sy,
+            w: contentPx.w / sx,
+            h: contentPx.h / sy,
+          };
+        }
+
         const payload = {
           projectBase: { ...PROJECT_BASE },
           overlayStage: { ...overlayStage },
           imageNatural: { ...figmaN },
+          norm, center, sizePct,
+          ar: { image: arImg, overlay: arOverlay, deltaPct: arDeltaPct },
+          edges,
+          content: contentPx ? {
+            px: contentPx,
+            project: contentInProject!,
+            norm: contentInProject ? normRect(contentInProject) : null,
+          } : null,
           ts: Date.now(),
           source: "webview/main.tsx",
         };
@@ -416,7 +548,7 @@ function App() {
       setOverlayStage(next);
       persistState({ overlayStage: next });
     }
-  }, [overlayStage, stageDims.scale, overlayAR, persistState]);
+  }, [overlayStage, stageDims.scale, overlayAR, clampOverlayToStage, persistState]);
 
   // resize-handle start
   const startResize = (mode: "nw" | "ne" | "se" | "sw") => (e: React.PointerEvent) => {
@@ -438,7 +570,7 @@ function App() {
     setOverlayStage(sized);
     persistState({ overlayStage: sized, showOverlay: true });
     setShowOverlay(true);
-  }, [overlayStage, overlayAR, selected, persistState]);
+  }, [overlayStage, overlayAR, selected, clampOverlayToStage, persistState]);
 
   // tangentbord endast när valt
   useEffect(() => {
@@ -510,7 +642,7 @@ function App() {
       window.removeEventListener("keydown", onKeyDown, { capture: true } as any);
       window.removeEventListener("keyup", onKeyUp, { capture: true } as any);
     };
-  }, [overlayStage, overlayAR, selected, persistState]);
+  }, [overlayStage, overlayAR, selected, clampOverlayToStage, persistState]);
 
   // auto-onboarding
   const [requestedProjectOnce, setRequestedProjectOnce] = useState(false);
@@ -540,7 +672,7 @@ function App() {
         style={{
           position: "absolute",
           left: stageDims.left + rootPadding,
-          top:  stageDims.top  + rootPadding,
+          top: stageDims.top + rootPadding,
           width: stageDims.w,
           height: stageDims.h,
           zIndex: 5,
@@ -587,6 +719,7 @@ function App() {
           <img
             src={figmaSrc}
             alt=""
+            crossOrigin="anonymous"
             onLoad={onFigmaLoad}
             onError={onFigmaError}
             style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
@@ -601,9 +734,9 @@ function App() {
             onPointerMove={onOverlayPointerMove}
             style={{
               position: "absolute",
-              left:  round(overlayStage.x * stageDims.scale),
-              top:   round(overlayStage.y * stageDims.scale),
-              width:  round(overlayStage.w * stageDims.scale),
+              left: round(overlayStage.x * stageDims.scale),
+              top: round(overlayStage.y * stageDims.scale),
+              width: round(overlayStage.w * stageDims.scale),
               height: round(overlayStage.h * stageDims.scale),
               zIndex: 20,
               cursor: "move",
@@ -616,8 +749,10 @@ function App() {
             {/* Klipp endast innehållet/bilden */}
             <div style={{ position: "absolute", inset: 0, borderRadius: 10, overflow: "hidden" }}>
               <img
+                ref={figmaImgRef}
                 src={figmaSrc}
                 alt="Figma node"
+                crossOrigin="anonymous"
                 draggable={false}
                 onLoad={onFigmaLoad}
                 onError={onFigmaError}
@@ -659,10 +794,10 @@ function App() {
                     pointerEvents: "auto",
                   };
                   const styleMap: Record<typeof pos, React.CSSProperties> = {
-                    nw: { ...base, left: 0,  top: 0,    transform: "translate(-50%,-50%)", cursor: "nwse-resize" },
-                    ne: { ...base, right: 0, top: 0,    transform: "translate(50%,-50%)",  cursor: "nesw-resize" },
-                    se: { ...base, right: 0, bottom: 0, transform: "translate(50%,50%)",   cursor: "nwse-resize" },
-                    sw: { ...base, left: 0,  bottom: 0, transform: "translate(-50%,50%)",  cursor: "nesw-resize" },
+                    nw: { ...base, left: 0, top: 0, transform: "translate(-50%,-50%)", cursor: "nwse-resize" },
+                    ne: { ...base, right: 0, top: 0, transform: "translate(50%,-50%)", cursor: "nesw-resize" },
+                    se: { ...base, right: 0, bottom: 0, transform: "translate(50%,50%)", cursor: "nwse-resize" },
+                    sw: { ...base, left: 0, bottom: 0, transform: "translate(-50%,50%)", cursor: "nesw-resize" },
                   };
                   return (
                     <div

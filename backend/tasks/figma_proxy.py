@@ -7,10 +7,11 @@ from typing import Any, Optional, Tuple, Dict, cast
 
 import requests
 from requests.exceptions import RequestException
-from fastapi import HTTPException
+from fastapi import HTTPException, APIRouter
 from fastapi.responses import Response
 from PIL import Image, ImageCms  # Kräver Pillow; för färghantering krävs lcms2 i OS
 
+router = APIRouter()
 log = logging.getLogger("ai-figma-codegen/figma-proxy")
 
 # ── Intent-typ för Pillow/Pylance ───────────────────────────────────────────
@@ -47,15 +48,14 @@ log.info(
 def _auth_headers(token_override: Optional[str] = None) -> Dict[str, str]:
     """
     Föredra token från anropet om angiven, annars env (OAuth först, sedan PAT).
-    Vi skickar både Authorization och X-Figma-Token för kompatibilitet.
+    Använd rätt header, aldrig båda.
     """
     if token_override:
-     log.debug("Auth headers: override token supplied")
-      # Heuristik: PAT börjar med "figd_". Använd rätt header, aldrig båda.
-     if token_override.startswith("figd_"):
-         return {"X-Figma-Token": token_override}
-     return {"Authorization": f"Bearer {token_override}"}
-        
+        log.debug("Auth headers: override token supplied")
+        if token_override.startswith("figd_"):  # PAT
+            return {"X-Figma-Token": token_override}
+        return {"Authorization": f"Bearer {token_override}"}  # OAuth
+
     if FIGMA_OAUTH:
         log.debug("Auth headers: using OAuth token from env")
         return {"Authorization": f"Bearer {FIGMA_OAUTH}"}
@@ -207,11 +207,7 @@ def _to_srgb_png(src_bytes: bytes) -> Image.Image:
             log.info("Converting with embedded ICC → sRGB", extra={"icc_bytes": len(src_icc)})
             src_prof = ImageCms.ImageCmsProfile(BytesIO(src_icc))
             conv = ImageCms.profileToProfile(
-                base,
-                src_prof,
-                dst_profile,
-                outputMode="RGB",
-                renderingIntent=_INTENT_PERCEPTUAL,
+                base, src_prof, dst_profile, outputMode="RGB", renderingIntent=_INTENT_PERCEPTUAL
             )
             base = cast(Image.Image, conv)
         else:
@@ -221,11 +217,7 @@ def _to_srgb_png(src_bytes: bytes) -> Image.Image:
                     p3 = f.read()
                 p3_prof = ImageCms.ImageCmsProfile(BytesIO(p3))
                 conv = ImageCms.profileToProfile(
-                    base,
-                    p3_prof,
-                    dst_profile,
-                    outputMode="RGB",
-                    renderingIntent=_INTENT_PERCEPTUAL,
+                    base, p3_prof, dst_profile, outputMode="RGB", renderingIntent=_INTENT_PERCEPTUAL
                 )
                 base = cast(Image.Image, conv)
             else:
@@ -280,8 +272,22 @@ def _image_bytes(img: Image.Image) -> bytes:
     log.debug("Encoded PNG bytes", extra={"bytes": len(data)})
     return data
 
-# ── Publik route-funktion ───────────────────────────────────────────────────
-# app.add_api_route("/api/figma-image", figma_image, methods=["GET"])
+# ── HTTP-svarshjälpare (CORS) ───────────────────────────────────────────────
+def _cors_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    base = {
+        "Access-Control-Allow-Origin": "*",              # viktig för canvas + crossOrigin="anonymous"
+        "Access-Control-Allow-Methods": "GET,HEAD,OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        # OBS: sätt inte Access-Control-Allow-Credentials när du använder anonymous
+    }
+    return {**base, **(extra or {})}
+
+# ── Publika routes ──────────────────────────────────────────────────────────
+@router.options("/api/figma-image")
+def figma_image_options() -> Response:
+    return Response(status_code=204, headers=_cors_headers())
+
+@router.get("/api/figma-image")
 def figma_image(
     fileKey: str,
     nodeId: str,
@@ -369,12 +375,22 @@ def figma_image(
     img = _flatten_if_needed(img, selected_bg)
     log.info("Flatten step done", extra={"ms": round((perf_counter() - t0) * 1000, 1), "bg_used": bool(selected_bg)})
 
-    # 6) Svara med PNG-bytes
+    # 6) Svara med PNG-bytes + CORS
     body = _image_bytes(img)
-    headers = {
-        "Content-Type": "image/png",
-        "Cache-Control": "public, max-age=31536000, immutable",
-    }
+    headers = _cors_headers(
+        {
+            "Content-Type": "image/png",
+            "Cache-Control": "public, max-age=31536000, immutable",
+        }
+    )
 
     log.info("Responding PNG", extra={"bytes": len(body), "total_ms": round((perf_counter() - t_total) * 1000, 1)})
     return Response(content=body, headers=headers)
+
+# OBS:
+# - Inkludera routern i din app:
+#     from backend.tasks.figma_proxy import router as figma_router
+#     app.include_router(figma_router)
+# - Alternativt kan du sätta global CORS-middleware i din app:
+#     from fastapi.middleware.cors import CORSMiddleware
+#     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
