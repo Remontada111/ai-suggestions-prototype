@@ -195,6 +195,23 @@ function App() {
   type StageRect = { x: number; y: number; w: number; h: number };
   const [overlayStage, setOverlayStage] = useState<StageRect | null>(null);
 
+  const [deletedState, setDeletedState] = useState<{
+    src: string;
+    n: { w: number; h: number } | null;
+    overlay: StageRect | null;
+  } | null>(null);
+
+  const iconBtnStyle: React.CSSProperties = {
+    width: 40,
+    height: 40,
+    borderRadius: 8,
+    border: "1px solid var(--border)",
+    background: "var(--vscode-editorWidget-background)",
+    display: "grid",
+    placeItems: "center",
+    cursor: "pointer",
+  };
+
   const refreshAttempts = useRef(0);
   const dragState = useRef<{
     mode: "move" | "nw" | "ne" | "se" | "sw" | null;
@@ -492,6 +509,26 @@ function App() {
     window.addEventListener("pointerdown", onGlobalPointerDown, { capture: true });
     return () => window.removeEventListener("pointerdown", onGlobalPointerDown, { capture: true } as any);
   }, [persistState]);
+
+  const handleDelete = useCallback(() => {
+    if (!figmaSrc) return;
+    setDeletedState({ src: figmaSrc, n: figmaN, overlay: overlayStage });
+    setFigmaSrc(null);
+    setFigmaN(null);
+    setOverlayStage(null);
+    setSelected(false);
+    setShowOverlay(false);
+    persistState({ overlayStage: null, imageNatural: null, showOverlay: false });
+  }, [figmaSrc, figmaN, overlayStage, persistState]);
+
+  const handleUndo = useCallback(() => {
+    if (!deletedState) return;
+    setFigmaSrc(deletedState.src);
+    setFigmaN(deletedState.n);
+    setOverlayStage(deletedState.overlay);
+    setDeletedState(null);
+    persistState({ overlayStage: deletedState.overlay, imageNatural: deletedState.n });
+  }, [deletedState, persistState]);
 
   // flytt
   const onOverlayPointerDown = useCallback((e: React.PointerEvent) => {
@@ -887,6 +924,86 @@ function App() {
               Laddar Figma-bild…
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Delete / Undo-Redo controls */}
+      {figmaSrc && selected && !deletedState && (
+        <div
+          style={{
+            position: "fixed",
+            right: CANVAS_MARGIN,
+            bottom: chatH + BOTTOM_GAP + 8,
+            zIndex: 50,
+          }}
+        >
+          <button onClick={handleDelete} style={iconBtnStyle} aria-label="Delete node">
+            <svg
+              width="20"
+              height="20"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <polyline points="3 6 5 6 21 6" />
+              <path d="M19 6l-1 14H6L5 6" />
+              <path d="M10 11v6" />
+              <path d="M14 11v6" />
+              <path d="M9 6V4h6v2" />
+            </svg>
+          </button>
+        </div>
+      )}
+
+      {deletedState && (
+        <div
+          style={{
+            position: "fixed",
+            right: CANVAS_MARGIN,
+            bottom: chatH + BOTTOM_GAP + 8,
+            zIndex: 50,
+            display: "flex",
+            gap: 8,
+          }}
+        >
+          <button onClick={handleUndo} style={iconBtnStyle} aria-label="Undo delete">
+            <svg
+              width="20"
+              height="20"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M3 7v6h6" />
+              <path d="M3 13c1.5-4 6-8 13-5" />
+            </svg>
+          </button>
+          <button
+            onClick={handleDelete}
+            style={{ ...iconBtnStyle, opacity: 0.5, cursor: "not-allowed" }}
+            aria-label="Redo delete"
+            disabled
+          >
+            <svg
+              width="20"
+              height="20"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M21 13V7h-6" />
+              <path d="M21 7c-1.5-4-6-8-13-5" />
+            </svg>
+          </button>
         </div>
       )}
 
