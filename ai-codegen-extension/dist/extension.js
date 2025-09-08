@@ -70,7 +70,8 @@ const safeUrl = (u) => {
     }
 };
 const redactPath = (p) => (p ? p.replace(process.cwd() || "", ".") : p);
-let lastInitPayload = null;
+const nodeKey = (f, n) => `${f}:${n}`;
+let activeNodes = new Map();
 let lastDevUrl = null;
 let pendingCandidate = null;
 let lastCandidates = [];
@@ -421,16 +422,17 @@ function buildProxyUrl(fileKey, nodeId, scale = "2", token) {
     u.searchParams.set("scale", scale);
     if (token)
         u.searchParams.set("token", token);
+    u.searchParams.set("flatten", "0"); // behåll transparens, ingen auto-flatten
     const built = u.toString();
     log("buildProxyUrl →", { url: safeUrl(built) });
     return built;
 }
-async function sendFreshFigmaImageUrlToWebview(source) {
-    if (!currentPanel || !lastInitPayload) {
-        warn("sendFreshFigmaImageUrlToWebview utan panel/payload");
+async function sendFreshFigmaImageUrlToWebview(node, source) {
+    if (!currentPanel) {
+        warn("sendFreshFigmaImageUrlToWebview utan panel");
         return;
     }
-    const { fileKey, nodeId, figmaToken } = lastInitPayload;
+    const { fileKey, nodeId, figmaToken } = node;
     log("figma-image request", { source, fileKey, nodeId, hasToken: !!figmaToken });
     const raw = buildProxyUrl(fileKey, nodeId, "2", figmaToken);
     if (!raw) {
@@ -442,22 +444,22 @@ async function sendFreshFigmaImageUrlToWebview(source) {
         return;
     }
     const url = addBust(raw);
-    log("Postar figma-image-url till webview", { url: safeUrl(url) });
-    currentPanel.webview.postMessage({ type: "figma-image-url", url });
+    log("Postar figma-image-url till webview", { url: safeUrl(url), fileKey, nodeId });
+    currentPanel.webview.postMessage({ type: "figma-image-url", fileKey, nodeId, url });
     lastUiPhase = "default";
     currentPanel.webview.postMessage({ type: "ui-phase", phase: "default" });
 }
-// ── NY: skicka sparad placement till webview om sådan finns
-async function sendSeedPlacementIfAny() {
+// ── NY: skicka sparad placement till webview om sådan finns (per nod)
+async function sendSeedPlacementIfAny(node) {
     var _a;
-    if (!currentPanel || !lastInitPayload)
+    if (!currentPanel)
         return;
     const key = `${SETTINGS_NS}.placements.v1`;
-    const id = `${lastInitPayload.fileKey}:${lastInitPayload.nodeId}`;
+    const id = `${node.fileKey}:${node.nodeId}`;
     const all = (_a = extCtxRef === null || extCtxRef === void 0 ? void 0 : extCtxRef.workspaceState.get(key)) !== null && _a !== void 0 ? _a : {};
     const saved = all === null || all === void 0 ? void 0 : all[id];
     if (saved === null || saved === void 0 ? void 0 : saved.overlayStage) {
-        currentPanel.webview.postMessage({ type: "seed-placement", payload: saved });
+        currentPanel.webview.postMessage({ type: "seed-placement", fileKey: node.fileKey, nodeId: node.nodeId, payload: saved });
     }
 }
 /* ─────────────────────────────────────────────────────────
@@ -475,9 +477,9 @@ function ensurePanel(context) {
             log("Panel stängdes – städar upp servrar och state");
             currentPanel = undefined;
             lastDevUrl = null;
-            lastInitPayload = null;
             pendingCandidate = null;
             lastUiPhase = "default";
+            activeNodes.clear();
             stopReloadWatcher();
             try {
                 await (0, runner_1.stopDevServer)();
@@ -508,11 +510,11 @@ function ensurePanel(context) {
             log("[wv→ext] message", (_b = (_a = msg === null || msg === void 0 ? void 0 : msg.type) !== null && _a !== void 0 ? _a : msg === null || msg === void 0 ? void 0 : msg.cmd) !== null && _b !== void 0 ? _b : msg);
             if ((msg === null || msg === void 0 ? void 0 : msg.type) === "ready") {
                 log("[wv→ext] ready");
-                if (lastInitPayload) {
-                    log("Skickar tidigare initPayload till webview", { fileKey: lastInitPayload.fileKey, nodeId: lastInitPayload.nodeId, hasToken: !!lastInitPayload.figmaToken });
-                    currentPanel.webview.postMessage(lastInitPayload);
-                    await sendFreshFigmaImageUrlToWebview("init");
-                    await sendSeedPlacementIfAny();
+                // Rehydrera ev. tidigare noder
+                for (const n of activeNodes.values()) {
+                    currentPanel.webview.postMessage({ type: "add-node", ...n });
+                    await sendFreshFigmaImageUrlToWebview(n, "init");
+                    await sendSeedPlacementIfAny(n);
                 }
                 if (lastDevUrl) {
                     log("Skickar tidigare devurl till webview", { url: safeUrl(lastDevUrl) });
@@ -526,23 +528,37 @@ function ensurePanel(context) {
                 }
                 return;
             }
-            // ── NY: spara placement per nod + heuristik
+            // ── NY: spara placement per nod (om info finns). Fallback: om exakt 1 nod aktiv.
             if ((msg === null || msg === void 0 ? void 0 : msg.type) === "placementAccepted" && (msg === null || msg === void 0 ? void 0 : msg.payload)) {
                 try {
                     const persist = vscode.workspace.getConfiguration(SETTINGS_NS).get("persistPlacements", true);
                     if (persist) {
-                        const id = lastInitPayload ? `${lastInitPayload.fileKey}:${lastInitPayload.nodeId}` : "unknown";
-                        const key = `${SETTINGS_NS}.placements.v1`;
-                        const all = (_d = extCtxRef === null || extCtxRef === void 0 ? void 0 : extCtxRef.workspaceState.get(key)) !== null && _d !== void 0 ? _d : {};
-                        all[id] = {
-                            ...msg.payload,
-                            fileKey: lastInitPayload === null || lastInitPayload === void 0 ? void 0 : lastInitPayload.fileKey,
-                            nodeId: lastInitPayload === null || lastInitPayload === void 0 ? void 0 : lastInitPayload.nodeId,
-                            savedAt: Date.now(),
-                            schema: 1,
-                        };
-                        await (extCtxRef === null || extCtxRef === void 0 ? void 0 : extCtxRef.workspaceState.update(key, all));
-                        log("Placement persisterad per nod", { id });
+                        let fileKey = msg.fileKey;
+                        let nodeId = msg.nodeId;
+                        if (!fileKey || !nodeId) {
+                            if (activeNodes.size === 1) {
+                                const one = [...activeNodes.values()][0];
+                                fileKey = one.fileKey;
+                                nodeId = one.nodeId;
+                            }
+                        }
+                        if (fileKey && nodeId) {
+                            const id = `${fileKey}:${nodeId}`;
+                            const key = `${SETTINGS_NS}.placements.v1`;
+                            const all = (_d = extCtxRef === null || extCtxRef === void 0 ? void 0 : extCtxRef.workspaceState.get(key)) !== null && _d !== void 0 ? _d : {};
+                            all[id] = {
+                                ...msg.payload,
+                                fileKey,
+                                nodeId,
+                                savedAt: Date.now(),
+                                schema: 1,
+                            };
+                            await (extCtxRef === null || extCtxRef === void 0 ? void 0 : extCtxRef.workspaceState.update(key, all));
+                            log("Placement persisterad per nod", { id });
+                        }
+                        else {
+                            warn("placementAccepted utan fileKey/nodeId och >1 aktiv nod; hoppar över persist");
+                        }
                     }
                     // Enkla kontroller
                     const p = msg.payload;
@@ -615,7 +631,16 @@ function ensurePanel(context) {
             }
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "refreshFigmaImage") {
                 log("WV bad om refreshFigmaImage");
-                await sendFreshFigmaImageUrlToWebview("refresh");
+                const nodeId = typeof msg.nodeId === "string" ? msg.nodeId : undefined;
+                let target;
+                if (nodeId) {
+                    target = [...activeNodes.values()].find(x => x.nodeId === nodeId);
+                }
+                else if (activeNodes.size === 1) {
+                    target = [...activeNodes.values()][0];
+                }
+                if (target)
+                    await sendFreshFigmaImageUrlToWebview(target, "refresh");
                 return;
             }
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "chat" && typeof msg.text === "string") {
@@ -1028,11 +1053,32 @@ function postJson(url, json, timeoutMs = 8000) {
         }
     });
 }
+// Välj nod och skicka placement till backend
 async function triggerFigmaHookWithPlacement() {
     var _a, _b;
-    if (!lastInitPayload) {
-        vscode.window.showErrorMessage("Ingen init-payload ännu.");
+    if (activeNodes.size === 0) {
+        vscode.window.showErrorMessage("Ingen importerad Figma-nod ännu.");
         return;
+    }
+    // välj nod om flera
+    let chosen;
+    if (activeNodes.size === 1) {
+        chosen = [...activeNodes.values()][0];
+    }
+    else {
+        const picks = [...activeNodes.values()].map((n) => ({
+            label: n.nodeId,
+            description: n.fileKey,
+            _n: n,
+        }));
+        const sel = await vscode.window.showQuickPick(picks, {
+            placeHolder: "Välj Figma-nod att skicka till backend",
+            ignoreFocusOut: true,
+            matchOnDescription: true,
+        });
+        if (!sel)
+            return;
+        chosen = sel._n;
     }
     const base = vscode.workspace.getConfiguration(SETTINGS_NS).get("backendBaseUrl");
     if (!base) {
@@ -1040,17 +1086,17 @@ async function triggerFigmaHookWithPlacement() {
         return;
     }
     const key = `${SETTINGS_NS}.placements.v1`;
-    const id = `${lastInitPayload.fileKey}:${lastInitPayload.nodeId}`;
+    const id = `${chosen.fileKey}:${chosen.nodeId}`;
     const all = (_a = extCtxRef === null || extCtxRef === void 0 ? void 0 : extCtxRef.workspaceState.get(key)) !== null && _a !== void 0 ? _a : {};
     const placement = all === null || all === void 0 ? void 0 : all[id];
     try {
         const url = new URL("/figma-hook", base).toString();
         const resp = await postJson(url, {
-            fileKey: lastInitPayload.fileKey,
-            nodeId: lastInitPayload.nodeId,
+            fileKey: chosen.fileKey,
+            nodeId: chosen.nodeId,
             placement,
         });
-        vscode.window.showInformationMessage(`Startade jobb ${(_b = resp === null || resp === void 0 ? void 0 : resp.task_id) !== null && _b !== void 0 ? _b : ""}`);
+        vscode.window.showInformationMessage(`Startade jobb ${(_b = resp === null || resp === void 0 ? void 0 : resp.task_id) !== null && _b !== void 0 ? _b : ""} för ${chosen.nodeId}`);
     }
     catch (e) {
         vscode.window.showErrorMessage(`Kunde inte starta jobb: ${(e === null || e === void 0 ? void 0 : e.message) || String(e)}`);
@@ -1186,7 +1232,7 @@ async function activate(context) {
         log("Cmd: forgetProject");
         await forgetRemembered(context);
     });
-    // ── NYTT: skicka placement till backend manuellt
+    // ── NYTT: skicka placement till backend (välj nod vid flera)
     const sendPlacementCmd = vscode.commands.registerCommand("ai-figma-codegen.sendPlacement", async () => {
         log("Cmd: sendPlacement");
         await triggerFigmaHookWithPlacement();
@@ -1205,12 +1251,14 @@ async function activate(context) {
                 }
                 const token = vscode.workspace.getConfiguration(SETTINGS_NS).get("figmaToken") || undefined;
                 const panel = ensurePanel(context);
-                lastInitPayload = { type: "init", fileKey, nodeId, token, figmaToken: token };
-                log("InitPayload satt", { fileKey, nodeId, hasToken: !!token });
-                panel.webview.postMessage(lastInitPayload);
+                // Lägg till eller uppdatera nod i minnet
+                const n = { fileKey, nodeId, token, figmaToken: token };
+                activeNodes.set(nodeKey(fileKey, nodeId), n);
+                // Informera webview om ny nod och ladda dess bild
+                panel.webview.postMessage({ type: "add-node", ...n });
                 panel.reveal(vscode.ViewColumn.One);
-                await sendFreshFigmaImageUrlToWebview("init");
-                await sendSeedPlacementIfAny();
+                await sendFreshFigmaImageUrlToWebview(n, "init");
+                await sendSeedPlacementIfAny(n);
                 const cfg = vscode.workspace.getConfiguration(SETTINGS_NS);
                 const autoStartImport = cfg.get("autoStartOnImport", true);
                 log("autoStartOnImport", { autoStartImport });

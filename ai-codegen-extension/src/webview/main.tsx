@@ -1,10 +1,10 @@
 // webview/main.tsx
-// Målsättning:
-// - Laptop-UI i fast 1280×800-stage som skalas för att passa panelen.
-// - Figma-fönstret behåller sin egen aspect ratio. Inget beskärs.
-// - Justeringspunkter syns bara när Figma-fönstret är valt. Klick utanför döljer dem.
-// - Tangentbord fungerar endast när fönstret är valt: pilar (flytt), Ctrl/Cmd+pilar (resize), Shift=större steg, Space=visa overlay, R=reset, F=full view.
-// - Wheel-zoom: Ctrl/Cmd + hjul = resize runt centrum när fönstret är valt.
+// Mål:
+// - 1280×800 stage som skalas i panelen.
+// - Stöd för flera Figma-noder samtidigt.
+// - Välj en nod → flytta/resize med mus, hjul och tangentbord.
+// - Papperskorg visas för vald nod. Efter borttagning visas Undo tills återställd.
+// - Figma-bild hämtas via extension per nod och renderas ovanför devUrl-iframe.
 
 import React, {
   useCallback,
@@ -14,13 +14,13 @@ import React, {
   useRef,
   useState,
 } from "react";
-  import { createRoot } from "react-dom/client";
+import { createRoot } from "react-dom/client";
 import "./index.css";
 import ChatBar from "./ChatBar";
 import { getVsCodeApi } from "./vscodeApi";
+import { Trash2, RotateCcw } from "lucide-react";
 
 const vscode = getVsCodeApi();
-const maskToken = (t?: string) => (t ? `${t.slice(0, 4)}…` : undefined);
 
 // ─────────────────────────────────────────────────────────
 // Konstanter / utils
@@ -28,22 +28,34 @@ const maskToken = (t?: string) => (t ? `${t.slice(0, 4)}…` : undefined);
 const PROJECT_BASE = { w: 1280, h: 800 };
 const PREVIEW_MIN_SCALE = 0.3;
 const PREVIEW_MAX_SCALE = Number.POSITIVE_INFINITY;
-const OVERLAY_MIN_FACTOR = 0.15;
 const CANVAS_MARGIN = 16;
-const BOTTOM_GAP = 16; // luft mellan preview och chat
+const BOTTOM_GAP = 16;
 
 type UiPhase = "default" | "onboarding" | "loading";
+type NodeId = string; // `${fileKey}:${nodeId}`
+
 type IncomingMsg =
   | { type: "devurl"; url: string }
   | { type: "ui-phase"; phase: UiPhase }
-  | { type: "init"; fileKey: string; nodeId: string; token?: string; figmaToken?: string }
-  | { type: "figma-image-url"; url: string }
-  | { type: "ui-error"; message: string }
-  | { type: "seed-placement"; payload: any };
+  | { type: "add-node"; fileKey: string; nodeId: string; token?: string; figmaToken?: string }
+  | { type: "figma-image-url"; fileKey: string; nodeId: string; url: string }
+  | { type: "seed-placement"; fileKey: string; nodeId: string; payload: any }
+  | { type: "ui-error"; message: string };
 
 type Vec2 = { x: number; y: number };
 type Rect = { x: number; y: number; w: number; h: number };
+type StageRect = Rect;
 
+type NodeState = {
+  fileKey: string;
+  nodeId: string;
+  imgSrc: string | null;
+  imgN: { w: number; h: number } | null;
+  rect: StageRect | null;
+  deleted: boolean;
+};
+
+function idOf(f: string, n: string): NodeId { return `${f}:${n}`; }
 function clamp(n: number, lo: number, hi: number) { return Math.max(lo, Math.min(hi, n)); }
 function round(n: number) { return Math.round(n); }
 function arFit(width: number, height: number, targetAR: number) {
@@ -57,8 +69,6 @@ function withCenterResize(rect: Rect, newW: number, newH: number): Rect {
   const cy = rect.y + rect.h / 2;
   return { x: cx - newW / 2, y: cy - newH / 2, w: newW, h: newH };
 }
-
-// ── NYTT: analys-hjälpare
 function normRect(r: Rect, base = PROJECT_BASE) {
   return { x: r.x / base.w, y: r.y / base.h, w: r.w / base.w, h: r.h / base.h };
 }
@@ -77,9 +87,9 @@ function computeContentBoundsPx(img: HTMLImageElement): { x: number; y: number; 
     if (!ctx) return null;
     ctx.drawImage(img, 0, 0);
     const data = ctx.getImageData(0, 0, w, h).data;
-    const alphaT = 8; // 0–255
+    const alphaT = 8;
     let L = w, R = -1, T = h, B = -1;
-    const stride = Math.max(1, Math.floor(Math.min(w, h) / 400)); // speedup
+    const stride = Math.max(1, Math.floor(Math.min(w, h) / 400));
     for (let y = 0; y < h; y += stride) {
       const rowOff = y * w * 4;
       for (let x = 0; x < w; x += stride) {
@@ -104,9 +114,7 @@ function ChooseProjectCard(props: { visible: boolean; compact?: boolean; busy?: 
   const { visible, compact, busy } = props;
   if (!visible) return null;
 
-  const onPickProject = () => {
-    vscode.postMessage({ cmd: "pickFolder" });
-  };
+  const onPickProject = () => vscode.postMessage({ cmd: "pickFolder" });
 
   return (
     <div
@@ -173,73 +181,26 @@ function App() {
   const [phase, setPhase] = useState<UiPhase>("default");
   const [devUrl, setDevUrl] = useState<string | null>(null);
   const [figmaErr, setFigmaErr] = useState<string | null>(null);
-  const [figmaSrc, setFigmaSrc] = useState<string | null>(null);
-  const [figmaN, setFigmaN] = useState<{ w: number; h: number } | null>(null);
 
-  const [showOverlay, setShowOverlay] = useState(false);
-  const [selected, setSelected] = useState(false);
+  const [nodes, setNodes] = useState<Record<NodeId, NodeState>>({});
+  const [selectedId, setSelectedId] = useState<NodeId | null>(null);
 
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const overlayRef = useRef<HTMLDivElement | null>(null);
-  const selectedRef = useRef(false);
-
-  // ── ref till synliga figma-bilden för pixel-analys
-  const figmaImgRef = useRef<HTMLImageElement | null>(null);
+  const imgRefs = useRef<Record<NodeId, HTMLImageElement | null>>({});
+  const selectedRef = useRef<NodeId | null>(null);
+  useEffect(() => { selectedRef.current = selectedId; }, [selectedId]);
 
   const [containerW, setContainerW] = useState(0);
   const [containerH, setContainerH] = useState(0);
-
-  // chat-höjd
   const [chatH, setChatH] = useState(0);
 
-  type StageRect = { x: number; y: number; w: number; h: number };
-  const [overlayStage, setOverlayStage] = useState<StageRect | null>(null);
-
-  const [deletedState, setDeletedState] = useState<{
-    src: string;
-    n: { w: number; h: number } | null;
-    overlay: StageRect | null;
-  } | null>(null);
-
-  const iconBtnStyle: React.CSSProperties = {
-    width: 40,
-    height: 40,
-    borderRadius: 8,
-    border: "1px solid var(--border)",
-    background: "var(--vscode-editorWidget-background)",
-    display: "grid",
-    placeItems: "center",
-    cursor: "pointer",
-  };
-
-  const refreshAttempts = useRef(0);
-  const dragState = useRef<{
-    mode: "move" | "nw" | "ne" | "se" | "sw" | null;
-    startPt: Vec2;
-    startRect: StageRect;
-  } | null>(null);
+  const [showOverlay, setShowOverlay] = useState(false);
   const spaceHeld = useRef(false);
   const fullViewRequested = useRef(false);
+  const refreshAttempts = useRef<Record<NodeId, number>>({});
 
-  // ── NYTT: hantera seed från extension eller lokal state
-  const pendingSeedRef = useRef<any | null>(null);
-
-  useEffect(() => { selectedRef.current = selected; }, [selected]);
-
-  // persist
-  useEffect(() => {
-    const st = vscode.getState?.() || {};
-    // Återställ inte overlay direkt. Parkera som seed så vi kan normalisera när figmaN finns.
-    if (st.overlayStage) {
-      pendingSeedRef.current = { overlayStage: st.overlayStage, imageNatural: st.imageNatural };
-    }
-    if (st.showOverlay) setShowOverlay(!!st.showOverlay);
-    if (st.fullViewRequested) fullViewRequested.current = true;
-  }, []);
-  const persistState = useCallback((extra?: Record<string, any>) => {
-    const current = { overlayStage, showOverlay, fullViewRequested: fullViewRequested.current, imageNatural: figmaN, ...extra };
-    try { vscode.setState?.(current); } catch {}
-  }, [overlayStage, showOverlay, figmaN]);
+  // Seeds som kom före naturliga mått
+  const pendingSeeds = useRef<Record<NodeId, any>>({});
 
   // editorstorlek: reservera plats för chatten
   useLayoutEffect(() => {
@@ -249,7 +210,7 @@ function App() {
       if (!e) return;
       const w = Math.max(0, e.contentRect.width - CANVAS_MARGIN * 2);
       const hRaw = Math.max(0, e.contentRect.height - CANVAS_MARGIN * 2);
-      const reserved = chatH > 0 ? chatH + BOTTOM_GAP : 96; // fallback innan chatten mätts
+      const reserved = chatH > 0 ? chatH + BOTTOM_GAP : 96;
       const h = Math.max(0, hRaw - reserved);
       setContainerW(w);
       setContainerH(h);
@@ -261,103 +222,48 @@ function App() {
   // inkommande meddelanden
   const sentReadyRef = useRef(false);
 
-  const overlayAR = useMemo(() => {
-    if (!figmaN) return PROJECT_BASE.w / PROJECT_BASE.h;
-    const ar = figmaN.w / figmaN.h;
+  const current = selectedId ? nodes[selectedId] || null : null;
+  const currentAR = useMemo(() => {
+    if (!current?.imgN) return PROJECT_BASE.w / PROJECT_BASE.h;
+    const ar = current.imgN.w / current.imgN.h;
     return ar > 0 ? ar : PROJECT_BASE.w / PROJECT_BASE.h;
-  }, [figmaN]);
+  }, [current?.imgN]);
 
-  const clampOverlayToStage = useCallback((r: { x: number; y: number; w: number; h: number }) => {
-    const minOverlay = {
-      w: PROJECT_BASE.w * OVERLAY_MIN_FACTOR,
-      h: PROJECT_BASE.h * OVERLAY_MIN_FACTOR,
-    };
-    let w = clamp(r.w, minOverlay.w, PROJECT_BASE.w);
-    let h = w / overlayAR;
-    if (h > PROJECT_BASE.h) { h = PROJECT_BASE.h; w = h * overlayAR; }
+  const clampOverlayToStage = useCallback((r: Rect, ar: number) => {
+    const minW = PROJECT_BASE.w * 0.15;
+    let w = clamp(r.w, minW, PROJECT_BASE.w);
+    let h = w / ar;
+    if (h > PROJECT_BASE.h) { h = PROJECT_BASE.h; w = h * ar; }
     let x = clamp(r.x, 0, PROJECT_BASE.w - w);
     let y = clamp(r.y, 0, PROJECT_BASE.h - h);
     return { x: round(x), y: round(y), w: round(w), h: round(h) };
-  }, [overlayAR]);
+  }, []);
 
-  const applySeed = useCallback((p: any) => {
-    if (!p?.overlayStage) return;
-    let rect = { ...p.overlayStage };
-    // Skala seed ifall tidigare naturliga mått finns
-    if (p.imageNatural && figmaN && p.imageNatural.w && p.imageNatural.h) {
-      const sx = figmaN.w / p.imageNatural.w;
-      const sy = figmaN.h / p.imageNatural.h;
-      const s = (isFinite(sx) && isFinite(sy)) ? (sx + sy) / 2 : 1;
-      rect = {
-        x: round(rect.x * s),
-        y: round(rect.y * s),
-        w: round(rect.w * s),
-        h: round(rect.h * s),
-      };
+  const requestFullViewIfNeeded = useCallback(() => {
+    if (!fullViewRequested.current) {
+      vscode.postMessage({ cmd: "enterFullView" });
+      fullViewRequested.current = true;
     }
-    // Snäpp till aktuell bild-AR och clamp:a
-    const targetH = rect.w / overlayAR;
-    rect = withCenterResize(rect, rect.w, targetH);
-    const clamped = clampOverlayToStage(rect);
+  }, []);
 
-    setOverlayStage(clamped);
-    setShowOverlay(false);
-    setSelected(false);
-    persistState({ overlayStage: clamped, showOverlay: false });
-  }, [figmaN, overlayAR, clampOverlayToStage, persistState]);
+  // persist bara små UI-flaggor
+  const persistState = useCallback((extra?: Record<string, any>) => {
+    const currentState = {
+      showOverlay,
+      fullViewRequested: fullViewRequested.current,
+      selectedId,
+      ...extra,
+    };
+    try { vscode.setState?.(currentState); } catch {}
+  }, [showOverlay, selectedId]);
 
+  // Återställ små UI-flaggor
   useEffect(() => {
-    function onMsg(ev: MessageEvent) {
-      const raw: any = ev.data;
-      if (!raw || typeof raw !== "object") return;
-
-      const safe: any = { ...raw };
-      if (safe.token) safe.token = maskToken(safe.token);
-      if (safe.figmaToken) safe.figmaToken = maskToken(safe.figmaToken);
-
-      const msg = raw as IncomingMsg;
-
-      if (msg.type === "seed-placement" && msg.payload) {
-        if (figmaN) applySeed(msg.payload);
-        else pendingSeedRef.current = msg.payload;
-        return;
-      }
-
-      if (msg.type === "devurl") { setDevUrl(msg.url); return; }
-
-      if (msg.type === "ui-phase") {
-        setPhase(msg.phase);
-        if (msg.phase === "onboarding") {
-          setDevUrl(null);
-          setFigmaSrc(null);
-          setFigmaErr(null);
-          setFigmaN(null);
-          setOverlayStage(null);
-          setSelected(false);
-          setShowOverlay(false);
-          persistState({ overlayStage: null, showOverlay: false, imageNatural: null });
-        }
-        return;
-      }
-
-      if (msg.type === "figma-image-url" && typeof msg.url === "string") { setFigmaSrc(msg.url); setFigmaErr(null); return; }
-      if (msg.type === "ui-error") { setFigmaErr(msg.message || "Okänt fel vid hämtning av Figma-bild."); setFigmaSrc(null); return; }
-
-      if (msg.type === "init") {
-        setFigmaSrc(null); setFigmaErr(null); setFigmaN(null);
-        setOverlayStage(null); setSelected(false); setShowOverlay(false);
-        persistState({ overlayStage: null, showOverlay: false, imageNatural: null });
-        refreshAttempts.current = 0;
-        return;
-      }
-    }
-    window.addEventListener("message", onMsg);
-    if (!sentReadyRef.current) {
-      vscode.postMessage({ type: "ready" });
-      sentReadyRef.current = true;
-    }
-    return () => window.removeEventListener("message", onMsg);
-  }, [applySeed, persistState, figmaN]);
+    const st = vscode.getState?.() || {};
+    if (st.showOverlay) setShowOverlay(!!st.showOverlay);
+    if (st.fullViewRequested) fullViewRequested.current = true;
+    if (typeof st.selectedId === "string") setSelectedId(st.selectedId);
+  }, []);
 
   // stage-dimensioner
   const stageDims = useMemo(() => {
@@ -370,249 +276,315 @@ function App() {
     return { w, h, left, top, scale };
   }, [containerW, containerH]);
 
-  // init overlay när bild finns (om vi inte fått seed)
+  // Auto-onboarding accept
+  const [requestedProjectOnce, setRequestedProjectOnce] = useState(false);
   useEffect(() => {
-    if (figmaSrc && figmaN && !overlayStage && !pendingSeedRef.current) {
-      const availW = PROJECT_BASE.w * 0.9;
-      const availH = PROJECT_BASE.h * 0.9;
-      const fitted = arFit(availW, availH, overlayAR);
-      const w = round(fitted.w);
-      const h = round(fitted.h);
-      const x = round((PROJECT_BASE.w - w) / 2);
-      const y = round((PROJECT_BASE.h - h) / 2);
-      const rect: { x: number; y: number; w: number; h: number } = { x, y, w, h };
-      setOverlayStage(rect);
-      setShowOverlay(false);
-      setSelected(false);
-      persistState({ overlayStage: rect, showOverlay: false });
-    }
-  }, [figmaSrc, figmaN, overlayAR, overlayStage, persistState]);
+    const t = setTimeout(() => {
+      if (!requestedProjectOnce && !devUrl && phase === "onboarding") {
+        vscode.postMessage({ cmd: "acceptCandidate" });
+        setRequestedProjectOnce(true);
+      }
+    }, 600);
+    return () => clearTimeout(t);
+  }, [devUrl, phase, requestedProjectOnce]);
 
-  // applicera seed när naturliga mått finns
+  // Meddelanden
   useEffect(() => {
-    if (figmaN && pendingSeedRef.current) {
-      applySeed(pendingSeedRef.current);
-      pendingSeedRef.current = null;
-    }
-  }, [figmaN, applySeed]);
+    function onMsg(ev: MessageEvent) {
+      const msg = ev.data as IncomingMsg;
+      if (!msg || typeof msg !== "object") return;
 
-  // säkerställ korrekt AR direkt när figmaN blir känd
-  useEffect(() => {
-    if (!figmaN || !overlayStage) return;
-    const expectedH = round(overlayStage.w / overlayAR);
-    if (Math.abs(expectedH - overlayStage.h) > 1) {
-      const fixed = clampOverlayToStage(withCenterResize(overlayStage, overlayStage.w, expectedH));
-      setOverlayStage(fixed);
-      persistState({ overlayStage: fixed });
-    }
-  }, [figmaN, overlayAR, overlayStage, clampOverlayToStage, persistState]);
+      if (msg.type === "devurl") { setDevUrl(msg.url); return; }
 
-  // onload/onerror
-  const onFigmaLoad = useCallback((ev: React.SyntheticEvent<HTMLImageElement>) => {
+      if (msg.type === "ui-phase") {
+        setPhase(msg.phase);
+        if (msg.phase === "onboarding") {
+          setDevUrl(null);
+          setFigmaErr(null);
+          setNodes({});
+          setSelectedId(null);
+          setShowOverlay(false);
+          persistState({ showOverlay: false, selectedId: null });
+        }
+        return;
+      }
+
+      if (msg.type === "add-node") {
+        const id = idOf(msg.fileKey, msg.nodeId);
+        setNodes(s => s[id] ? s : ({
+          ...s,
+          [id]: {
+            fileKey: msg.fileKey,
+            nodeId: msg.nodeId,
+            imgSrc: null,
+            imgN: null,
+            rect: null,
+            deleted: false,
+          }
+        }));
+        setSelectedId(id);
+        return;
+      }
+
+      if (msg.type === "figma-image-url") {
+        const id = idOf(msg.fileKey, msg.nodeId);
+        setNodes(s => ({
+          ...s,
+          [id]: { ...(s[id] || { fileKey: msg.fileKey, nodeId: msg.nodeId, imgN: null, rect: null, deleted: false }), imgSrc: msg.url }
+        }));
+        setFigmaErr(null);
+        return;
+      }
+
+      if (msg.type === "seed-placement" && msg.payload) {
+        const id = idOf(msg.fileKey, msg.nodeId);
+        pendingSeeds.current[id] = msg.payload;
+        // Om naturliga mått redan finns så applicera direkt
+        setNodes(s => {
+          const ns = s[id];
+          if (!ns?.imgN) return s;
+          const p = pendingSeeds.current[id];
+          if (!p?.overlayStage) return s;
+          let rect = { ...p.overlayStage };
+          // Justera mot aktuell bild-AR
+          const ar = ns.imgN.w / ns.imgN.h;
+          rect = withCenterResize(rect, rect.w, rect.w / ar);
+          const clamped = clampOverlayToStage(rect, ar);
+          delete pendingSeeds.current[id];
+          return { ...s, [id]: { ...ns, rect: clamped } };
+        });
+        return;
+      }
+
+      if (msg.type === "ui-error") { setFigmaErr(msg.message || "Okänt fel."); return; }
+    }
+
+    window.addEventListener("message", onMsg);
+    if (!sentReadyRef.current) {
+      vscode.postMessage({ type: "ready" });
+      sentReadyRef.current = true;
+    }
+    return () => window.removeEventListener("message", onMsg);
+  }, [clampOverlayToStage, persistState]);
+
+  // Bild onload per nod
+  const onLoadFor = useCallback((id: NodeId) => (ev: React.SyntheticEvent<HTMLImageElement>) => {
     const el = ev.currentTarget;
     const natural = { w: el.naturalWidth || el.width, h: el.naturalHeight || el.height };
-    setFigmaN(natural);
-    persistState({ imageNatural: natural });
-  }, [persistState]);
-  const onFigmaError = useCallback(() => {
-    const attempt = refreshAttempts.current + 1;
-    if (attempt <= 3) {
-      refreshAttempts.current = attempt;
-      const delay = 500 * Math.pow(2, attempt - 1);
-      setFigmaErr(`Förlorad åtkomst till Figma-bilden. Försök ${attempt}/3…`);
-      setTimeout(() => vscode.postMessage({ cmd: "refreshFigmaImage" }), delay);
+    setNodes(s => {
+      const ns = s[id]; if (!ns) return s;
+      let rect = ns.rect;
+      if (!rect) {
+        const availW = PROJECT_BASE.w * 0.9;
+        const availH = PROJECT_BASE.h * 0.9;
+        const ar = natural.w / natural.h;
+        const fitted = arFit(availW, availH, ar);
+        const w = round(Math.min(fitted.w, PROJECT_BASE.w));
+        const h = round(Math.min(fitted.h, PROJECT_BASE.h));
+        rect = { x: round((PROJECT_BASE.w - w) / 2), y: round((PROJECT_BASE.h - h) / 2), w, h };
+      }
+      return { ...s, [id]: { ...ns, imgN: natural, rect } };
+    });
+
+    // Seed som väntat
+    const p = pendingSeeds.current[id];
+    if (p?.overlayStage) {
+      setNodes(s => {
+        const ns = s[id]; if (!ns?.imgN) return s;
+        let rect = { ...p.overlayStage };
+        const ar = ns.imgN.w / ns.imgN.h;
+        rect = withCenterResize(rect, rect.w, rect.w / ar);
+        const clamped = clampOverlayToStage(rect, ar);
+        delete pendingSeeds.current[id];
+        return { ...s, [id]: { ...ns, rect: clamped } };
+      });
+    }
+  }, [clampOverlayToStage]);
+
+  const onErrorFor = useCallback((id: NodeId) => () => {
+    const att = (refreshAttempts.current[id] || 0) + 1;
+    refreshAttempts.current[id] = att;
+    if (att <= 3) {
+      const delay = 500 * Math.pow(2, att - 1);
+      setFigmaErr(`Kunde inte ladda bild (${att}/3)…`);
+      setTimeout(() => {
+        const ns = nodes[id];
+        if (ns) vscode.postMessage({ cmd: "refreshFigmaImage", nodeId: ns.nodeId });
+      }, delay);
     } else {
-      setFigmaErr("Kunde inte ladda Figma-bilden efter flera försök. Kontrollera token/åtkomst.");
+      setFigmaErr("Kunde inte ladda Figma-bilden efter flera försök.");
     }
-  }, []);
+  }, [nodes]);
 
-  // full view
-  const requestFullViewIfNeeded = useCallback(() => {
-    if (!fullViewRequested.current) {
-      vscode.postMessage({ cmd: "enterFullView" });
-      fullViewRequested.current = true;
-      persistState();
-    }
-  }, [persistState]);
-
-  // start/stop interaktion
-  const beginInteraction = useCallback((e?: React.PointerEvent) => {
-    requestFullViewIfNeeded();
-    setSelected(true);
-    setShowOverlay(true);
-    persistState({ showOverlay: true });
-    if (e) (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
-    document.body.classList.add("dragging");
-    const end = () => {
-      dragState.current = null;
-      document.body.classList.remove("dragging");
-      if (!spaceHeld.current && !selectedRef.current) {
-        setTimeout(() => { setShowOverlay(false); persistState({ showOverlay: false }); }, 80);
-      }
-      if (overlayStage && figmaN) {
-        const img = figmaImgRef.current || undefined;
-        const contentPx = img ? computeContentBoundsPx(img) : null;
-
-        const arImg = figmaN.w / figmaN.h;
-        const arOverlay = overlayStage.w / overlayStage.h;
-        const arDeltaPct = Math.abs(arOverlay - arImg) / arImg;
-
-        const norm = normRect(overlayStage);
-        const edges = nearEdges(norm);
-        const center = { x: norm.x + norm.w / 2, y: norm.y + norm.h / 2 };
-        const sizePct = norm.w * norm.h;
-
-        let contentInProject: Rect | null = null;
-        if (contentPx) {
-          const sx = figmaN.w / overlayStage.w;
-          const sy = figmaN.h / overlayStage.h;
-          contentInProject = {
-            x: overlayStage.x + contentPx.x / sx,
-            y: overlayStage.y + contentPx.y / sy,
-            w: contentPx.w / sx,
-            h: contentPx.h / sy,
-          };
-        }
-
-        const payload = {
-          projectBase: { ...PROJECT_BASE },
-          overlayStage: { ...overlayStage },
-          imageNatural: { ...figmaN },
-          norm, center, sizePct,
-          ar: { image: arImg, overlay: arOverlay, deltaPct: arDeltaPct },
-          edges,
-          content: contentPx ? {
-            px: contentPx,
-            project: contentInProject!,
-            norm: contentInProject ? normRect(contentInProject) : null,
-          } : null,
-          ts: Date.now(),
-          source: "webview/main.tsx",
-        };
-        vscode.postMessage({ type: "placementAccepted", payload });
-      }
-    };
-    window.addEventListener("pointerup", end, { once: true });
-    window.addEventListener("pointercancel", end, { once: true });
-  }, [overlayStage, figmaN, persistState, requestFullViewIfNeeded]);
-
-  // klick utanför → avmarkera och dölj UI
+  // Klick utanför överlays → avmarkera
   useEffect(() => {
     function onGlobalPointerDown(e: PointerEvent) {
-      const inside = overlayRef.current?.contains(e.target as Node) ?? false;
-      if (!inside) {
-        setSelected(false);
+      const el = e.target as Element | null;
+      const keep = !!el?.closest?.('[data-overlay="1"],[data-keep-selection="1"]');
+      if (!keep) {
+        setSelectedId(null);
         setShowOverlay(false);
-        persistState({ showOverlay: false });
+        persistState({ showOverlay: false, selectedId: null });
       }
     }
     window.addEventListener("pointerdown", onGlobalPointerDown, { capture: true });
     return () => window.removeEventListener("pointerdown", onGlobalPointerDown, { capture: true } as any);
   }, [persistState]);
 
-  const handleDelete = useCallback(() => {
-    if (!figmaSrc) return;
-    setDeletedState({ src: figmaSrc, n: figmaN, overlay: overlayStage });
-    setFigmaSrc(null);
-    setFigmaN(null);
-    setOverlayStage(null);
-    setSelected(false);
-    setShowOverlay(false);
-    persistState({ overlayStage: null, imageNatural: null, showOverlay: false });
-  }, [figmaSrc, figmaN, overlayStage, persistState]);
+  // Drag/resize-state
+  const dragState = useRef<{
+    id: NodeId;
+    mode: "move" | "nw" | "ne" | "se" | "sw" | null;
+    startPt: Vec2;
+    startRect: StageRect;
+  } | null>(null);
 
-  const handleUndo = useCallback(() => {
-    if (!deletedState) return;
-    setFigmaSrc(deletedState.src);
-    setFigmaN(deletedState.n);
-    setOverlayStage(deletedState.overlay);
-    setDeletedState(null);
-    persistState({ overlayStage: deletedState.overlay, imageNatural: deletedState.n });
-  }, [deletedState, persistState]);
+  const beginInteraction = useCallback((id: NodeId, e?: React.PointerEvent) => {
+    requestFullViewIfNeeded();
+    setSelectedId(id);
+    setShowOverlay(true);
+    persistState({ showOverlay: true, selectedId: id });
+    if (e) (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+    document.body.classList.add("dragging");
 
-  // flytt
-  const onOverlayPointerDown = useCallback((e: React.PointerEvent) => {
-    if (!overlayStage) return;
-    beginInteraction(e);
-    dragState.current = {
-      mode: "move",
-      startPt: { x: e.clientX, y: e.clientY },
-      startRect: { ...overlayStage },
+    const end = () => {
+      dragState.current = null;
+      document.body.classList.remove("dragging");
+      if (!spaceHeld.current && !selectedRef.current) {
+        setTimeout(() => { setShowOverlay(false); persistState({ showOverlay: false }); }, 80);
+      }
+
+      const ns = selectedRef.current ? nodes[selectedRef.current] : null;
+      if (!ns || !ns.rect || !ns.imgN || ns.deleted) return;
+
+      const imgEl = selectedRef.current ? imgRefs.current[selectedRef.current] : null;
+      const contentPx = imgEl ? computeContentBoundsPx(imgEl) : null;
+
+      const arImg = ns.imgN.w / ns.imgN.h;
+      const arOverlay = ns.rect.w / ns.rect.h;
+      const arDeltaPct = Math.abs(arOverlay - arImg) / arImg;
+
+      const norm = normRect(ns.rect);
+      const edges = nearEdges(norm);
+      const center = { x: norm.x + norm.w / 2, y: norm.y + norm.h / 2 };
+      const sizePct = norm.w * norm.h;
+
+      let contentInProject: Rect | null = null;
+      if (contentPx) {
+        const sx = ns.imgN.w / ns.rect.w;
+        const sy = ns.imgN.h / ns.rect.h;
+        contentInProject = {
+          x: ns.rect.x + contentPx.x / sx,
+          y: ns.rect.y + contentPx.y / sy,
+          w: contentPx.w / sx,
+          h: contentPx.h / sy,
+        };
+      }
+
+      const payload = {
+        projectBase: { ...PROJECT_BASE },
+        overlayStage: { ...ns.rect },
+        imageNatural: { ...ns.imgN },
+        norm, center, sizePct,
+        ar: { image: arImg, overlay: arOverlay, deltaPct: arDeltaPct },
+        edges,
+        content: contentPx ? {
+          px: contentPx,
+          project: contentInProject!,
+          norm: contentInProject ? normRect(contentInProject) : null,
+        } : null,
+        ts: Date.now(),
+        source: "webview/main.tsx",
+      };
+      vscode.postMessage({ type: "placementAccepted", fileKey: ns.fileKey, nodeId: ns.nodeId, payload });
     };
-  }, [overlayStage, beginInteraction]);
+
+    window.addEventListener("pointerup", end, { once: true });
+    window.addEventListener("pointercancel", end, { once: true });
+  }, [nodes, persistState, requestFullViewIfNeeded]);
+
+  // Flytt/resize handlers
+  const onOverlayPointerDown = useCallback((id: NodeId) => (e: React.PointerEvent) => {
+    const ns = nodes[id];
+    if (!ns?.rect || ns.deleted) return;
+    beginInteraction(id, e);
+    dragState.current = { id, mode: "move", startPt: { x: e.clientX, y: e.clientY }, startRect: { ...ns.rect } };
+  }, [nodes, beginInteraction]);
 
   const onOverlayPointerMove = useCallback((e: React.PointerEvent) => {
     const st = dragState.current;
-    if (!st || !overlayStage) return;
+    if (!st) return;
+    const ns = nodes[st.id];
+    if (!ns?.rect || !ns.imgN || ns.deleted) return;
+
     const dxPx = e.clientX - st.startPt.x;
     const dyPx = e.clientY - st.startPt.y;
     const dx = dxPx / stageDims.scale;
     const dy = dyPx / stageDims.scale;
 
+    const ar = ns.imgN.w / ns.imgN.h;
+
     if (st.mode === "move") {
-      const next = clampOverlayToStage({
-        ...st.startRect,
-        x: st.startRect.x + dx,
-        y: st.startRect.y + dy,
-        w: st.startRect.w,
-        h: st.startRect.h,
-      });
-      setOverlayStage(next);
-      persistState({ overlayStage: next });
+      const next = clampOverlayToStage(
+        { ...st.startRect, x: st.startRect.x + dx, y: st.startRect.y + dy },
+        ar
+      );
+      setNodes(s => ({ ...s, [st.id]: { ...ns, rect: next } }));
     } else {
       let { x, y, w, h } = st.startRect;
       if (st.mode === "nw") {
-        const newW = st.startRect.w - dx; const newH = newW / overlayAR;
-        const fitted = clampOverlayToStage({ x, y, w: newW, h: newH }); w = fitted.w; h = fitted.h;
+        const newW = st.startRect.w - dx; const newH = newW / ar;
+        const fitted = clampOverlayToStage({ x, y, w: newW, h: newH }, ar); w = fitted.w; h = fitted.h;
         x = st.startRect.x + (st.startRect.w - w);
         y = st.startRect.y + (st.startRect.h - h);
       } else if (st.mode === "ne") {
-        const newW = st.startRect.w + dx; const newH = newW / overlayAR;
-        const fitted = clampOverlayToStage({ x, y, w: newW, h: newH }); w = fitted.w; h = fitted.h;
+        const newW = st.startRect.w + dx; const newH = newW / ar;
+        const fitted = clampOverlayToStage({ x, y, w: newW, h: newH }, ar); w = fitted.w; h = fitted.h;
         x = st.startRect.x;
         y = st.startRect.y + (st.startRect.h - h);
       } else if (st.mode === "se") {
-        const newW = st.startRect.w + dx; const newH = newW / overlayAR;
-        const fitted = clampOverlayToStage({ x, y, w: newW, h: newH }); w = fitted.w; h = fitted.h;
-        x = st.startRect.x; y = st.startRect.y;
+        const newW = st.startRect.w + dx; const newH = newW / ar;
+        const fitted = clampOverlayToStage({ x, y, w: newW, h: newH }, ar); w = fitted.w; h = fitted.h;
       } else if (st.mode === "sw") {
-        const newW = st.startRect.w - dx; const newH = newW / overlayAR;
-        const fitted = clampOverlayToStage({ x, y, w: newW, h: newH }); w = fitted.w; h = fitted.h;
+        const newW = st.startRect.w - dx; const newH = newW / ar;
+        const fitted = clampOverlayToStage({ x, y, w: newW, h: newH }, ar); w = fitted.w; h = fitted.h;
         x = st.startRect.x + (st.startRect.w - w);
-        y = st.startRect.y;
       }
-      const next = clampOverlayToStage({ x, y, w, h });
-      setOverlayStage(next);
-      persistState({ overlayStage: next });
+      const next = clampOverlayToStage({ x, y, w, h }, ar);
+      setNodes(s => ({ ...s, [st.id]: { ...ns, rect: next } }));
     }
-  }, [overlayStage, stageDims.scale, overlayAR, clampOverlayToStage, persistState]);
+  }, [nodes, stageDims.scale, clampOverlayToStage]);
 
-  // resize-handle start
-  const startResize = (mode: "nw" | "ne" | "se" | "sw") => (e: React.PointerEvent) => {
-    if (!overlayStage) return;
-    e.stopPropagation();
-    beginInteraction(e);
-    dragState.current = { mode, startPt: { x: e.clientX, y: e.clientY }, startRect: { ...overlayStage } };
-  };
+  const startResize = useCallback((id: NodeId, mode: "nw" | "ne" | "se" | "sw") =>
+    (e: React.PointerEvent) => {
+      const ns = nodes[id];
+      if (!ns?.rect || ns.deleted) return;
+      e.stopPropagation();
+      beginInteraction(id, e);
+      dragState.current = { id, mode, startPt: { x: e.clientX, y: e.clientY }, startRect: { ...ns.rect } };
+    }, [nodes, beginInteraction]);
 
-  // wheel = resize runt centrum (endast när valt)
+  // wheel = resize runt centrum
   const onWheel = useCallback((e: React.WheelEvent) => {
-    if (!overlayStage || !selected) return;
+    const id = selectedId; if (!id) return;
+    const ns = nodes[id]; if (!ns?.rect || !ns.imgN || ns.deleted) return;
     if (!(e.ctrlKey || e.metaKey)) return;
     e.preventDefault();
     const factor = e.deltaY > 0 ? 0.98 : 1.02;
-    const newW = overlayStage.w * factor;
-    const newH = newW / overlayAR;
-    const sized = clampOverlayToStage(withCenterResize(overlayStage, newW, newH));
-    setOverlayStage(sized);
-    persistState({ overlayStage: sized, showOverlay: true });
+    const ar = ns.imgN.w / ns.imgN.h;
+    const newW = ns.rect.w * factor;
+    const newH = newW / ar;
+    const sized = clampOverlayToStage(withCenterResize(ns.rect, newW, newH), ar);
+    setNodes(s => ({ ...s, [id]: { ...ns, rect: sized } }));
     setShowOverlay(true);
-  }, [overlayStage, overlayAR, selected, clampOverlayToStage, persistState]);
+    persistState({ showOverlay: true });
+  }, [nodes, selectedId, clampOverlayToStage, persistState]);
 
-  // tangentbord endast när valt
+  // tangentbord när valt
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      if (!overlayStage || !selected) return;
+      const id = selectedId; if (!id) return;
+      const ns = nodes[id]; if (!ns?.rect || !ns.imgN || ns.deleted) return;
 
       if (e.code === "Space" && !e.repeat) {
         spaceHeld.current = true;
@@ -624,8 +596,9 @@ function App() {
 
       const step = e.shiftKey ? 10 : 1;
       let changed = false;
-      let next: { x: number; y: number; w: number; h: number } = { ...overlayStage };
+      let next: Rect = { ...ns.rect };
       const isMeta = e.ctrlKey || e.metaKey;
+      const ar = ns.imgN.w / ns.imgN.h;
 
       if (!isMeta) {
         if (e.key === "ArrowLeft")  { next.x -= step; changed = true; }
@@ -634,18 +607,16 @@ function App() {
         if (e.key === "ArrowDown")  { next.y += step; changed = true; }
       } else {
         if (e.key === "ArrowRight" || e.key === "ArrowDown") {
-          const factor = 1 + (e.shiftKey ? 0.05 : 0.02);
-          const newW = next.w * factor; const newH = newW / overlayAR;
-          next = withCenterResize(next, newW, newH); changed = true;
+          const f = 1 + (e.shiftKey ? 0.05 : 0.02);
+          next = withCenterResize(next, next.w * f, next.w * f / ar); changed = true;
         } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
-          const factor = 1 - (e.shiftKey ? 0.05 : 0.02);
-          const newW = next.w * factor; const newH = newW / overlayAR;
-          next = withCenterResize(next, newW, newH); changed = true;
+          const f = 1 - (e.shiftKey ? 0.05 : 0.02);
+          next = withCenterResize(next, next.w * f, next.w * f / ar); changed = true;
         }
       }
 
       if (e.key === "r" || e.key === "R") {
-        const fitted = arFit(PROJECT_BASE.w, PROJECT_BASE.h, overlayAR);
+        const fitted = arFit(PROJECT_BASE.w, PROJECT_BASE.h, ar);
         const w = round(Math.min(fitted.w, PROJECT_BASE.w));
         const h = round(Math.min(fitted.h, PROJECT_BASE.h));
         next = { w, h, x: round((PROJECT_BASE.w - w) / 2), y: round((PROJECT_BASE.h - h) / 2) };
@@ -656,9 +627,8 @@ function App() {
       }
 
       if (changed) {
-        next = clampOverlayToStage(next);
-        setOverlayStage(next);
-        persistState({ overlayStage: next });
+        next = clampOverlayToStage(next, ar);
+        setNodes(s => ({ ...s, [id]: { ...ns, rect: next } }));
         setShowOverlay(true);
         e.preventDefault();
       }
@@ -679,22 +649,27 @@ function App() {
       window.removeEventListener("keydown", onKeyDown, { capture: true } as any);
       window.removeEventListener("keyup", onKeyUp, { capture: true } as any);
     };
-  }, [overlayStage, overlayAR, selected, clampOverlayToStage, persistState]);
+  }, [nodes, selectedId, clampOverlayToStage, persistState]);
 
-  // auto-onboarding
-  const [requestedProjectOnce, setRequestedProjectOnce] = useState(false);
-  useEffect(() => {
-    const t = setTimeout(() => {
-      if (!requestedProjectOnce && !devUrl && !figmaSrc && phase === "onboarding") {
-        vscode.postMessage({ cmd: "acceptCandidate" });
-        setRequestedProjectOnce(true);
-      }
-    }, 600);
-    return () => clearTimeout(t);
-  }, [devUrl, figmaSrc, phase, requestedProjectOnce]);
+  // Delete/Undo
+  const handleDelete = useCallback(() => {
+    const id = selectedId; if (!id) return;
+    const ns = nodes[id]; if (!ns?.rect || ns.deleted) return;
+    setNodes(s => ({ ...s, [id]: { ...ns, deleted: true } }));
+    setShowOverlay(false);
+    persistState({ showOverlay: false });
+  }, [nodes, selectedId, persistState]);
 
-  const showChooseCard = !devUrl && !figmaSrc && phase === "onboarding";
-  const rootPadding = (!devUrl && !figmaSrc) ? CANVAS_MARGIN : 0;
+  const handleUndo = useCallback(() => {
+    const id = selectedId; if (!id) return;
+    const ns = nodes[id]; if (!ns) return;
+    setNodes(s => ({ ...s, [id]: { ...ns, deleted: false } }));
+  }, [nodes, selectedId]);
+
+  const showChooseCard = phase === "onboarding" && !devUrl;
+  const rootPadding = (!devUrl) ? CANVAS_MARGIN : 0;
+  const actionBtnBaseLeft = stageDims.left + rootPadding + stageDims.w - 36;
+  const actionBtnBaseTop  = stageDims.top  + rootPadding + stageDims.h + 8;
 
   return (
     <div
@@ -750,105 +725,125 @@ function App() {
           </div>
         )}
 
-        {/* Figma-fönster */}
-        {/* 1) Dold probe för naturliga mått */}
-        {figmaSrc && !figmaN && (
-          <img
-            src={figmaSrc}
-            alt=""
-            crossOrigin="anonymous"
-            onLoad={onFigmaLoad}
-            onError={onFigmaError}
-            style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
-          />
-        )}
-
-        {/* 2) Interaktiv overlay */}
-        {figmaSrc && overlayStage && (
-          <div
-            ref={overlayRef}
-            onPointerDown={onOverlayPointerDown}
-            onPointerMove={onOverlayPointerMove}
-            style={{
-              position: "absolute",
-              left: round(overlayStage.x * stageDims.scale),
-              top: round(overlayStage.y * stageDims.scale),
-              width: round(overlayStage.w * stageDims.scale),
-              height: round(overlayStage.h * stageDims.scale),
-              zIndex: 20,
-              cursor: "move",
-              background: "transparent",
-              borderRadius: 10,
-              boxShadow: selected ? "0 0 0 2px rgba(0,0,0,.06), 0 2px 10px rgba(0,0,0,.25)" : "none",
-              overflow: "visible",
-            }}
-          >
-            {/* Klipp endast innehållet/bilden */}
-            <div style={{ position: "absolute", inset: 0, borderRadius: 10, overflow: "hidden" }}>
-              <img
-                ref={figmaImgRef}
-                src={figmaSrc}
-                alt="Figma node"
-                crossOrigin="anonymous"
-                draggable={false}
-                onLoad={onFigmaLoad}
-                onError={onFigmaError}
+        {/* Overlays för alla noder */}
+        <div
+          style={{
+            position: "absolute",
+            left: 0, top: 0,
+            width: PROJECT_BASE.w,
+            height: PROJECT_BASE.h,
+            transform: `scale(${stageDims.scale})`,
+            transformOrigin: "top left",
+            pointerEvents: "none", // aktivera lokalt på overlay-lager
+          }}
+        >
+          {Object.entries(nodes).map(([id, ns]) => {
+            if (!ns.imgSrc || !ns.rect || ns.deleted) return null;
+            const isSelected = selectedId === id;
+            const rect = ns.rect;
+            return (
+              <div
+                key={id}
+                data-overlay="1"
+                onPointerDown={onOverlayPointerDown(id)}
+                onPointerMove={onOverlayPointerMove}
                 style={{
-                  width: "100%",
-                  height: "100%",
-                  display: "block",
-                  objectFit: "contain",
-                  userSelect: "none",
-                  pointerEvents: "none",
+                  position: "absolute",
+                  left: round(rect.x),
+                  top: round(rect.y),
+                  width: round(rect.w),
+                  height: round(rect.h),
+                  zIndex: isSelected ? 30 : 20,
+                  cursor: "move",
+                  background: "transparent",
+                  borderRadius: 10,
+                  boxShadow: isSelected ? "0 0 0 2px rgba(0,0,0,.06), 0 2px 10px rgba(0,0,0,.25)" : "none",
+                  overflow: "visible",
+                  pointerEvents: "auto",
                 }}
-              />
-              {/* Stödraster visas när valt */}
-              {showOverlay && selected && (
-                <div
-                  aria-hidden
-                  style={{
-                    position: "absolute",
-                    inset: 6,
-                    border: "1px dashed color-mix(in srgb, var(--accent) 60%, transparent)",
-                    borderRadius: 8,
-                    pointerEvents: "none",
-                  }}
-                />
-              )}
-            </div>
-
-            {/* Hörnhandtag */}
-            {showOverlay && selected && (
-              <>
-                {(["nw", "ne", "se", "sw"] as const).map((pos) => {
-                  const size = 16;
-                  const base: React.CSSProperties = {
-                    position: "absolute",
-                    width: size, height: size,
-                    background: "var(--accent)",
-                    borderRadius: 999,
-                    boxShadow: "0 1px 4px rgba(0,0,0,.35)",
-                    pointerEvents: "auto",
-                  };
-                  const styleMap: Record<typeof pos, React.CSSProperties> = {
-                    nw: { ...base, left: 0, top: 0, transform: "translate(-50%,-50%)", cursor: "nwse-resize" },
-                    ne: { ...base, right: 0, top: 0, transform: "translate(50%,-50%)", cursor: "nesw-resize" },
-                    se: { ...base, right: 0, bottom: 0, transform: "translate(50%,50%)", cursor: "nwse-resize" },
-                    sw: { ...base, left: 0, bottom: 0, transform: "translate(-50%,50%)", cursor: "nesw-resize" },
-                  };
-                  return (
+              >
+                <div style={{ position: "absolute", inset: 0, borderRadius: 10, overflow: "hidden" }}>
+                  <img
+                    ref={(el) => { imgRefs.current[id] = el; }}
+                    src={ns.imgSrc}
+                    alt="Figma node"
+                    crossOrigin="anonymous"
+                    draggable={false}
+                    onLoad={onLoadFor(id)}
+                    onError={onErrorFor(id)}
+                    style={{
+                      width: "100%",
+                      height: "100%",
+                      display: "block",
+                      objectFit: "contain",
+                      userSelect: "none",
+                      pointerEvents: "none",
+                    }}
+                  />
+                  {showOverlay && isSelected && (
                     <div
-                      key={pos}
-                      onPointerDown={startResize(pos)}
-                      onPointerMove={onOverlayPointerMove}
-                      style={styleMap[pos]}
+                      aria-hidden
+                      style={{
+                        position: "absolute",
+                        inset: 6,
+                        border: "1px dashed color-mix(in srgb, var(--accent) 60%, transparent)",
+                        borderRadius: 8,
+                        pointerEvents: "none",
+                      }}
                     />
-                  );
-                })}
-              </>
-            )}
-          </div>
-        )}
+                  )}
+                </div>
+
+                {/* Hörnhandtag */}
+                {showOverlay && isSelected && (
+                  <>
+                    {(["nw", "ne", "se", "sw"] as const).map((pos) => {
+                      const size = 16;
+                      const base: React.CSSProperties = {
+                        position: "absolute",
+                        width: size, height: size,
+                        background: "var(--accent)",
+                        borderRadius: 999,
+                        boxShadow: "0 1px 4px rgba(0,0,0,.35)",
+                        pointerEvents: "auto",
+                      };
+                      const styleMap: Record<typeof pos, React.CSSProperties> = {
+                        nw: { ...base, left: 0, top: 0, transform: "translate(-50%,-50%)", cursor: "nwse-resize" },
+                        ne: { ...base, right: 0, top: 0, transform: "translate(50%,-50%)", cursor: "nesw-resize" },
+                        se: { ...base, right: 0, bottom: 0, transform: "translate(50%,50%)", cursor: "nwse-resize" },
+                        sw: { ...base, left: 0, bottom: 0, transform: "translate(-50%,50%)", cursor: "nesw-resize" },
+                      };
+                      return (
+                        <div
+                          key={pos}
+                          onPointerDown={startResize(id, pos)}
+                          onPointerMove={onOverlayPointerMove}
+                          style={styleMap[pos]}
+                        />
+                      );
+                    })}
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Dolda probes för de noder som saknar imgN */}
+        {Object.entries(nodes).map(([id, ns]) => {
+          if (!ns.imgSrc || ns.imgN) return null;
+          return (
+            <img
+              key={`probe-${id}`}
+              src={ns.imgSrc}
+              alt=""
+              crossOrigin="anonymous"
+              onLoad={onLoadFor(id)}
+              onError={onErrorFor(id)}
+              style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
+            />
+          );
+        })}
       </div>
 
       {/* Onboarding-kort */}
@@ -887,9 +882,12 @@ function App() {
                 <button
                   className="pp-btn"
                   onClick={() => {
-                    refreshAttempts.current = 0;
                     setFigmaErr("Försöker hämta ny bild-URL…");
-                    vscode.postMessage({ cmd: "refreshFigmaImage" });
+                    const id = selectedId;
+                    if (id) {
+                      const ns = nodes[id];
+                      if (ns) vscode.postMessage({ cmd: "refreshFigmaImage", nodeId: ns.nodeId });
+                    }
                   }}
                 >
                   Försök igen
@@ -901,7 +899,7 @@ function App() {
       )}
 
       {/* Placeholder */}
-      {!figmaErr && !figmaSrc && phase !== "onboarding" && (
+      {!figmaErr && phase !== "onboarding" && Object.values(nodes).every(n => !n.imgSrc) && (
         <div
           style={{
             position: "absolute",
@@ -921,89 +919,9 @@ function App() {
             }}
           >
             <div className="text-foreground" style={{ opacity: 0.85 }}>
-              Laddar Figma-bild…
+              Laddar Figma-bilder…
             </div>
           </div>
-        </div>
-      )}
-
-      {/* Delete / Undo-Redo controls */}
-      {figmaSrc && selected && !deletedState && (
-        <div
-          style={{
-            position: "fixed",
-            right: CANVAS_MARGIN,
-            bottom: chatH + BOTTOM_GAP + 8,
-            zIndex: 50,
-          }}
-        >
-          <button onClick={handleDelete} style={iconBtnStyle} aria-label="Delete node">
-            <svg
-              width="20"
-              height="20"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <polyline points="3 6 5 6 21 6" />
-              <path d="M19 6l-1 14H6L5 6" />
-              <path d="M10 11v6" />
-              <path d="M14 11v6" />
-              <path d="M9 6V4h6v2" />
-            </svg>
-          </button>
-        </div>
-      )}
-
-      {deletedState && (
-        <div
-          style={{
-            position: "fixed",
-            right: CANVAS_MARGIN,
-            bottom: chatH + BOTTOM_GAP + 8,
-            zIndex: 50,
-            display: "flex",
-            gap: 8,
-          }}
-        >
-          <button onClick={handleUndo} style={iconBtnStyle} aria-label="Undo delete">
-            <svg
-              width="20"
-              height="20"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M3 7v6h6" />
-              <path d="M3 13c1.5-4 6-8 13-5" />
-            </svg>
-          </button>
-          <button
-            onClick={handleDelete}
-            style={{ ...iconBtnStyle, opacity: 0.5, cursor: "not-allowed" }}
-            aria-label="Redo delete"
-            disabled
-          >
-            <svg
-              width="20"
-              height="20"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M21 13V7h-6" />
-              <path d="M21 7c-1.5-4-6-8-13-5" />
-            </svg>
-          </button>
         </div>
       )}
 
@@ -1016,6 +934,58 @@ function App() {
         placeholder="Skriv ett meddelande…"
         onHeightChange={setChatH}
       />
+
+      {/* Action-knappar: Trash/Undo under previewens nedre högra kant */}
+      {phase === "default" && devUrl && selectedId && (
+        <>
+          {/* Trash visas när vald nod finns och inte “raderad” */}
+          {nodes[selectedId] && !nodes[selectedId].deleted && (
+            <button
+              data-keep-selection="1"
+              onPointerDownCapture={(e) => e.stopPropagation()}
+              aria-label="Ta bort Figma-nod"
+              onClick={handleDelete}
+              style={{
+                position: "absolute",
+                left: Math.max(CANVAS_MARGIN, actionBtnBaseLeft),
+                top: Math.max(CANVAS_MARGIN, actionBtnBaseTop),
+                width: 32, height: 32, borderRadius: 999,
+                border: "1px solid var(--border)",
+                background: "var(--vscode-editorWidget-background)",
+                display: "grid", placeItems: "center",
+                zIndex: 50, cursor: "pointer",
+                boxShadow: "0 4px 10px rgba(0,0,0,.15)",
+              }}
+              title="Ta bort (dölj) vald Figma-nod"
+            >
+              <Trash2 size={18} />
+            </button>
+          )}
+          {/* Undo visas när vald nod är “raderad” */}
+          {nodes[selectedId] && nodes[selectedId].deleted && (
+            <button
+              data-keep-selection="1"
+              onPointerDownCapture={(e) => e.stopPropagation()}
+              aria-label="Ångra borttagning"
+              onClick={handleUndo}
+              style={{
+                position: "absolute",
+                left: Math.max(CANVAS_MARGIN, actionBtnBaseLeft),
+                top: Math.max(CANVAS_MARGIN, actionBtnBaseTop),
+                width: 32, height: 32, borderRadius: 999,
+                border: "1px solid var(--border)",
+                background: "var(--vscode-editorWidget-background)",
+                display: "grid", placeItems: "center",
+                zIndex: 50, cursor: "pointer",
+                boxShadow: "0 4px 10px rgba(0,0,0,.15)",
+              }}
+              title="Ångra borttagning"
+            >
+              <RotateCcw size={18} />
+            </button>
+          )}
+        </>
+      )}
     </div>
   );
 }

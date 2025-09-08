@@ -7,7 +7,9 @@
   "engines": {
     "vscode": "^1.102.0"
   },
-  "categories": ["Other"],
+  "categories": [
+    "Other"
+  ],
   "activationEvents": [
     "onUri"
   ],
@@ -35,9 +37,9 @@
         "title": "AI Figma Codegen: Glöm valt projekt"
       },
       {
-  "command": "ai-figma-codegen.sendPlacement",
-  "title": "AI Figma Codegen: Send Placement to Backend"
-}
+        "command": "ai-figma-codegen.sendPlacement",
+        "title": "AI Figma Codegen: Send Placement to Backend"
+      }
     ],
     "configuration": {
       "title": "AI Figma Codegen",
@@ -82,7 +84,6 @@
           "default": true,
           "description": "Spara senaste placerings-/analysdata i workspaceState."
         }
-
       }
     }
   },
@@ -128,6 +129,7 @@
     "clsx": "^2.1.1",
     "dotenv": "^17.2.0",
     "fast-glob": "^3.3.2",
+    "lucide-react": "^0.542.0",
     "node-fetch": "^3.3.2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
