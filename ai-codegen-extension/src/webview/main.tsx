@@ -1,4 +1,4 @@
-// webview/main.tsx
+// webview/main.tsx 
 // Mål:
 // - 1280×800 stage som skalas i panelen.
 // - Stöd för flera Figma-noder samtidigt.
@@ -184,6 +184,7 @@ function App() {
 
   const [nodes, setNodes] = useState<Record<NodeId, NodeState>>({});
   const [selectedId, setSelectedId] = useState<NodeId | null>(null);
+  const [deletedStack, setDeletedStack] = useState<NodeId[]>([]);
 
   const rootRef = useRef<HTMLDivElement | null>(null);
   const imgRefs = useRef<Record<NodeId, HTMLImageElement | null>>({});
@@ -228,6 +229,19 @@ function App() {
     const ar = current.imgN.w / current.imgN.h;
     return ar > 0 ? ar : PROJECT_BASE.w / PROJECT_BASE.h;
   }, [current?.imgN]);
+
+  // För global "Accept": välj första giltiga nod om ingen vald
+  const firstEligibleId = useMemo(() => {
+    if (selectedId) {
+      const ns = nodes[selectedId];
+      if (ns && ns.rect && ns.imgN && !ns.deleted) return selectedId;
+    }
+    for (const [id, ns] of Object.entries(nodes)) {
+      if (ns && ns.rect && ns.imgN && !ns.deleted) return id as NodeId;
+    }
+    return null;
+  }, [selectedId, nodes]);
+  const canAccept = !!firstEligibleId;
 
   const clampOverlayToStage = useCallback((r: Rect, ar: number) => {
     const minW = PROJECT_BASE.w * 0.15;
@@ -304,6 +318,7 @@ function App() {
           setNodes({});
           setSelectedId(null);
           setShowOverlay(false);
+          setDeletedStack([]); // nollställ historik
           persistState({ showOverlay: false, selectedId: null });
         }
         return;
@@ -656,20 +671,100 @@ function App() {
     const id = selectedId; if (!id) return;
     const ns = nodes[id]; if (!ns?.rect || ns.deleted) return;
     setNodes(s => ({ ...s, [id]: { ...ns, deleted: true } }));
+    setDeletedStack(stk => [id, ...stk]); // push LIFO
     setShowOverlay(false);
     persistState({ showOverlay: false });
   }, [nodes, selectedId, persistState]);
 
-  const handleUndo = useCallback(() => {
+  // Undo endast för vald nod
+  const handleUndoSelected = useCallback(() => {
     const id = selectedId; if (!id) return;
-    const ns = nodes[id]; if (!ns) return;
-    setNodes(s => ({ ...s, [id]: { ...ns, deleted: false } }));
-  }, [nodes, selectedId]);
+    setNodes(s => {
+      const ns = s[id]; if (!ns) return s;
+      return { ...s, [id]: { ...ns, deleted: false } };
+    });
+    setDeletedStack(stk => stk.filter(x => x !== id));
+  }, [selectedId]);
 
-  const showChooseCard = phase === "onboarding" && !devUrl;
+  // Global LIFO-undo
+  const handleUndoTop = useCallback(() => {
+    setDeletedStack(stk => {
+      if (!stk.length) return stk;
+      const [restoreId, ...rest] = stk;
+      setNodes(s => {
+        const ns = s[restoreId]; if (!ns) return s;
+        return { ...s, [restoreId]: { ...ns, deleted: false } };
+      });
+      setSelectedId(restoreId);
+      setShowOverlay(true);
+      persistState({ showOverlay: true, selectedId: restoreId });
+      return rest;
+    });
+  }, [persistState]);
+
+  // Global ACCEPT – bygger och postar placement från vald eller första giltiga nod
+  const handleAccept = useCallback(() => {
+    const id = firstEligibleId; if (!id) return;
+    const ns = nodes[id]; if (!ns?.rect || !ns.imgN || ns.deleted) return;
+
+    const imgEl = imgRefs.current[id] || null;
+    const contentPx = imgEl ? computeContentBoundsPx(imgEl) : null;
+
+    const arImg = ns.imgN.w / ns.imgN.h;
+    const arOverlay = ns.rect.w / ns.rect.h;
+    const arDeltaPct = Math.abs(arOverlay - arImg) / arImg;
+
+    const norm = normRect(ns.rect);
+    const edges = nearEdges(norm);
+    const center = { x: norm.x + norm.w / 2, y: norm.y + norm.h / 2 };
+    const sizePct = norm.w * norm.h;
+
+    let contentInProject: Rect | null = null;
+    if (contentPx) {
+      const sx = ns.imgN.w / ns.rect.w;
+      const sy = ns.imgN.h / ns.rect.h;
+      contentInProject = {
+        x: ns.rect.x + contentPx.x / sx,
+        y: ns.rect.y + contentPx.y / sy,
+        w: contentPx.w / sx,
+        h: contentPx.h / sy,
+      };
+    }
+
+    const payload = {
+      projectBase: { ...PROJECT_BASE },
+      overlayStage: { ...ns.rect },
+      imageNatural: { ...ns.imgN },
+      norm, center, sizePct,
+      ar: { image: arImg, overlay: arOverlay, deltaPct: arDeltaPct },
+      edges,
+      content: contentPx ? {
+        px: contentPx,
+        project: contentInProject!,
+        norm: contentInProject ? normRect(contentInProject) : null,
+      } : null,
+      ts: Date.now(),
+      source: "webview/main.tsx",
+    };
+
+    vscode.postMessage({ type: "placementAccepted", fileKey: ns.fileKey, nodeId: ns.nodeId, payload });
+  }, [firstEligibleId, nodes]);
+
+  // Beräkna pixelpositioner för vald overlay (ankra knappar)
   const rootPadding = (!devUrl) ? CANVAS_MARGIN : 0;
-  const actionBtnBaseLeft = stageDims.left + rootPadding + stageDims.w - 36;
-  const actionBtnBaseTop  = stageDims.top  + rootPadding + stageDims.h + 8;
+  const selRectPx = useMemo(() => {
+    if (!selectedId) return null;
+    const ns = nodes[selectedId];
+    if (!ns?.rect) return null;
+    const s = stageDims.scale;
+    const r = ns.rect;
+    return {
+      left: stageDims.left + rootPadding + r.x * s,
+      top:  stageDims.top  + rootPadding + r.y * s,
+      w:    r.w * s,
+      h:    r.h * s,
+    };
+  }, [selectedId, nodes, stageDims, rootPadding]);
 
   return (
     <div
@@ -847,7 +942,7 @@ function App() {
       </div>
 
       {/* Onboarding-kort */}
-      <ChooseProjectCard visible={showChooseCard} compact={!!devUrl && phase === "default"} busy={phase === "loading"} />
+      <ChooseProjectCard visible={phase === "onboarding" && !devUrl} compact={!!devUrl && phase === "default"} busy={phase === "loading"} />
 
       {/* Figma-fel */}
       {figmaErr && (
@@ -935,11 +1030,11 @@ function App() {
         onHeightChange={setChatH}
       />
 
-      {/* Action-knappar: Trash/Undo under previewens nedre högra kant */}
-      {phase === "default" && devUrl && selectedId && (
+      {/* Actions */}
+      {phase === "default" && devUrl && (
         <>
-          {/* Trash visas när vald nod finns och inte “raderad” */}
-          {nodes[selectedId] && !nodes[selectedId].deleted && (
+          {/* Per-nod action: Trash för vald icke-raderad nod */}
+          {selectedId && selRectPx && nodes[selectedId] && !nodes[selectedId].deleted && (
             <button
               data-keep-selection="1"
               onPointerDownCapture={(e) => e.stopPropagation()}
@@ -947,13 +1042,13 @@ function App() {
               onClick={handleDelete}
               style={{
                 position: "absolute",
-                left: Math.max(CANVAS_MARGIN, actionBtnBaseLeft),
-                top: Math.max(CANVAS_MARGIN, actionBtnBaseTop),
+                left: Math.round(selRectPx.left + selRectPx.w - 20),
+                top:  Math.round(selRectPx.top  + selRectPx.h + 8),
                 width: 32, height: 32, borderRadius: 999,
                 border: "1px solid var(--border)",
                 background: "var(--vscode-editorWidget-background)",
                 display: "grid", placeItems: "center",
-                zIndex: 50, cursor: "pointer",
+                zIndex: 60, cursor: "pointer",
                 boxShadow: "0 4px 10px rgba(0,0,0,.15)",
               }}
               title="Ta bort (dölj) vald Figma-nod"
@@ -961,22 +1056,23 @@ function App() {
               <Trash2 size={18} />
             </button>
           )}
-          {/* Undo visas när vald nod är “raderad” */}
-          {nodes[selectedId] && nodes[selectedId].deleted && (
+
+          {/* Per-nod action: Undo för vald raderad nod */}
+          {selectedId && selRectPx && nodes[selectedId] && nodes[selectedId].deleted && (
             <button
               data-keep-selection="1"
               onPointerDownCapture={(e) => e.stopPropagation()}
               aria-label="Ångra borttagning"
-              onClick={handleUndo}
+              onClick={handleUndoSelected}
               style={{
                 position: "absolute",
-                left: Math.max(CANVAS_MARGIN, actionBtnBaseLeft),
-                top: Math.max(CANVAS_MARGIN, actionBtnBaseTop),
+                left: Math.round(selRectPx.left + selRectPx.w - 20),
+                top:  Math.round(selRectPx.top  + selRectPx.h + 8),
                 width: 32, height: 32, borderRadius: 999,
                 border: "1px solid var(--border)",
                 background: "var(--vscode-editorWidget-background)",
                 display: "grid", placeItems: "center",
-                zIndex: 50, cursor: "pointer",
+                zIndex: 60, cursor: "pointer",
                 boxShadow: "0 4px 10px rgba(0,0,0,.15)",
               }}
               title="Ångra borttagning"
@@ -984,6 +1080,48 @@ function App() {
               <RotateCcw size={18} />
             </button>
           )}
+
+          {/* Global multi-stegs Undo (LIFO). Döljs när en icke-raderad nod är vald. */}
+          {deletedStack.length > 0 && !(selectedId && nodes[selectedId] && !nodes[selectedId].deleted) && (
+            <button
+              data-keep-selection="1"
+              onPointerDownCapture={(e) => e.stopPropagation()}
+              aria-label="Ångra senast borttagna"
+              onClick={handleUndoTop}
+              style={{
+                position: "absolute",
+                left: Math.round(stageDims.left + rootPadding + stageDims.w - 36),
+                top:  Math.round(stageDims.top  + rootPadding + stageDims.h + 8),
+                width: 36, height: 32, borderRadius: 999,
+                border: "1px solid var(--border)",
+                background: "var(--vscode-editorWidget-background)",
+                display: "grid", placeItems: "center",
+                zIndex: 55, cursor: "pointer",
+                boxShadow: "0 4px 10px rgba(0,0,0,.15)",
+              }}
+              title={`Ångra (${deletedStack.length})`}
+            >
+              <RotateCcw size={18} />
+            </button>
+          )}
+
+          {/* Global ACCEPT – alltid synlig under preview, bredvid Undo */}
+          <button
+            data-keep-selection="1"
+            onPointerDownCapture={(e) => e.stopPropagation()}
+            aria-label={canAccept ? "Acceptera placement" : "Ingen nod att acceptera"}
+            onClick={handleAccept}
+            disabled={!canAccept}
+            className="fx-accept-btn"
+            style={{
+              left: Math.round(stageDims.left + rootPadding + stageDims.w - 140),
+              top:  Math.round(stageDims.top  + rootPadding + stageDims.h + 8),
+              zIndex: 60,
+            }}
+            title={canAccept ? "Accept" : "Ingen aktiv nod"}
+          >
+            Accept
+          </button>
         </>
       )}
     </div>

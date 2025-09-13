@@ -358,16 +358,42 @@ function buildProxyUrl(fileKey: string, nodeId: string, scale = "2", token?: str
   u.searchParams.set("nodeId", nodeId);
   u.searchParams.set("scale", scale);
   if (token) u.searchParams.set("token", token);
-  u.searchParams.set("flatten", "0"); // behåll transparens, ingen auto-flatten
+  // OBS: tidigare satte vi flatten=0 här, vilket gav ljusare bild pga transparens över vit bakgrund.
+  // Vi skickar inte flatten-override längre. Backend auto-flattenar vid behov.
   const built = u.toString();
   log("buildProxyUrl →", { url: safeUrl(built) });
   return built;
+}
+
+// Vänta tills backend rapporterar frisk /healthz innan vi postar bild-URL till webview.
+async function waitForBackendHealth(attempts = 8, intervalMs = 300): Promise<boolean> {
+  try {
+    const base = vscode.workspace.getConfiguration(SETTINGS_NS).get<string>("backendBaseUrl");
+    if (!base) return true; // inget att vänta på
+    const health = new URL("/healthz", base).toString();
+    for (let i = 1; i <= attempts; i++) {
+      const ok = await quickCheck(health);
+      if (ok) return true;
+      await new Promise(r => setTimeout(r, intervalMs));
+    }
+    return false;
+  } catch (e) {
+    warn("waitForBackendHealth error", e);
+    return false;
+  }
 }
 
 async function sendFreshFigmaImageUrlToWebview(node: ImportedNode, source: "init" | "refresh") {
   if (!currentPanel) { warn("sendFreshFigmaImageUrlToWebview utan panel"); return; }
   const { fileKey, nodeId, figmaToken } = node;
   log("figma-image request", { source, fileKey, nodeId, hasToken: !!figmaToken });
+
+  // Nytt: säkerställ att backend är redo innan vi ger webview en URL att ladda.
+  const healthy = await waitForBackendHealth();
+  if (!healthy) {
+    errlog("Backend /healthz nåddes inte i tid – hoppar inte över men varnar.");
+  }
+
   const raw = buildProxyUrl(fileKey, nodeId, "2", figmaToken);
   if (!raw) {
     errlog("Saknar giltig backendBaseUrl");

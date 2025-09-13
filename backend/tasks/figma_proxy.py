@@ -2,12 +2,13 @@
 from io import BytesIO
 import os
 import logging
-from time import perf_counter
+import random
+from time import perf_counter, sleep
 from typing import Any, Optional, Tuple, Dict, cast
 
 import requests
 from requests.exceptions import RequestException
-from fastapi import HTTPException, APIRouter
+from fastapi import HTTPException, APIRouter, Request
 from fastapi.responses import Response
 from PIL import Image, ImageCms  # Kräver Pillow; för färghantering krävs lcms2 i OS
 
@@ -32,6 +33,12 @@ P3_ICC_PATH = os.getenv("P3_ICC_PATH", "backend/color/DisplayP3.icc")
 AUTO_FLATTEN_WITH_NODE_BG = os.getenv("AUTO_FLATTEN_WITH_NODE_BG", "1") == "1"
 FALLBACK_FLATTEN_BG = os.getenv("FALLBACK_FLATTEN_BG", "")
 
+# Retries
+FIGMA_API_ATTEMPTS = int(os.getenv("FIGMA_API_ATTEMPTS", "3"))          # Images/Nodes API
+FIGMA_API_BACKOFF_S = float(os.getenv("FIGMA_API_BACKOFF_S", "0.3"))    # 0.3 → 0.6 → 1.2 …
+IMG_FETCH_ATTEMPTS = int(os.getenv("IMG_FETCH_ATTEMPTS", "3"))          # presigned image URL
+IMG_FETCH_BACKOFF_S = float(os.getenv("IMG_FETCH_BACKOFF_S", "0.2"))
+
 log.info(
     "Figma proxy init",
     extra={
@@ -41,6 +48,8 @@ log.info(
         "p3_icc_exists": os.path.exists(P3_ICC_PATH),
         "auto_flatten_node_bg": AUTO_FLATTEN_WITH_NODE_BG,
         "fallback_flatten_bg": bool(FALLBACK_FLATTEN_BG),
+        "figma_api_attempts": FIGMA_API_ATTEMPTS,
+        "img_fetch_attempts": IMG_FETCH_ATTEMPTS,
     },
 )
 
@@ -51,18 +60,14 @@ def _auth_headers(token_override: Optional[str] = None) -> Dict[str, str]:
     Använd rätt header, aldrig båda.
     """
     if token_override:
-        log.debug("Auth headers: override token supplied")
         if token_override.startswith("figd_"):  # PAT
             return {"X-Figma-Token": token_override}
         return {"Authorization": f"Bearer {token_override}"}  # OAuth
 
     if FIGMA_OAUTH:
-        log.debug("Auth headers: using OAuth token from env")
         return {"Authorization": f"Bearer {FIGMA_OAUTH}"}
     if FIGMA_PAT:
-        log.debug("Auth headers: using PAT token from env")
         return {"X-Figma-Token": str(FIGMA_PAT)}
-    log.error("Auth headers: no token configured")
     raise HTTPException(500, "Ingen Figma-token konfigurerad (FIGMA_TOKEN eller FIGMA_OAUTH_TOKEN).")
 
 def _parse_hex_rgb(s: str) -> Optional[Tuple[int, int, int]]:
@@ -89,9 +94,48 @@ def _parse_hex_rgb(s: str) -> Optional[Tuple[int, int, int]]:
             return None
     return None
 
+def _should_retry_status(status: int) -> bool:
+    # Retry på 429 + 5xx. Inte på 4xx i övrigt.
+    return status == 429 or (500 <= status < 600)
+
+def _sleep_backoff(base: float, attempt: int) -> None:
+    # Exponentiell backoff med lite jitter
+    t = base * (2 ** (attempt - 1))
+    jitter = t * 0.25 * (random.random() - 0.5)  # ±12.5%
+    sleep(max(0.0, t + jitter))
+
+def _get_with_retries(
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, str]] = None,
+    timeout: float = 15.0,
+    attempts: int = 3,
+    backoff_s: float = 0.3,
+) -> requests.Response:
+    last_exc: Optional[Exception] = None
+    for i in range(1, max(1, attempts) + 1):
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=timeout)
+            if _should_retry_status(r.status_code) and i < attempts:
+                _sleep_backoff(backoff_s, i)
+                continue
+            return r
+        except RequestException as e:
+            last_exc = e
+            if i < attempts:
+                _sleep_backoff(backoff_s, i)
+                continue
+            break
+    if last_exc:
+        raise last_exc
+    # Om vi kommer hit har vi svar men med status som inte blev returnerad ovan
+    return r  # type: ignore[UnboundLocalVariable]
+
 def _figma_image_url(file_key: str, node_id: str, scale: str, token: Optional[str] = None) -> str:
     """
     Hämtar presignad bild-URL från Figma Images API för given node.
+    Retries på nätverksfel och 429/5xx.
     """
     u = f"https://api.figma.com/v1/images/{file_key}"
     params = {
@@ -102,7 +146,14 @@ def _figma_image_url(file_key: str, node_id: str, scale: str, token: Optional[st
     }
     t0 = perf_counter()
     try:
-        r = requests.get(u, headers=_auth_headers(token), params=params, timeout=15)
+        r = _get_with_retries(
+            u,
+            headers=_auth_headers(token),
+            params=params,
+            timeout=15.0,
+            attempts=FIGMA_API_ATTEMPTS,
+            backoff_s=FIGMA_API_BACKOFF_S,
+        )
     except RequestException as e:
         log.error("Images API network error", exc_info=True)
         raise HTTPException(502, f"figma images nätverksfel: {e}")
@@ -110,31 +161,40 @@ def _figma_image_url(file_key: str, node_id: str, scale: str, token: Optional[st
     log.info("Images API response", extra={"status": r.status_code, "ms": round(dt, 1)})
 
     if r.status_code != 200:
-        log.warning("Images API non-200", extra={"status": r.status_code, "text": r.text[:300]})
-        raise HTTPException(502, f"figma images error {r.status_code}: {r.text}")
+        text_preview = ""
+        try:
+            text_preview = r.text[:300]
+        except Exception:
+            pass
+        raise HTTPException(502, f"figma images error {r.status_code}: {text_preview}")
 
     try:
         j = r.json()
     except ValueError:
-        log.error("Images API invalid JSON")
         raise HTTPException(502, "figma images svarade inte med giltig JSON")
 
     url = (j.get("images") or {}).get(node_id)
     if not url:
-        log.warning("Images API missing URL for node", extra={"nodeId": node_id})
         raise HTTPException(502, "figma images saknar image-url för angiven node (fel nodeId eller åtkomst).")
 
-    log.debug("Presigned image URL received", extra={"len": len(url)})
     return url
 
 def _figma_node_bg_color(file_key: str, node_id: str, token: Optional[str]) -> Optional[Tuple[int, int, int]]:
     """
     Försök läsa ut en "solid" bakgrundsfärg för noden via Nodes API.
+    Retries på nätverksfel och 429/5xx.
     """
     try:
         u = f"https://api.figma.com/v1/files/{file_key}/nodes"
         t0 = perf_counter()
-        r = requests.get(u, headers=_auth_headers(token), params={"ids": node_id}, timeout=15)
+        r = _get_with_retries(
+            u,
+            headers=_auth_headers(token),
+            params={"ids": node_id},
+            timeout=15.0,
+            attempts=FIGMA_API_ATTEMPTS,
+            backoff_s=FIGMA_API_BACKOFF_S,
+        )
         dt = (perf_counter() - t0) * 1000
     except RequestException:
         log.debug("Nodes API network error, ignoring", exc_info=True)
@@ -289,6 +349,7 @@ def figma_image_options() -> Response:
 
 @router.get("/api/figma-image")
 def figma_image(
+    request: Request,
     fileKey: str,
     nodeId: str,
     scale: str = "2",
@@ -309,30 +370,40 @@ def figma_image(
             "has_token": bool(token),
             "flatten": flatten,
             "bg_override": bg,
+            "method": request.method,
         },
     )
 
     # Säkerställ att vi har någon form av token
     _ = _auth_headers(token)  # kastar 500 om saknas
 
-    # 1) Hämta bild-URL för node
+    # 1) Hämta bild-URL för node (med retries)
     url = _figma_image_url(fileKey, nodeId, scale, token)
 
-    # 2) Ladda bildbytes
+    # 2) Ladda bildbytes (med retries)
     try:
         t0 = perf_counter()
-        r = requests.get(url, timeout=30)
+        r = _get_with_retries(
+            url,
+            timeout=30.0,
+            attempts=IMG_FETCH_ATTEMPTS,
+            backoff_s=IMG_FETCH_BACKOFF_S,
+        )
         dt = (perf_counter() - t0) * 1000
+        content_len = 0
+        try:
+            content_len = int(r.headers.get("content-length", "0") or 0)
+        except Exception:
+            pass
         log.info(
             "Fetch presigned image",
-            extra={"status": r.status_code, "content_len": int(r.headers.get("content-length", "0") or 0), "ms": round(dt, 1)},
+            extra={"status": r.status_code, "content_len": content_len, "ms": round(dt, 1)},
         )
     except RequestException as e:
         log.error("Presigned image fetch error", exc_info=True)
         raise HTTPException(502, f"image fetch nätverksfel: {e}")
 
     if r.status_code != 200:
-        log.warning("Presigned image non-200", extra={"status": r.status_code})
         raise HTTPException(502, f"image fetch error {r.status_code}")
 
     # 3) Konvertera till sRGB + RGBA
@@ -386,11 +457,3 @@ def figma_image(
 
     log.info("Responding PNG", extra={"bytes": len(body), "total_ms": round((perf_counter() - t_total) * 1000, 1)})
     return Response(content=body, headers=headers)
-
-# OBS:
-# - Inkludera routern i din app:
-#     from backend.tasks.figma_proxy import router as figma_router
-#     app.include_router(figma_router)
-# - Alternativt kan du sätta global CORS-middleware i din app:
-#     from fastapi.middleware.cors import CORSMiddleware
-#     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
