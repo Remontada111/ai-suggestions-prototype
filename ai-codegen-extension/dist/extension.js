@@ -491,6 +491,7 @@ async function sendSeedPlacementIfAny(node) {
 /* ─────────────────────────────────────────────────────────
    Panel och meddelanden
    ───────────────────────────────────────────────────────── */
+const jobPollers = new Map(); // taskId -> timer
 function ensurePanel(context) {
     if (!currentPanel) {
         log("Skapar ny Webview-panel");
@@ -532,7 +533,7 @@ function ensurePanel(context) {
             }
         });
         currentPanel.webview.onDidReceiveMessage(async (msg) => {
-            var _a, _b, _d, _e;
+            var _a, _b, _d, _e, _f, _g, _h, _j, _k;
             log("[wv→ext] message", (_b = (_a = msg === null || msg === void 0 ? void 0 : msg.type) !== null && _a !== void 0 ? _a : msg === null || msg === void 0 ? void 0 : msg.cmd) !== null && _b !== void 0 ? _b : msg);
             if ((msg === null || msg === void 0 ? void 0 : msg.type) === "ready") {
                 log("[wv→ext] ready");
@@ -554,8 +555,8 @@ function ensurePanel(context) {
                 }
                 return;
             }
-            // ── NY: spara placement per nod (om info finns). Fallback: om exakt 1 nod aktiv.
-            if ((msg === null || msg === void 0 ? void 0 : msg.type) === "placementAccepted" && (msg === null || msg === void 0 ? void 0 : msg.payload)) {
+            // ── Ny: spara endast placement vid drag/resize/import (ingen backend)
+            if ((msg === null || msg === void 0 ? void 0 : msg.type) === "placementPreview" && (msg === null || msg === void 0 ? void 0 : msg.payload)) {
                 try {
                     const persist = vscode.workspace.getConfiguration(SETTINGS_NS).get("persistPlacements", true);
                     if (persist) {
@@ -580,16 +581,102 @@ function ensurePanel(context) {
                                 schema: 1,
                             };
                             await (extCtxRef === null || extCtxRef === void 0 ? void 0 : extCtxRef.workspaceState.update(key, all));
+                        }
+                    }
+                }
+                catch (e) {
+                    warn("placementPreview persist fel:", (e === null || e === void 0 ? void 0 : e.message) || String(e));
+                }
+                return;
+            }
+            // ── Spara placement per nod och TRIGGA backend-jobb direkt vid Accept.
+            if ((msg === null || msg === void 0 ? void 0 : msg.type) === "placementAccepted" && (msg === null || msg === void 0 ? void 0 : msg.payload)) {
+                try {
+                    const persist = vscode.workspace.getConfiguration(SETTINGS_NS).get("persistPlacements", true);
+                    if (persist) {
+                        let fileKey = msg.fileKey;
+                        let nodeId = msg.nodeId;
+                        if (!fileKey || !nodeId) {
+                            if (activeNodes.size === 1) {
+                                const one = [...activeNodes.values()][0];
+                                fileKey = one.fileKey;
+                                nodeId = one.nodeId;
+                            }
+                        }
+                        if (fileKey && nodeId) {
+                            const id = `${fileKey}:${nodeId}`;
+                            const key = `${SETTINGS_NS}.placements.v1`;
+                            const all = (_e = extCtxRef === null || extCtxRef === void 0 ? void 0 : extCtxRef.workspaceState.get(key)) !== null && _e !== void 0 ? _e : {};
+                            all[id] = {
+                                ...msg.payload,
+                                fileKey,
+                                nodeId,
+                                savedAt: Date.now(),
+                                schema: 1,
+                            };
+                            await (extCtxRef === null || extCtxRef === void 0 ? void 0 : extCtxRef.workspaceState.update(key, all));
                             log("Placement persisterad per nod", { id });
                         }
                         else {
                             warn("placementAccepted utan fileKey/nodeId och >1 aktiv nod; hoppar över persist");
                         }
                     }
+                    // Starta backend-jobbet nu
+                    try {
+                        const base = vscode.workspace.getConfiguration(SETTINGS_NS).get("backendBaseUrl");
+                        if (!base)
+                            throw new Error("Saknar backendBaseUrl i inställningarna.");
+                        const fileKey = (_f = msg.fileKey) !== null && _f !== void 0 ? _f : ((_g = [...activeNodes.values()][0]) === null || _g === void 0 ? void 0 : _g.fileKey);
+                        const nodeId = (_h = msg.nodeId) !== null && _h !== void 0 ? _h : ((_j = [...activeNodes.values()][0]) === null || _j === void 0 ? void 0 : _j.nodeId);
+                        if (!fileKey || !nodeId)
+                            throw new Error("Saknar fileKey/nodeId för jobbet.");
+                        const url = new URL("/figma-hook", base).toString();
+                        const resp = await postJson(url, { fileKey, nodeId, placement: msg.payload });
+                        const taskId = resp === null || resp === void 0 ? void 0 : resp.task_id;
+                        if (!taskId) {
+                            vscode.window.showWarningMessage("Backend returnerade inget task_id.");
+                            return;
+                        }
+                        // Informera webview om att jobb startat
+                        currentPanel === null || currentPanel === void 0 ? void 0 : currentPanel.webview.postMessage({ type: "job-started", taskId, fileKey, nodeId });
+                        // Starta polling
+                        const statusUrl = new URL(`/task/${encodeURIComponent(taskId)}`, base).toString();
+                        const t = setInterval(async () => {
+                            try {
+                                const s = await fetchStatus(statusUrl);
+                                if (!s)
+                                    return;
+                                if (s.done) {
+                                    clearInterval(t);
+                                    jobPollers.delete(taskId);
+                                    currentPanel === null || currentPanel === void 0 ? void 0 : currentPanel.webview.postMessage({
+                                        type: "job-finished",
+                                        status: s.status,
+                                        pr_url: s.pr_url,
+                                        error: s.error,
+                                    });
+                                    if (s.status === "SUCCESS" && s.pr_url) {
+                                        vscode.window.showInformationMessage(`PR skapad: ${s.pr_url}`, "Öppna").then((btn) => {
+                                            if (btn === "Öppna")
+                                                vscode.env.openExternal(vscode.Uri.parse(s.pr_url));
+                                        });
+                                    }
+                                    else if (s.status === "FAILURE") {
+                                        vscode.window.showErrorMessage(s.error || "Jobbet misslyckades.");
+                                    }
+                                }
+                            }
+                            catch (_a) { }
+                        }, 1500);
+                        jobPollers.set(taskId, t);
+                    }
+                    catch (e) {
+                        vscode.window.showErrorMessage(`Kunde inte starta jobb: ${(e === null || e === void 0 ? void 0 : e.message) || String(e)}`);
+                    }
                     // Enkla kontroller
                     const p = msg.payload;
                     const issues = [];
-                    if (((_e = p === null || p === void 0 ? void 0 : p.ar) === null || _e === void 0 ? void 0 : _e.deltaPct) > 0.02)
+                    if (((_k = p === null || p === void 0 ? void 0 : p.ar) === null || _k === void 0 ? void 0 : _k.deltaPct) > 0.02)
                         issues.push(`AR-avvikelse ${(p.ar.deltaPct * 100).toFixed(1)}%`);
                     if ((p === null || p === void 0 ? void 0 : p.sizePct) < 0.15)
                         issues.push("Overlay < 15% av ytan");
@@ -602,6 +689,26 @@ function ensurePanel(context) {
                 }
                 catch (e) {
                     errlog("Kunde inte spara placement (workspaceState):", (e === null || e === void 0 ? void 0 : e.message) || String(e));
+                }
+                return;
+            }
+            if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "cancelJob" && typeof msg.taskId === "string") {
+                try {
+                    const base = vscode.workspace.getConfiguration(SETTINGS_NS).get("backendBaseUrl");
+                    if (!base)
+                        throw new Error("Saknar backendBaseUrl i inställningarna.");
+                    const u = new URL(`/task/${encodeURIComponent(msg.taskId)}/cancel`, base).toString();
+                    await postJson(u, {}); // POST cancel
+                    const t = jobPollers.get(msg.taskId);
+                    if (t) {
+                        clearInterval(t);
+                        jobPollers.delete(msg.taskId);
+                    }
+                    currentPanel === null || currentPanel === void 0 ? void 0 : currentPanel.webview.postMessage({ type: "job-finished", status: "CANCELLED" });
+                    vscode.window.showInformationMessage("Jobb avbrutet.");
+                }
+                catch (e) {
+                    vscode.window.showErrorMessage(`Kunde inte avbryta jobb: ${(e === null || e === void 0 ? void 0 : e.message) || String(e)}`);
                 }
                 return;
             }
@@ -652,7 +759,7 @@ function ensurePanel(context) {
                     await new Promise(r => setTimeout(r, 60));
                     currentPanel === null || currentPanel === void 0 ? void 0 : currentPanel.webview.postMessage({ type: "ui-phase", phase: lastUiPhase });
                 }
-                catch (_f) { }
+                catch (_l) { }
                 return;
             }
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "refreshFigmaImage") {
@@ -1035,7 +1142,7 @@ function basicFallbackHtml(webview) {
 </html>`;
 }
 /* ─────────────────────────────────────────────────────────
-   POST helper för backend-hook
+   POST/GET helpers för backend
    ───────────────────────────────────────────────────────── */
 function postJson(url, json, timeoutMs = 8000) {
     return new Promise((resolve, reject) => {
@@ -1076,6 +1183,39 @@ function postJson(url, json, timeoutMs = 8000) {
         }
         catch (e) {
             reject(e);
+        }
+    });
+}
+async function fetchStatus(url, timeoutMs = 6000) {
+    return await new Promise((resolve) => {
+        try {
+            const u = new URL(url);
+            const mod = u.protocol === "https:" ? https : http;
+            const req = mod.request({ method: "GET", hostname: u.hostname, port: u.port, path: (u.pathname || "/") + (u.search || ""), timeout: timeoutMs }, (res) => {
+                const chunks = [];
+                res.on("data", (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+                res.on("end", () => {
+                    try {
+                        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+                        const raw = String((body === null || body === void 0 ? void 0 : body.status) || "");
+                        const mapped = raw === "SUCCESS" ? "SUCCESS" :
+                            raw === "FAILURE" ? "FAILURE" :
+                                raw === "REVOKED" ? "CANCELLED" :
+                                    "PENDING";
+                        const done = mapped === "SUCCESS" || mapped === "FAILURE" || mapped === "CANCELLED";
+                        resolve({ done, status: mapped, pr_url: body === null || body === void 0 ? void 0 : body.pr_url, error: body === null || body === void 0 ? void 0 : body.error });
+                    }
+                    catch (_a) {
+                        resolve(null);
+                    }
+                });
+            });
+            req.on("timeout", () => { req.destroy(); resolve(null); });
+            req.on("error", () => resolve(null));
+            req.end();
+        }
+        catch (_a) {
+            resolve(null);
         }
     });
 }
@@ -1227,7 +1367,7 @@ async function activate(context) {
         if (!pendingCandidate) {
             const candidates = await (0, detector_1.detectProjects)([]);
             lastCandidates = candidates;
-            log("openPanel detekterade kandidater", { count: candidates.length });
+            log("openPanel detekterade kandidater", { count: lastCandidates.length });
             if (candidates.length) {
                 pendingCandidate = candidates[0];
                 if (candidates.length === 1 || ((_a = pendingCandidate === null || pendingCandidate === void 0 ? void 0 : pendingCandidate.confidence) !== null && _a !== void 0 ? _a : 0) >= AUTO_START_SURE_THRESHOLD) {
@@ -1352,5 +1492,12 @@ async function deactivate() {
     catch (e) {
         warn("stopInlineServer fel:", e);
     }
+    for (const t of jobPollers.values()) {
+        try {
+            clearInterval(t);
+        }
+        catch (_a) { }
+    }
+    jobPollers.clear();
 }
 //# sourceMappingURL=extension.js.map

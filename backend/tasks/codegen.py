@@ -18,6 +18,10 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, Tuple, cast
 
+# Ladda .env tidigt så alla imports får rätt miljö
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
+
 import requests
 from fastapi import HTTPException
 from celery import Celery
@@ -39,6 +43,15 @@ RESULT_BACKEND = (os.getenv("CELERY_RESULT_BACKEND") or BROKER_URL).strip()
 # OpenAI
 openai.api_key = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+
+# Genereringsmål i repo:t
+TARGET_COMPONENT_DIR = os.getenv("TARGET_COMPONENT_DIR", "frontendplay/src/components/ai")
+# Enda filen vi tillåter patch av (monteringspunkt)
+ALLOW_PATCH = [
+    p.strip().replace("\\", "/")
+    for p in (os.getenv("ALLOW_PATCH", "frontendplay/src/main.tsx").split(";"))
+    if p.strip()
+]
 
 # Figma
 FIGMA_TOKEN: str | None = os.getenv("FIGMA_TOKEN")
@@ -68,7 +81,6 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 logger.setLevel(logging.INFO)
 
-
 # ─────────────────────────────────────────────────────────
 # Hjälpfunktioner
 # ─────────────────────────────────────────────────────────
@@ -91,7 +103,7 @@ def _fetch_figma_node(file_key: str, node_id: str) -> Dict[str, Any]:
     return cast(Dict[str, Any], data)
 
 
-def _build_prompt(figma_json: dict, comp_map: dict[str, Path]) -> str:
+def _build_prompt(figma_json: dict, comp_map: dict[str, Path], placement: dict | None) -> str:
     """Bygger system-prompt till OpenAI."""
     try:
         overview = (
@@ -102,19 +114,26 @@ def _build_prompt(figma_json: dict, comp_map: dict[str, Path]) -> str:
         # Om repo körs i tmp-dir utan relation till cwd, fall tillbaka till absoluta vägar
         overview = "\n".join(f"- {name}: {path}" for name, path in comp_map.items()) or "Inga komponenter hittades."
 
-    # Trunka Figma-JSON för att hålla prompten kompakt
+    # Trunka för kompakthet
     fig_excerpt = json.dumps(figma_json, ensure_ascii=False)[:4000]
+    placement_excerpt = json.dumps(placement or {}, ensure_ascii=False)[:2000]
 
     return (
-        "Du är en senior fullstack-utvecklare.\n\n"
-        "Detta Next.js-projekt innehåller följande komponenter:\n"
+        "Du är en senior frontend-utvecklare.\n\n"
+        "Projektöversikt – befintliga komponenter:\n"
         f"{overview}\n\n"
         "Instruktion:\n"
         "• Om en passande komponent redan finns → returnera en unified diff (patch).\n"
         "• Annars → returnera första raden som filnamn följt av hela filens innehåll.\n\n"
-        "Krav: React 19, shadcn/ui, Tailwind 4 syntax. Minimera ändringar – följ projektets stil.\n\n"
+        "Krav:\n"
+        f"• Nya filer får endast skapas under '{TARGET_COMPONENT_DIR}'.\n"
+        "• Patch är ENDAST tillåten på 'frontendplay/src/main.tsx' för att montera komponenten vid kommentaren 'AI-INJECT-MOUNT'.\n"
+        "• Använd React 18/19, Vite-miljö, inga Next-specifika APIs.\n"
+        "• Minimera ändringar och följ projektets stil.\n\n"
+        "Placering från webview (normaliserad till 1280×800):\n"
+        f"{placement_excerpt}\n\n"
         "Figma-JSON (trunkerad):\n"
-        f"{fig_excerpt}"
+        f"{fig_excerpt}\n"
     )
 
 
@@ -159,7 +178,7 @@ def _parse_gpt_reply(reply: str) -> Tuple[str, str, str]:
 # ─────────────────────────────────────────────────────────
 
 @app.task(name="backend.tasks.codegen.integrate_figma_node")
-def integrate_figma_node(*, file_key: str, node_id: str) -> Dict[str, str]:
+def integrate_figma_node(*, file_key: str, node_id: str, placement: Dict[str, Any] | None = None) -> Dict[str, str]:
     """
     Asynkron pipeline: hämtar Figma-node, genererar/patchar kod och öppnar PR.
 
@@ -181,7 +200,7 @@ def integrate_figma_node(*, file_key: str, node_id: str) -> Dict[str, str]:
         logger.info("Hittade %d komponent(er).", len(components))
 
         # 4) Bygg prompt och kalla OpenAI
-        prompt = _build_prompt(figma_json, components)
+        prompt = _build_prompt(figma_json, components, placement)
         logger.info("Skickar prompt till OpenAI (%s) …", OPENAI_MODEL)
 
         completion = openai.chat.completions.create(  # type: ignore[attr-defined]
@@ -197,14 +216,27 @@ def integrate_figma_node(*, file_key: str, node_id: str) -> Dict[str, str]:
         mode, target_rel, payload = _parse_gpt_reply(gpt_reply)
         logger.info("OpenAI-svar parsat: mode=%s target=%s", mode, target_rel)
 
-        # 5) Git-gren
+        # 5) Normalisera målväg / säkerhetsregler
+        if mode == "file":
+            # Tvinga ny fil in i komponentkatalog
+            try:
+                suggested = Path(target_rel)
+                target_rel = (Path(TARGET_COMPONENT_DIR) / suggested.name).as_posix()
+            except Exception:
+                target_rel = (Path(TARGET_COMPONENT_DIR) / "GeneratedComponent.tsx").as_posix()
+        elif mode == "patch":
+            norm = target_rel.replace("\\", "/")
+            if norm not in ALLOW_PATCH:
+                raise HTTPException(400, f"Patch ej tillåten för {norm}. Tillåtna: {ALLOW_PATCH}")
+
+        # 6) Git-gren
         branch = unique_branch(node_id)
         repo.git.checkout("-b", branch)
 
         target_path = Path(tmp_dir, target_rel)
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # 6) Applicera ändring
+        # 7) Applicera ändring
         if mode == "patch":
             if not target_path.exists():
                 raise HTTPException(500, f"Patchfilen {target_rel} finns inte i repo:t.")
@@ -218,7 +250,7 @@ def integrate_figma_node(*, file_key: str, node_id: str) -> Dict[str, str]:
         repo.index.commit(commit_msg)
         logger.info("Commit klar: %s", commit_msg)
 
-        # 7) Skapa PR
+        # 8) Skapa PR
         pr_url = create_pr(
             repo,
             branch=branch,
@@ -227,7 +259,7 @@ def integrate_figma_node(*, file_key: str, node_id: str) -> Dict[str, str]:
         )
         logger.info("Pull Request skapad: %s", pr_url)
 
-        # 8) Klart – returnera för polling-endpointen
+        # 9) Klart – returnera för polling-endpointen
         return {"pr_url": pr_url}
 
     finally:
@@ -241,6 +273,5 @@ try:
     from . import analyze as _register_analyze  # noqa: F401
 except Exception as e:  # pragma: no cover
     logging.getLogger(__name__).warning("Kunde inte importera analyze-tasks: %s", e)
-
 
 __all__ = ["app", "celery_app", "integrate_figma_node"]

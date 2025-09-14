@@ -1,11 +1,10 @@
+# backend/tasks/utils.py
 """
-tasks/utils.py
-────────────────────────────────────────────────────────────────────────────
 Gemensamma hjälpfunktioner för Celery-workern:
 
 * Läser miljövariabler och räknar ut Git-URL:er
 * Klonar mål-repositoriet till en temporär katalog
-* Skapar unika branch-namn (ingen “non-fast-forward”-konflikt)
+* Skapar unika branch-namn
 * Öppnar Pull Requests via GitHub REST-API
 * Skannar projektet efter befintliga React-komponenter (default-exports)
 """
@@ -17,16 +16,17 @@ import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Any
 
 import requests
 from fastapi import HTTPException
 from git import Repo
 from git.exc import GitCommandError
 
-#  ──────────────────────────── 1. Miljövariabler ───────────────────────────
+# ─────────────────────────── 1) Miljö & Git ───────────────────────────
+
 GH_TOKEN: str | None = os.getenv("GH_TOKEN")
-TARGET_REPO: str | None = os.getenv("TARGET_REPO")          # "user/repo"
+TARGET_REPO: str | None = os.getenv("TARGET_REPO")  # "user/repo"
 BASE_BRANCH: str = os.getenv("BASE_BRANCH", "main")
 
 if not (GH_TOKEN and TARGET_REPO):
@@ -37,7 +37,7 @@ if not (GH_TOKEN and TARGET_REPO):
 
 REMOTE_URL = f"https://{GH_TOKEN}:x-oauth-basic@github.com/{TARGET_REPO}.git"
 
-#  ──────────────────────────── 2. Git-utility-funktioner ────────────────────
+
 def unique_branch(node_id: str) -> str:
     """
     Returnerar ett garanterat unikt branch-namn.
@@ -50,10 +50,8 @@ def unique_branch(node_id: str) -> str:
 
 def clone_repo() -> Tuple[str, Repo]:
     """
-    Klonar `TARGET_REPO` till en temporär katalog (depth=1 för fart).
+    Klonar `TARGET_REPO` till en temporär katalog (depth=1).
     Returnerar (temp_dir_path, Repo-objekt).
-
-    Höjer HTTPException(500) om något går fel.
     """
     tmp_dir = tempfile.mkdtemp(prefix="ai-pr-bot-")
     try:
@@ -72,18 +70,15 @@ def clone_repo() -> Tuple[str, Repo]:
 
 def create_pr(repo: Repo, branch: str, title: str, body: str | None = None) -> str:
     """
-    Pushar `branch` (antar att den finns lokalt) och öppnar en Pull Request.
-    Returnerar PR-länken.
-
-    ➜ Kallas i slutet av Celery-tasken.
+    Pushar `branch` och öppnar en Pull Request. Returnerar PR-länken.
     """
-    # 1. Push
+    # Push
     try:
         repo.remote("origin").push(refspec=f"{branch}:{branch}")
     except GitCommandError as e:
         raise HTTPException(500, f"Git push error: {e.stderr or e}") from e
 
-    # 2. PR via GitHub-API
+    # PR via GitHub-API
     pr_resp = requests.post(
         f"https://api.github.com/repos/{TARGET_REPO}/pulls",
         headers={
@@ -105,92 +100,137 @@ def create_pr(repo: Repo, branch: str, title: str, body: str | None = None) -> s
         )
     return pr_resp.json().get("html_url", "")
 
-#  ──────────────────────────── 3. Komponent-scanner ─────────────────────────
-#   Vi använder tree-sitter för att hitta default-exporterade React-funktioner.
+# ───────────────── 2) Komponent-scanner (förkompilerad TSX) ───────────────
+
+# Använd förkompilerade språk för att slippa runtime-builds (distutils).
 try:
-    from tree_sitter import Language, Parser
-except ImportError:  # om användaren inte har behov av analysfunktionen
-    Parser = None      # type: ignore
+    from tree_sitter import Parser
+    from tree_sitter_languages import get_language
+except Exception:  # ImportError eller annat – gör scannern valfri
+    Parser = None            # type: ignore[assignment]
+    get_language = None      # type: ignore[assignment]
 
-_TS_LIB = Path(__file__).with_suffix(".ts.so")  # tasks/utils.ts.so
-
-from typing import Any
 
 def _ensure_ts_parser() -> Any:
     """
-    Bygger (första gången) och cachar en tree-sitter-parser för TSX.
+    Hämtar en Parser inställd på TSX via tree_sitter_languages.
+    Ingen kompilering vid körning.
     """
-    if Parser is None:
-        raise RuntimeError("tree_sitter saknas – installera paketet först.")
-
-    if not _TS_LIB.exists():
-        # Build once: nedladdar grammar och kompilera shared object
-        from subprocess import check_call
-
-        grammar_repo = (
-            "https://github.com/tree-sitter/tree-sitter-typescript.git"
-        )
-        tmp = Path(tempfile.mkdtemp())
-        try:
-            check_call(["git", "clone", "--depth", "1", grammar_repo, tmp])
-            ts_src = tmp / "tsx"
-            from tree_sitter import Language
-            Language.build_library(str(_TS_LIB), [str(ts_src)]) # type: ignore
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-
-    ts_lang = Language(str(_TS_LIB), "tsx") # type: ignore
+    if Parser is None or get_language is None:
+        raise RuntimeError("tree_sitter eller tree_sitter_languages saknas.")
     parser = Parser()
-    parser.set_language(ts_lang) # type: ignore
+    parser.set_language(get_language("tsx"))
     return parser
 
 
 def list_components(repo_path: str) -> Dict[str, Path]:
     """
-    Går igenom hela repo-trädet och returnerar en dict:
-
-        { "ComponentName": Path("<repo>/src/…/ComponentName.tsx"), ... }
+    Går igenom repo-trädet och returnerar en dict:
+        { "ComponentName": Path("<repo>/src/.../ComponentName.tsx"), ... }
 
     Vi letar efter:
-        export default function ComponentName(
-    eller
-        const ComponentName = (…) => { … }; export default ComponentName;
+      1) `export default function ComponentName(` i filen
+      2) `const ComponentName = (…) => ...; export default ComponentName;`
     """
-    if Parser is None:
-        # tree-sitter är valfritt – utan det returnerar vi tom lista.
+    # Valfri funktionalitet: saknas parser → tom lista
+    if Parser is None or get_language is None:
         return {}
 
-    parser = _ensure_ts_parser()
+    try:
+        parser = _ensure_ts_parser()
+    except Exception:
+        # Robust fallback: ingen komponentlista om parsern inte kan initieras
+        return {}
+
     components: Dict[str, Path] = {}
 
     for p in Path(repo_path).rglob("*.tsx"):
         try:
             src = p.read_bytes()
         except (OSError, UnicodeDecodeError):
-            continue  # hoppa över binärkod, felkodad fil etc.
+            continue
 
-        tree = parser.parse(src)
+        # Snabb path: text-scan gör grovfilter, AST bekräftar struktur
+        text_utf8 = ""
+        try:
+            text_utf8 = src.decode("utf-8", "ignore")
+        except Exception:
+            pass
+
+        if "export default" not in text_utf8:
+            # Troligen ingen default-export – hoppa AST-parse för speed
+            continue
+
+        try:
+            tree = parser.parse(src)
+        except Exception:
+            # Om tree-sitter misslyckas, gör en enkel textbaserad heuristik
+            # för vanliga mönster.
+            name = _heuristic_name_from_text(text_utf8)
+            if name:
+                components[name] = p
+            continue
+
         root = tree.root_node
 
-        # Lättviktig traversal – vi går inte igenom hela AST:t djupare än nödvändigt.
+        # Lättviktig traversal – kolla top-level declarationer
+        matched = False
         for node in root.children:
-            if node.type == "function_declaration":
-                text = src[node.start_byte : node.end_byte].decode("utf-8", "ignore")
-                if text.startswith("export default function"):
-                    name = (
-                        text.split("function", 1)[1]
-                        .split("(", 1)[0]
-                        .strip()
-                    )
-                    components[name] = p
-            elif node.type == "lexical_declaration":  # const/let …
-                text = src[node.start_byte : node.end_byte].decode("utf-8", "ignore")
-                if "export default" in text:
-                    # Förenklad parse: const Foo = ⇒ hämta första ordet
-                    try:
-                        left = text.split("const", 1)[1]
-                        name = left.split("=", 1)[0].strip()
-                        components[name] = p
-                    except IndexError:
-                        pass
+            try:
+                if node.type == "function_declaration":
+                    segment = src[node.start_byte: node.end_byte].decode("utf-8", "ignore")
+                    if segment.startswith("export default function"):
+                        name = (
+                            segment.split("function", 1)[1]
+                            .split("(", 1)[0]
+                            .strip()
+                        )
+                        if name:
+                            components[name] = p
+                            matched = True
+                elif node.type == "lexical_declaration":  # const/let …
+                    segment = src[node.start_byte: node.end_byte].decode("utf-8", "ignore")
+                    if "export default" in segment and "const " in segment:
+                        try:
+                            left = segment.split("const", 1)[1]
+                            name = left.split("=", 1)[0].strip()
+                            if name:
+                                components[name] = p
+                                matched = True
+                        except IndexError:
+                            pass
+            except Exception:
+                # Fortsätt på nästa node vid partiella parse-problem
+                continue
+
+        if not matched:
+            # Fallback på heuristik om top-level-parse inte hittade något
+            name = _heuristic_name_from_text(text_utf8)
+            if name:
+                components[name] = p
+
     return components
+
+
+def _heuristic_name_from_text(text: str) -> str | None:
+    """
+    Enkel textbaserad heuristik för att extrahera ett sannolikt komponentnamn.
+    Används när parsern inte finns eller bommar på en fil.
+    """
+    try:
+        # export default function Foo(
+        if "export default function" in text:
+            tail = text.split("export default function", 1)[1].lstrip()
+            cand = tail.split("(", 1)[0].strip()
+            if cand:
+                return cand
+
+        # const Foo = (...) => ...; export default Foo
+        if "export default" in text and "const " in text:
+            left = text.split("const", 1)[1]
+            name = left.split("=", 1)[0].strip()
+            if name and f"export default {name}" in text:
+                return name
+    except Exception:
+        pass
+    return None

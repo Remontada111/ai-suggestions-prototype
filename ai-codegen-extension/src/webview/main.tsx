@@ -1,10 +1,11 @@
-// webview/main.tsx 
+// webview/main.tsx
 // Mål:
 // - 1280×800 stage som skalas i panelen.
 // - Stöd för flera Figma-noder samtidigt.
 // - Välj en nod → flytta/resize med mus, hjul och tangentbord.
 // - Papperskorg visas för vald nod. Efter borttagning visas Undo tills återställd.
 // - Figma-bild hämtas via extension per nod och renderas ovanför devUrl-iframe.
+// - Accept låser interaktion, visar loading + Cancel.
 
 import React, {
   useCallback,
@@ -40,7 +41,9 @@ type IncomingMsg =
   | { type: "add-node"; fileKey: string; nodeId: string; token?: string; figmaToken?: string }
   | { type: "figma-image-url"; fileKey: string; nodeId: string; url: string }
   | { type: "seed-placement"; fileKey: string; nodeId: string; payload: any }
-  | { type: "ui-error"; message: string };
+  | { type: "ui-error"; message: string }
+  | { type: "job-started"; taskId: string; fileKey: string; nodeId: string }
+  | { type: "job-finished"; status: "SUCCESS" | "FAILURE" | "CANCELLED"; pr_url?: string; error?: string };
 
 type Vec2 = { x: number; y: number };
 type Rect = { x: number; y: number; w: number; h: number };
@@ -187,7 +190,7 @@ function App() {
   const [deletedStack, setDeletedStack] = useState<NodeId[]>([]);
 
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const imgRefs = useRef<Record<NodeId, HTMLImageElement | null>>({});
+  const imgRefs = useRef<Record<NodeId, HTMLImageElement | null>>({ });
   const selectedRef = useRef<NodeId | null>(null);
   useEffect(() => { selectedRef.current = selectedId; }, [selectedId]);
 
@@ -202,6 +205,9 @@ function App() {
 
   // Seeds som kom före naturliga mått
   const pendingSeeds = useRef<Record<NodeId, any>>({});
+
+  // Jobbstatus
+  const [job, setJob] = useState<{ status: "idle" | "running" | "done" | "error"; taskId?: string }>({ status: "idle" });
 
   // editorstorlek: reservera plats för chatten
   useLayoutEffect(() => {
@@ -241,7 +247,7 @@ function App() {
     }
     return null;
   }, [selectedId, nodes]);
-  const canAccept = !!firstEligibleId;
+  const canAccept = !!firstEligibleId && job.status !== "running";
 
   const clampOverlayToStage = useCallback((r: Rect, ar: number) => {
     const minW = PROJECT_BASE.w * 0.15;
@@ -372,6 +378,18 @@ function App() {
       }
 
       if (msg.type === "ui-error") { setFigmaErr(msg.message || "Okänt fel."); return; }
+
+      if (msg.type === "job-started") {
+        setJob({ status: "running", taskId: msg.taskId });
+        return;
+      }
+
+      if (msg.type === "job-finished") {
+        if (msg.status === "SUCCESS") setJob({ status: "done" });
+        else if (msg.status === "CANCELLED") setJob({ status: "idle" });
+        else setJob({ status: "error" });
+        return;
+      }
     }
 
     window.addEventListener("message", onMsg);
@@ -381,6 +399,14 @@ function App() {
     }
     return () => window.removeEventListener("message", onMsg);
   }, [clampOverlayToStage, persistState]);
+
+  // Auto-återställ jobbstatus från done/error → idle
+  useEffect(() => {
+    if (job.status === "done" || job.status === "error") {
+      const t = setTimeout(() => setJob({ status: "idle" }), 1800);
+      return () => clearTimeout(t);
+    }
+  }, [job.status]);
 
   // Bild onload per nod
   const onLoadFor = useCallback((id: NodeId) => (ev: React.SyntheticEvent<HTMLImageElement>) => {
@@ -511,7 +537,8 @@ function App() {
         ts: Date.now(),
         source: "webview/main.tsx",
       };
-      vscode.postMessage({ type: "placementAccepted", fileKey: ns.fileKey, nodeId: ns.nodeId, payload });
+      // Endast preview under drag/resize – inget jobb triggas.
+      vscode.postMessage({ type: "placementPreview", fileKey: ns.fileKey, nodeId: ns.nodeId, payload });
     };
 
     window.addEventListener("pointerup", end, { once: true });
@@ -520,13 +547,15 @@ function App() {
 
   // Flytt/resize handlers
   const onOverlayPointerDown = useCallback((id: NodeId) => (e: React.PointerEvent) => {
+    if (job.status === "running") return;
     const ns = nodes[id];
     if (!ns?.rect || ns.deleted) return;
     beginInteraction(id, e);
     dragState.current = { id, mode: "move", startPt: { x: e.clientX, y: e.clientY }, startRect: { ...ns.rect } };
-  }, [nodes, beginInteraction]);
+  }, [nodes, beginInteraction, job.status]);
 
   const onOverlayPointerMove = useCallback((e: React.PointerEvent) => {
+    if (job.status === "running") return;
     const st = dragState.current;
     if (!st) return;
     const ns = nodes[st.id];
@@ -568,19 +597,21 @@ function App() {
       const next = clampOverlayToStage({ x, y, w, h }, ar);
       setNodes(s => ({ ...s, [st.id]: { ...ns, rect: next } }));
     }
-  }, [nodes, stageDims.scale, clampOverlayToStage]);
+  }, [nodes, stageDims.scale, clampOverlayToStage, job.status]);
 
   const startResize = useCallback((id: NodeId, mode: "nw" | "ne" | "se" | "sw") =>
     (e: React.PointerEvent) => {
+      if (job.status === "running") return;
       const ns = nodes[id];
       if (!ns?.rect || ns.deleted) return;
       e.stopPropagation();
       beginInteraction(id, e);
       dragState.current = { id, mode, startPt: { x: e.clientX, y: e.clientY }, startRect: { ...ns.rect } };
-    }, [nodes, beginInteraction]);
+    }, [nodes, beginInteraction, job.status]);
 
   // wheel = resize runt centrum
   const onWheel = useCallback((e: React.WheelEvent) => {
+    if (job.status === "running") return;
     const id = selectedId; if (!id) return;
     const ns = nodes[id]; if (!ns?.rect || !ns.imgN || ns.deleted) return;
     if (!(e.ctrlKey || e.metaKey)) return;
@@ -593,11 +624,12 @@ function App() {
     setNodes(s => ({ ...s, [id]: { ...ns, rect: sized } }));
     setShowOverlay(true);
     persistState({ showOverlay: true });
-  }, [nodes, selectedId, clampOverlayToStage, persistState]);
+  }, [nodes, selectedId, clampOverlayToStage, persistState, job.status]);
 
   // tangentbord när valt
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
+      if (job.status === "running") { e.preventDefault(); return; }
       const id = selectedId; if (!id) return;
       const ns = nodes[id]; if (!ns?.rect || !ns.imgN || ns.deleted) return;
 
@@ -649,6 +681,7 @@ function App() {
       }
     }
     function onKeyUp(e: KeyboardEvent) {
+      if (job.status === "running") { e.preventDefault(); return; }
       if (e.code === "Space") {
         spaceHeld.current = false;
         if (!selectedRef.current) {
@@ -664,30 +697,33 @@ function App() {
       window.removeEventListener("keydown", onKeyDown, { capture: true } as any);
       window.removeEventListener("keyup", onKeyUp, { capture: true } as any);
     };
-  }, [nodes, selectedId, clampOverlayToStage, persistState]);
+  }, [nodes, selectedId, clampOverlayToStage, persistState, job.status]);
 
   // Delete/Undo
   const handleDelete = useCallback(() => {
+    if (job.status === "running") return;
     const id = selectedId; if (!id) return;
     const ns = nodes[id]; if (!ns?.rect || ns.deleted) return;
     setNodes(s => ({ ...s, [id]: { ...ns, deleted: true } }));
     setDeletedStack(stk => [id, ...stk]); // push LIFO
     setShowOverlay(false);
     persistState({ showOverlay: false });
-  }, [nodes, selectedId, persistState]);
+  }, [nodes, selectedId, persistState, job.status]);
 
   // Undo endast för vald nod
   const handleUndoSelected = useCallback(() => {
+    if (job.status === "running") return;
     const id = selectedId; if (!id) return;
     setNodes(s => {
       const ns = s[id]; if (!ns) return s;
       return { ...s, [id]: { ...ns, deleted: false } };
     });
     setDeletedStack(stk => stk.filter(x => x !== id));
-  }, [selectedId]);
+  }, [selectedId, job.status]);
 
   // Global LIFO-undo
   const handleUndoTop = useCallback(() => {
+    if (job.status === "running") return;
     setDeletedStack(stk => {
       if (!stk.length) return stk;
       const [restoreId, ...rest] = stk;
@@ -700,7 +736,7 @@ function App() {
       persistState({ showOverlay: true, selectedId: restoreId });
       return rest;
     });
-  }, [persistState]);
+  }, [persistState, job.status]);
 
   // Global ACCEPT – bygger och postar placement från vald eller första giltiga nod
   const handleAccept = useCallback(() => {
@@ -747,6 +783,8 @@ function App() {
       source: "webview/main.tsx",
     };
 
+    // Lås direkt; extension skickar senare job-started med taskId
+    setJob({ status: "running" });
     vscode.postMessage({ type: "placementAccepted", fileKey: ns.fileKey, nodeId: ns.nodeId, payload });
   }, [firstEligibleId, nodes]);
 
@@ -849,12 +887,13 @@ function App() {
                   width: round(rect.w),
                   height: round(rect.h),
                   zIndex: isSelected ? 30 : 20,
-                  cursor: "move",
+                  cursor: job.status === "running" ? "default" : "move",
                   background: "transparent",
                   borderRadius: 10,
                   boxShadow: isSelected ? "0 0 0 2px rgba(0,0,0,.06), 0 2px 10px rgba(0,0,0,.25)" : "none",
                   overflow: "visible",
                   pointerEvents: "auto",
+                  opacity: job.status === "running" && isSelected ? 0.95 : 1,
                 }}
               >
                 <div style={{ position: "absolute", inset: 0, borderRadius: 10, overflow: "hidden" }}>
@@ -873,9 +912,10 @@ function App() {
                       objectFit: "contain",
                       userSelect: "none",
                       pointerEvents: "none",
+                      filter: job.status === "running" && isSelected ? "grayscale(0.2)" : "none",
                     }}
                   />
-                  {showOverlay && isSelected && (
+                  {showOverlay && isSelected && job.status !== "running" && (
                     <div
                       aria-hidden
                       style={{
@@ -890,7 +930,7 @@ function App() {
                 </div>
 
                 {/* Hörnhandtag */}
-                {showOverlay && isSelected && (
+                {showOverlay && isSelected && job.status !== "running" && (
                   <>
                     {(["nw", "ne", "se", "sw"] as const).map((pos) => {
                       const size = 16;
@@ -1033,8 +1073,16 @@ function App() {
       {/* Actions */}
       {phase === "default" && devUrl && (
         <>
-          {/* Per-nod action: Trash för vald icke-raderad nod */}
-          {selectedId && selRectPx && nodes[selectedId] && !nodes[selectedId].deleted && (
+          <style>{`
+            @keyframes spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }
+            .fx-btn { position:absolute; height:32px; border-radius:999px; border:1px solid var(--border);
+              background: var(--vscode-editorWidget-background); display:grid; place-items:center; cursor:pointer;
+              padding: 0 12px; box-shadow: 0 4px 10px rgba(0,0,0,.15); }
+            .fx-btn[disabled] { opacity:.7; cursor:default }
+          `}</style>
+
+          {/* Per-nod action: Trash för vald icke-raderad nod, dolt under jobb */}
+          {job.status !== "running" && selectedId && selRectPx && nodes[selectedId] && !nodes[selectedId].deleted && (
             <button
               data-keep-selection="1"
               onPointerDownCapture={(e) => e.stopPropagation()}
@@ -1057,8 +1105,8 @@ function App() {
             </button>
           )}
 
-          {/* Per-nod action: Undo för vald raderad nod */}
-          {selectedId && selRectPx && nodes[selectedId] && nodes[selectedId].deleted && (
+          {/* Per-nod action: Undo för vald raderad nod, dolt under jobb */}
+          {job.status !== "running" && selectedId && selRectPx && nodes[selectedId] && nodes[selectedId].deleted && (
             <button
               data-keep-selection="1"
               onPointerDownCapture={(e) => e.stopPropagation()}
@@ -1081,23 +1129,18 @@ function App() {
             </button>
           )}
 
-          {/* Global multi-stegs Undo (LIFO). Döljs när en icke-raderad nod är vald. */}
-          {deletedStack.length > 0 && !(selectedId && nodes[selectedId] && !nodes[selectedId].deleted) && (
+          {/* Global multi-stegs Undo (LIFO). Döljs när jobb kör eller en icke-raderad nod är vald. */}
+          {job.status !== "running" && deletedStack.length > 0 && !(selectedId && nodes[selectedId] && !nodes[selectedId].deleted) && (
             <button
               data-keep-selection="1"
               onPointerDownCapture={(e) => e.stopPropagation()}
               aria-label="Ångra senast borttagna"
               onClick={handleUndoTop}
+              className="fx-btn"
               style={{
-                position: "absolute",
                 left: Math.round(stageDims.left + rootPadding + stageDims.w - 36),
                 top:  Math.round(stageDims.top  + rootPadding + stageDims.h + 8),
-                width: 36, height: 32, borderRadius: 999,
-                border: "1px solid var(--border)",
-                background: "var(--vscode-editorWidget-background)",
-                display: "grid", placeItems: "center",
-                zIndex: 55, cursor: "pointer",
-                boxShadow: "0 4px 10px rgba(0,0,0,.15)",
+                width: 36, zIndex: 55,
               }}
               title={`Ångra (${deletedStack.length})`}
             >
@@ -1105,23 +1148,60 @@ function App() {
             </button>
           )}
 
-          {/* Global ACCEPT – alltid synlig under preview, bredvid Undo */}
-          <button
-            data-keep-selection="1"
-            onPointerDownCapture={(e) => e.stopPropagation()}
-            aria-label={canAccept ? "Acceptera placement" : "Ingen nod att acceptera"}
-            onClick={handleAccept}
-            disabled={!canAccept}
-            className="fx-accept-btn"
-            style={{
-              left: Math.round(stageDims.left + rootPadding + stageDims.w - 140),
-              top:  Math.round(stageDims.top  + rootPadding + stageDims.h + 8),
-              zIndex: 60,
-            }}
-            title={canAccept ? "Accept" : "Ingen aktiv nod"}
-          >
-            Accept
-          </button>
+          {/* Accept: dold under jobb */}
+          {job.status !== "running" && (
+            <button
+              data-keep-selection="1"
+              onPointerDownCapture={(e) => e.stopPropagation()}
+              aria-label={canAccept ? "Acceptera placement" : "Ingen nod att acceptera"}
+              onClick={handleAccept}
+              disabled={!canAccept}
+              className="fx-accept-btn fx-btn"
+              style={{
+                left: Math.round(stageDims.left + rootPadding + stageDims.w - 140),
+                top:  Math.round(stageDims.top  + rootPadding + stageDims.h + 8),
+                zIndex: 60,
+              }}
+              title={canAccept ? "Accept" : "Ingen aktiv nod"}
+            >
+              Accept
+            </button>
+          )}
+
+          {/* Loading + Cancel under pågående jobb */}
+          {job.status === "running" && (
+            <>
+              <button
+                data-keep-selection="1"
+                className="fx-btn"
+                disabled
+                style={{
+                  left: Math.round(stageDims.left + rootPadding + stageDims.w - 180),
+                  top:  Math.round(stageDims.top  + rootPadding + stageDims.h + 8),
+                  width: 110, zIndex: 60,
+                }}
+                title="Skickar jobb…"
+              >
+                <span aria-hidden style={{ display:"inline-block", animation:"spin 1.2s linear infinite" }}>🤖</span>
+                &nbsp;Loading
+              </button>
+              <button
+                data-keep-selection="1"
+                className="fx-btn"
+                onPointerDownCapture={(e)=>e.stopPropagation()}
+                onClick={() => job.taskId && vscode.postMessage({ cmd: "cancelJob", taskId: job.taskId })}
+                disabled={!job.taskId}
+                style={{
+                  left: Math.round(stageDims.left + rootPadding + stageDims.w - 62),
+                  top:  Math.round(stageDims.top  + rootPadding + stageDims.h + 8),
+                  width: 60, zIndex: 60,
+                }}
+                title="Avbryt jobb"
+              >
+                Cancel
+              </button>
+            </>
+          )}
         </>
       )}
     </div>

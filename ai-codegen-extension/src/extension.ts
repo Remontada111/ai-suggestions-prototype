@@ -425,6 +425,8 @@ async function sendSeedPlacementIfAny(node: ImportedNode) {
 /* ─────────────────────────────────────────────────────────
    Panel och meddelanden
    ───────────────────────────────────────────────────────── */
+const jobPollers = new Map<string, NodeJS.Timeout>(); // taskId -> timer
+
 function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
   if (!currentPanel) {
     log("Skapar ny Webview-panel");
@@ -479,7 +481,40 @@ function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
         return;
       }
 
-      // ── NY: spara placement per nod (om info finns). Fallback: om exakt 1 nod aktiv.
+      // ── Ny: spara endast placement vid drag/resize/import (ingen backend)
+      if (msg?.type === "placementPreview" && msg?.payload) {
+        try {
+          const persist = vscode.workspace.getConfiguration(SETTINGS_NS).get<boolean>("persistPlacements", true);
+          if (persist) {
+            let fileKey: string | undefined = msg.fileKey;
+            let nodeId: string | undefined = msg.nodeId;
+            if (!fileKey || !nodeId) {
+              if (activeNodes.size === 1) {
+                const one = [...activeNodes.values()][0];
+                fileKey = one.fileKey; nodeId = one.nodeId;
+              }
+            }
+            if (fileKey && nodeId) {
+              const id = `${fileKey}:${nodeId}`;
+              const key = `${SETTINGS_NS}.placements.v1`;
+              const all = extCtxRef?.workspaceState.get<Record<string, any>>(key) ?? {};
+              all[id] = {
+                ...msg.payload,
+                fileKey,
+                nodeId,
+                savedAt: Date.now(),
+                schema: 1,
+              };
+              await extCtxRef?.workspaceState.update(key, all);
+            }
+          }
+        } catch (e: any) {
+          warn("placementPreview persist fel:", e?.message || String(e));
+        }
+        return;
+      }
+
+      // ── Spara placement per nod och TRIGGA backend-jobb direkt vid Accept.
       if (msg?.type === "placementAccepted" && msg?.payload) {
         try {
           const persist = vscode.workspace.getConfiguration(SETTINGS_NS).get<boolean>("persistPlacements", true);
@@ -510,6 +545,54 @@ function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
             }
           }
 
+          // Starta backend-jobbet nu
+          try {
+            const base = vscode.workspace.getConfiguration(SETTINGS_NS).get<string>("backendBaseUrl");
+            if (!base) throw new Error("Saknar backendBaseUrl i inställningarna.");
+            const fileKey: string | undefined = msg.fileKey ?? ([...activeNodes.values()][0]?.fileKey);
+            const nodeId: string | undefined  = msg.nodeId  ?? ([...activeNodes.values()][0]?.nodeId);
+            if (!fileKey || !nodeId) throw new Error("Saknar fileKey/nodeId för jobbet.");
+            const url = new URL("/figma-hook", base).toString();
+            const resp = await postJson(url, { fileKey, nodeId, placement: msg.payload });
+            const taskId: string | undefined = resp?.task_id;
+            if (!taskId) {
+              vscode.window.showWarningMessage("Backend returnerade inget task_id.");
+              return;
+            }
+
+            // Informera webview om att jobb startat
+            currentPanel?.webview.postMessage({ type: "job-started", taskId, fileKey, nodeId });
+
+            // Starta polling
+            const statusUrl = new URL(`/task/${encodeURIComponent(taskId)}`, base).toString();
+            const t = setInterval(async () => {
+              try {
+                const s = await fetchStatus(statusUrl);
+                if (!s) return;
+                if (s.done) {
+                  clearInterval(t);
+                  jobPollers.delete(taskId);
+                  currentPanel?.webview.postMessage({
+                    type: "job-finished",
+                    status: s.status,
+                    pr_url: s.pr_url,
+                    error: s.error,
+                  });
+                  if (s.status === "SUCCESS" && s.pr_url) {
+                    vscode.window.showInformationMessage(`PR skapad: ${s.pr_url}`, "Öppna").then((btn) => {
+                      if (btn === "Öppna") vscode.env.openExternal(vscode.Uri.parse(s.pr_url!));
+                    });
+                  } else if (s.status === "FAILURE") {
+                    vscode.window.showErrorMessage(s.error || "Jobbet misslyckades.");
+                  }
+                }
+              } catch {}
+            }, 1500);
+            jobPollers.set(taskId, t);
+          } catch (e:any) {
+            vscode.window.showErrorMessage(`Kunde inte starta jobb: ${e?.message || String(e)}`);
+          }
+
           // Enkla kontroller
           const p = msg.payload;
           const issues: string[] = [];
@@ -522,6 +605,22 @@ function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
           else vscode.window.showInformationMessage("Placement mottagen och validerad.");
         } catch (e: any) {
           errlog("Kunde inte spara placement (workspaceState):", e?.message || String(e));
+        }
+        return;
+      }
+
+      if (msg?.cmd === "cancelJob" && typeof msg.taskId === "string") {
+        try {
+          const base = vscode.workspace.getConfiguration(SETTINGS_NS).get<string>("backendBaseUrl");
+          if (!base) throw new Error("Saknar backendBaseUrl i inställningarna.");
+          const u = new URL(`/task/${encodeURIComponent(msg.taskId)}/cancel`, base).toString();
+          await postJson(u, {}); // POST cancel
+          const t = jobPollers.get(msg.taskId);
+          if (t) { clearInterval(t); jobPollers.delete(msg.taskId); }
+          currentPanel?.webview.postMessage({ type: "job-finished", status: "CANCELLED" });
+          vscode.window.showInformationMessage("Jobb avbrutet.");
+        } catch (e: any) {
+          vscode.window.showErrorMessage(`Kunde inte avbryta jobb: ${e?.message || String(e)}`);
         }
         return;
       }
@@ -967,7 +1066,7 @@ function basicFallbackHtml(webview: vscode.Webview): string {
 }
 
 /* ─────────────────────────────────────────────────────────
-   POST helper för backend-hook
+   POST/GET helpers för backend
    ───────────────────────────────────────────────────────── */
 function postJson(url: string, json: any, timeoutMs = 8000): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -1004,6 +1103,40 @@ function postJson(url: string, json: any, timeoutMs = 8000): Promise<any> {
     } catch (e) {
       reject(e);
     }
+  });
+}
+
+type JobStatus = { done: boolean; status: "SUCCESS" | "FAILURE" | "CANCELLED" | "PENDING"; pr_url?: string; error?: string };
+
+async function fetchStatus(url: string, timeoutMs = 6000): Promise<JobStatus | null> {
+  return await new Promise((resolve) => {
+    try {
+      const u = new URL(url);
+      const mod = u.protocol === "https:" ? https : http;
+      const req = mod.request(
+        { method: "GET", hostname: u.hostname, port: u.port, path: (u.pathname || "/") + (u.search || ""), timeout: timeoutMs },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+          res.on("end", () => {
+            try {
+              const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+              const raw = String(body?.status || "");
+              const mapped: "SUCCESS" | "FAILURE" | "CANCELLED" | "PENDING" =
+                raw === "SUCCESS" ? "SUCCESS" :
+                raw === "FAILURE" ? "FAILURE" :
+                raw === "REVOKED" ? "CANCELLED" :
+                "PENDING";
+              const done = mapped === "SUCCESS" || mapped === "FAILURE" || mapped === "CANCELLED";
+              resolve({ done, status: mapped, pr_url: body?.pr_url, error: body?.error });
+            } catch { resolve(null); }
+          });
+        }
+      );
+      req.on("timeout", () => { req.destroy(); resolve(null); });
+      req.on("error", () => resolve(null));
+      req.end();
+    } catch { resolve(null); }
   });
 }
 
@@ -1160,7 +1293,7 @@ export async function activate(context: vscode.ExtensionContext) {
     if (!pendingCandidate) {
       const candidates = await detectProjects([]);
       lastCandidates = candidates;
-      log("openPanel detekterade kandidater", { count: candidates.length });
+      log("openPanel detekterade kandidater", { count: lastCandidates.length });
       if (candidates.length) {
         pendingCandidate = candidates[0];
         if (candidates.length === 1 || (pendingCandidate?.confidence ?? 0) >= AUTO_START_SURE_THRESHOLD) {
@@ -1285,4 +1418,6 @@ export async function deactivate() {
   stopReloadWatcher();
   try { await stopDevServer(); } catch (e) { warn("stopDevServer fel:", e); }
   try { await stopInlineServer(); } catch (e) { warn("stopInlineServer fel:", e); }
+  for (const t of jobPollers.values()) { try { clearInterval(t); } catch {} }
+  jobPollers.clear();
 }
