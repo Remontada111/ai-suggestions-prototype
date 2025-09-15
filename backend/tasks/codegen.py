@@ -1,4 +1,3 @@
-# backend/tasks/codegen.py
 from __future__ import annotations
 
 """
@@ -180,9 +179,9 @@ def _parse_gpt_reply(reply: str) -> Tuple[str, str, str]:
 @app.task(name="backend.tasks.codegen.integrate_figma_node")
 def integrate_figma_node(*, file_key: str, node_id: str, placement: Dict[str, Any] | None = None) -> Dict[str, str]:
     """
-    Asynkron pipeline: hämtar Figma-node, genererar/patchar kod och öppnar PR.
+    Asynkron pipeline: hämtar Figma-node, genererar/patchar kod och returnerar innehåll och sökväg.
 
-    Returnerar: {"pr_url": "<https://github.com/...>"} för polling-endpointen.
+    Returnerar: {"content": "<file contents>", "path": "<relativ/sökväg>"}.
     """
     logger.info("Integrationsstart: file_key=%s node_id=%s", file_key, node_id)
 
@@ -250,17 +249,10 @@ def integrate_figma_node(*, file_key: str, node_id: str, placement: Dict[str, An
         repo.index.commit(commit_msg)
         logger.info("Commit klar: %s", commit_msg)
 
-        # 8) Skapa PR
-        pr_url = create_pr(
-            repo,
-            branch=branch,
-            title=commit_msg,
-            body=f"Automatisk integration för Figma-node {node_id}",
-        )
-        logger.info("Pull Request skapad: %s", pr_url)
-
-        # 9) Klart – returnera för polling-endpointen
-        return {"pr_url": pr_url}
+        # 8) Returnera innehållet istället för att skapa PR
+        content = target_path.read_text(encoding="utf-8")
+        logger.info("Code changes ready for direct apply: %s", target_rel)
+        return {"content": content, "path": target_rel}
 
     finally:
         # Alltid städa temp

@@ -120,7 +120,7 @@ function startReloadWatcher(rootDir, baseUrl) {
             log("Auto-reload posting devurl (file change)", { path: p, url: safeUrl(bust) });
             currentPanel.webview.postMessage({ type: "devurl", url: bust });
             // ── Ny: verifiera att URL:en faktiskt svarar, annars öppna väljare
-            void verifyDevUrlAndMaybeRechoose(bust, "reload");
+            void verifyDevUrlAndMaybeRechoose(forLocalProbe(bust), "reload");
         }, 200);
     };
     reloadWatcher.onDidChange(onEvt);
@@ -637,8 +637,10 @@ function ensurePanel(context) {
                             vscode.window.showWarningMessage("Backend returnerade inget task_id.");
                             return;
                         }
-                        // Informera webview om att jobb startat
+                        // Informera webview om att jobb startat och visa loading-state
                         currentPanel === null || currentPanel === void 0 ? void 0 : currentPanel.webview.postMessage({ type: "job-started", taskId, fileKey, nodeId });
+                        currentPanel === null || currentPanel === void 0 ? void 0 : currentPanel.webview.postMessage({ type: "ui-phase", phase: "loading" });
+                        lastUiPhase = "loading";
                         // Starta polling
                         const statusUrl = new URL(`/task/${encodeURIComponent(taskId)}`, base).toString();
                         const t = setInterval(async () => {
@@ -655,11 +657,22 @@ function ensurePanel(context) {
                                         pr_url: s.pr_url,
                                         error: s.error,
                                     });
-                                    if (s.status === "SUCCESS" && s.pr_url) {
-                                        vscode.window.showInformationMessage(`PR skapad: ${s.pr_url}`, "Öppna").then((btn) => {
-                                            if (btn === "Öppna")
-                                                vscode.env.openExternal(vscode.Uri.parse(s.pr_url));
-                                        });
+                                    if (s.status === "SUCCESS") {
+                                        // Skriv AI-genererat innehåll direkt till fil i workspace
+                                        if (s.path && s.content) {
+                                            const [folder] = vscode.workspace.workspaceFolders || [];
+                                            if (folder) {
+                                                const filePath = path.join(folder.uri.fsPath, s.path);
+                                                try {
+                                                    await fsp.mkdir(path.dirname(filePath), { recursive: true });
+                                                    await fsp.writeFile(filePath, s.content, "utf8");
+                                                    vscode.window.showInformationMessage(`✅ AI changes applied to ${s.path}`);
+                                                }
+                                                catch (err) {
+                                                    vscode.window.showErrorMessage(`Failed to apply AI changes: ${err.message}`);
+                                                }
+                                            }
+                                        }
                                     }
                                     else if (s.status === "FAILURE") {
                                         vscode.window.showErrorMessage(s.error || "Jobbet misslyckades.");
@@ -747,11 +760,7 @@ function ensurePanel(context) {
                 await pickFolderAndStart(extCtxRef);
                 return;
             }
-            if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "openPR" && typeof msg.url === "string") {
-                log("Öppnar PR-url via system", { url: msg.url });
-                vscode.env.openExternal(vscode.Uri.parse(msg.url));
-                return;
-            }
+            // PR-öppning används inte längre
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "enterFullView") {
                 log("WV bad om enterFullView");
                 await enterFullView(currentPanel);
@@ -840,6 +849,29 @@ function normalizeRel(rel) {
     return rel.replace(/^\.\//, "").replace(/^\/+/, "");
 }
 async function startOrRespectfulFallback(c, context) {
+    // 0) Försök smart: TS/TSX i index.html ⇒ dev-server (npm run dev → Vite → preview), annars inline.
+    try {
+        log("Startar smart server", { cwd: redactPath(c.dir) });
+        const { externalUrl } = await (0, runner_1.runSmartServer)(c.dir, selectLaunchCommand(c));
+        // Säkerhetsbälte: om basen inte är direkt nåbar, prova index.html
+        try {
+            const ok = await quickCheck(externalUrl);
+            if (!ok) {
+                const base = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
+                if (await quickCheck(base + "index.html")) {
+                    const url = base + "index.html";
+                    log("Smart: föll tillbaka till index.html", { url: safeUrl(url) });
+                    return { externalUrl: url, mode: "dev" };
+                }
+            }
+        }
+        catch (_a) { }
+        return { externalUrl, mode: "dev" };
+    }
+    catch (e) {
+        warn("Smart server misslyckades, provar legacy-fallback", e);
+    }
+    // 1) Legacy: använd explicit dev-kommando om möjligt
     const cmd = selectLaunchCommand(c);
     if (cmd) {
         try {
@@ -881,6 +913,7 @@ async function startOrRespectfulFallback(c, context) {
             errlog("Dev-server start misslyckades:", (e === null || e === void 0 ? void 0 : e.message) || e);
         }
     }
+    // 2) Inline-fallback
     const html = await findExistingHtml(c);
     if (html) {
         log("Startar inline static server för HTML-root", { root: redactPath(html.root) });
@@ -960,7 +993,7 @@ async function startCandidatePreviewWithFallback(c, context, opts) {
             log("Postar devurl", { url: safeUrl(busted), mode: res.mode, watchRoot: redactPath(res.watchRoot) });
             panel.webview.postMessage({ type: "devurl", url: busted });
             // ── Ny: verifiera att URL:en svarar, annars öppna projektväljaren
-            void verifyDevUrlAndMaybeRechoose(busted, "initial");
+            void verifyDevUrlAndMaybeRechoose(forLocalProbe(busted), "initial");
             if ((res.mode === "inline" || res.mode === "http") && res.watchRoot) {
                 startReloadWatcher(res.watchRoot, res.externalUrl);
             }
@@ -1203,7 +1236,14 @@ async function fetchStatus(url, timeoutMs = 6000) {
                                 raw === "REVOKED" ? "CANCELLED" :
                                     "PENDING";
                         const done = mapped === "SUCCESS" || mapped === "FAILURE" || mapped === "CANCELLED";
-                        resolve({ done, status: mapped, pr_url: body === null || body === void 0 ? void 0 : body.pr_url, error: body === null || body === void 0 ? void 0 : body.error });
+                        resolve({
+                            done,
+                            status: mapped,
+                            pr_url: body === null || body === void 0 ? void 0 : body.pr_url,
+                            error: body === null || body === void 0 ? void 0 : body.error,
+                            path: body === null || body === void 0 ? void 0 : body.path,
+                            content: body === null || body === void 0 ? void 0 : body.content,
+                        });
                     }
                     catch (_a) {
                         resolve(null);
@@ -1218,6 +1258,17 @@ async function fetchStatus(url, timeoutMs = 6000) {
             resolve(null);
         }
     });
+}
+function forLocalProbe(u) {
+    try {
+        const x = new URL(u);
+        if (x.hostname === "localhost")
+            x.hostname = "127.0.0.1";
+        return x.toString();
+    }
+    catch (_a) {
+        return u;
+    }
 }
 // Välj nod och skicka placement till backend
 async function triggerFigmaHookWithPlacement() {

@@ -385,9 +385,15 @@ function App() {
       }
 
       if (msg.type === "job-finished") {
-        if (msg.status === "SUCCESS") setJob({ status: "done" });
-        else if (msg.status === "CANCELLED") setJob({ status: "idle" });
-        else setJob({ status: "error" });
+        if (msg.status === "SUCCESS") {
+          setJob({ status: "done" });
+        } else if (msg.status === "CANCELLED") {
+          setJob({ status: "idle" });
+        } else {
+          setJob({ status: "error" });
+        }
+        // Return to default UI phase (show preview again)
+        setPhase("default");
         return;
       }
     }
@@ -826,7 +832,7 @@ function App() {
           borderRadius: 12,
         }}
       >
-        {(!devUrl || phase !== "default") && (
+        {(!devUrl || (phase !== "default" && phase !== "loading")) && (
           <div className="skeleton" aria-hidden="true" style={{ width: "100%", height: "100%", borderRadius: 12 }} />
         )}
 
@@ -979,6 +985,28 @@ function App() {
             />
           );
         })}
+
+        {/* Loading overlay under kodgenerering och applicering */}
+        {phase === "loading" && (
+          <div style={{
+            position: "absolute", inset: 0, zIndex: 100,
+            display: "grid", placeItems: "center",
+            background: "rgba(0, 0, 0, 0.4)"  /* semi-transparent dark overlay */
+          }}>
+            <div style={{
+              color: "#fff", textAlign: "center", padding: "16px 24px", borderRadius: 8
+            }}>
+              <p>🤖 <strong>Generating code</strong> based on design…</p>
+              <p>🤖 <strong>Applying changes</strong> to project preview…</p>
+              <button onClick={() => vscode.postMessage({ cmd: "cancelJob", taskId: job.taskId })}
+                      style={{ marginTop: 12, padding: "6px 12px",
+                               border: "1px solid var(--border)", borderRadius: 999,
+                               background: "var(--vscode-editorWidget-background)", color: "var(--foreground)" }}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Onboarding-kort */}

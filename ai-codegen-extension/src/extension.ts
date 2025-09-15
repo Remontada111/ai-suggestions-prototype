@@ -7,7 +7,7 @@ import * as http from "node:http";
 import * as https from "node:https";
 
 import { detectProjects, Candidate } from "./detector";
-import { runDevServer, stopDevServer, runInlineStaticServer, stopInlineServer } from "./runner";
+import { runDevServer, stopDevServer, runInlineStaticServer, stopInlineServer, runSmartServer } from "./runner";
 import { loadModelIfAny } from "./ml/classifier";
 import { exportDatasetCommand } from "./commands/exportDataset";
 
@@ -94,7 +94,7 @@ function startReloadWatcher(rootDir: string, baseUrl: string) {
       log("Auto-reload posting devurl (file change)", { path: p, url: safeUrl(bust) });
       currentPanel.webview.postMessage({ type: "devurl", url: bust });
       // ── Ny: verifiera att URL:en faktiskt svarar, annars öppna väljare
-      void verifyDevUrlAndMaybeRechoose(bust, "reload");
+     void verifyDevUrlAndMaybeRechoose(forLocalProbe(bust), "reload");
     }, 200);
   };
 
@@ -560,8 +560,10 @@ function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
               return;
             }
 
-            // Informera webview om att jobb startat
+            // Informera webview om att jobb startat och visa loading-state
             currentPanel?.webview.postMessage({ type: "job-started", taskId, fileKey, nodeId });
+            currentPanel?.webview.postMessage({ type: "ui-phase", phase: "loading" });
+            lastUiPhase = "loading";
 
             // Starta polling
             const statusUrl = new URL(`/task/${encodeURIComponent(taskId)}`, base).toString();
@@ -578,10 +580,22 @@ function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
                     pr_url: s.pr_url,
                     error: s.error,
                   });
-                  if (s.status === "SUCCESS" && s.pr_url) {
-                    vscode.window.showInformationMessage(`PR skapad: ${s.pr_url}`, "Öppna").then((btn) => {
-                      if (btn === "Öppna") vscode.env.openExternal(vscode.Uri.parse(s.pr_url!));
-                    });
+
+                  if (s.status === "SUCCESS") {
+                    // Skriv AI-genererat innehåll direkt till fil i workspace
+                    if (s.path && s.content) {
+                      const [folder] = vscode.workspace.workspaceFolders || [];
+                      if (folder) {
+                        const filePath = path.join(folder.uri.fsPath, s.path);
+                        try {
+                          await fsp.mkdir(path.dirname(filePath), { recursive: true });
+                          await fsp.writeFile(filePath, s.content, "utf8");
+                          vscode.window.showInformationMessage(`✅ AI changes applied to ${s.path}`);
+                        } catch (err: any) {
+                          vscode.window.showErrorMessage(`Failed to apply AI changes: ${err.message}`);
+                        }
+                      }
+                    }
                   } else if (s.status === "FAILURE") {
                     vscode.window.showErrorMessage(s.error || "Jobbet misslyckades.");
                   }
@@ -659,11 +673,7 @@ function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
         return;
       }
 
-      if (msg?.cmd === "openPR" && typeof msg.url === "string") {
-        log("Öppnar PR-url via system", { url: msg.url });
-        vscode.env.openExternal(vscode.Uri.parse(msg.url));
-        return;
-      }
+      // PR-öppning används inte längre
 
       if (msg?.cmd === "enterFullView") {
         log("WV bad om enterFullView");
@@ -754,6 +764,28 @@ async function startOrRespectfulFallback(
   c: Candidate,
   context: vscode.ExtensionContext
 ): Promise<{ externalUrl: string; mode: "dev" | "http" | "inline"; watchRoot?: string }> {
+  // 0) Försök smart: TS/TSX i index.html ⇒ dev-server (npm run dev → Vite → preview), annars inline.
+  try {
+    log("Startar smart server", { cwd: redactPath(c.dir) });
+    const { externalUrl } = await runSmartServer(c.dir, selectLaunchCommand(c));
+    // Säkerhetsbälte: om basen inte är direkt nåbar, prova index.html
+    try {
+      const ok = await quickCheck(externalUrl);
+      if (!ok) {
+        const base = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
+        if (await quickCheck(base + "index.html")) {
+          const url = base + "index.html";
+          log("Smart: föll tillbaka till index.html", { url: safeUrl(url) });
+          return { externalUrl: url, mode: "dev" };
+        }
+      }
+    } catch {}
+    return { externalUrl, mode: "dev" };
+  } catch (e) {
+    warn("Smart server misslyckades, provar legacy-fallback", e);
+  }
+
+  // 1) Legacy: använd explicit dev-kommando om möjligt
   const cmd = selectLaunchCommand(c);
   if (cmd) {
     try {
@@ -797,6 +829,7 @@ async function startOrRespectfulFallback(
     }
   }
 
+  // 2) Inline-fallback
   const html = await findExistingHtml(c);
   if (html) {
     log("Startar inline static server för HTML-root", { root: redactPath(html.root) });
@@ -880,7 +913,7 @@ async function startCandidatePreviewWithFallback(
       panel.webview.postMessage({ type: "devurl", url: busted });
 
       // ── Ny: verifiera att URL:en svarar, annars öppna projektväljaren
-      void verifyDevUrlAndMaybeRechoose(busted, "initial");
+      void verifyDevUrlAndMaybeRechoose(forLocalProbe(busted), "initial");
 
       if ((res.mode === "inline" || res.mode === "http") && res.watchRoot) {
         startReloadWatcher(res.watchRoot, res.externalUrl);
@@ -1106,7 +1139,14 @@ function postJson(url: string, json: any, timeoutMs = 8000): Promise<any> {
   });
 }
 
-type JobStatus = { done: boolean; status: "SUCCESS" | "FAILURE" | "CANCELLED" | "PENDING"; pr_url?: string; error?: string };
+type JobStatus = {
+  done: boolean;
+  status: "SUCCESS" | "FAILURE" | "CANCELLED" | "PENDING";
+  pr_url?: string;   // bakåtkompat
+  error?: string;
+  path?: string;     // relativ path i workspace
+  content?: string;  // filinnehåll att skriva
+};
 
 async function fetchStatus(url: string, timeoutMs = 6000): Promise<JobStatus | null> {
   return await new Promise((resolve) => {
@@ -1128,7 +1168,14 @@ async function fetchStatus(url: string, timeoutMs = 6000): Promise<JobStatus | n
                 raw === "REVOKED" ? "CANCELLED" :
                 "PENDING";
               const done = mapped === "SUCCESS" || mapped === "FAILURE" || mapped === "CANCELLED";
-              resolve({ done, status: mapped, pr_url: body?.pr_url, error: body?.error });
+              resolve({
+                done,
+                status: mapped,
+                pr_url: body?.pr_url,
+                error: body?.error,
+                path: body?.path,
+                content: body?.content,
+              });
             } catch { resolve(null); }
           });
         }
@@ -1138,6 +1185,10 @@ async function fetchStatus(url: string, timeoutMs = 6000): Promise<JobStatus | n
       req.end();
     } catch { resolve(null); }
   });
+}
+function forLocalProbe(u: string): string {
+  try { const x = new URL(u); if (x.hostname === "localhost") x.hostname = "127.0.0.1"; return x.toString(); }
+  catch { return u; }
 }
 
 // Välj nod och skicka placement till backend

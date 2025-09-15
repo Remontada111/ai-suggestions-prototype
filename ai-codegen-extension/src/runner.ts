@@ -1,9 +1,9 @@
 // extension/src/runner.ts
 // Robust dev-server runner + minimal inline static server.
-// - Fångar URL:er från loggar för de flesta populära dev-servrar
+// - Autodetekterar TS/TSX module-entry i index.html → startar riktig dev-server (Vite) automatiskt
+// - Fångar URL:er från loggar för populära dev-servrar
 // - Portgissning (parallell) på vanliga portar
-// - Tuff reachability-koll (HEAD/GET, "/", "/index.html")
-// - Säkra uppstartsmiljövariabler (HOST=127.0.0.1, BROWSER=none)
+// - Reachability-koll (HEAD/GET, "/", "/index.html")
 // - Processhantering med kill tree
 // - Ultralätt inline-server för statiska HTML-mappar
 
@@ -13,6 +13,7 @@ import * as http from "node:http";
 import * as https from "node:https";
 import * as os from "node:os";
 import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { AddressInfo } from "node:net";
 
@@ -62,7 +63,6 @@ const URL_PATTERNS: RegExp[] = [
 ];
 
 function stripAnsi(s: string): string {
-  // ta bort ANSI-färgkoder (räcker för Vite/Nuxt/Remix m.fl.)
   return s.replace(/\x1B\[[0-9;]*m/g, "");
 }
 
@@ -79,12 +79,12 @@ function normalizeLocalUrl(raw: string): string {
     const u = new URL(raw.trim());
     // Normalisera till localhost för inbäddning i webview/proxy
     if (
-      u.hostname === "0.0.0.0" ||
-      u.hostname === "127.0.0.1" ||
+     u.hostname === "0.0.0.0" ||
       u.hostname === "::" ||
-      u.hostname === "[::]"
+      u.hostname === "[::]" ||
+      u.hostname === "localhost"
     ) {
-      u.hostname = "localhost";
+      u.hostname = "127.0.0.1";
     }
     if (!u.pathname.endsWith("/")) u.pathname += "/";
     return u.toString();
@@ -115,7 +115,6 @@ function headPing(url: string, timeoutMs = 900): Promise<boolean> {
           timeout: timeoutMs
         },
         (res) => {
-          // Godkänn endast 2xx/3xx som "reachable" för att undvika falska positiva (t.ex. 404)
           res.resume();
           const ok = (res.statusCode ?? 500) < 400;
           resolve(ok);
@@ -147,7 +146,6 @@ function getOk(url: string, timeoutMs = 1500): Promise<boolean> {
           timeout: timeoutMs
         },
         (res) => {
-          // 2xx/3xx betraktas som OK
           const ok = (res.statusCode ?? 500) < 400;
           res.resume();
           resolve(ok);
@@ -173,8 +171,7 @@ async function waitForReachable(rawUrl: string, timeoutMs = 12000): Promise<bool
   while (Date.now() < until) {
     for (const u of cand) {
       if (await headPing(u, 900)) return true;
-      // Om HEAD misslyckas (en del dev-servrar svarar inte på HEAD) → prova GET
-      if (await getOk(u, 1500)) return true;
+      if (await getOk(u, 1500)) return true; // en del dev-servrar svarar inte på HEAD
     }
     await sleep(350);
   }
@@ -201,7 +198,6 @@ function firstTruthy<T>(promises: Promise<T>[], pred: (v: T) => boolean): Promis
 }
 
 async function guessPortsFast(): Promise<string | null> {
-  // Utökad lista med vanliga dev/preview-portar
   const ports = [
     5173, 4173,        // Vite dev / preview
     3000, 3001,        // Next/React/Remix
@@ -222,7 +218,7 @@ async function guessPortsFast(): Promise<string | null> {
   }
 
   const probes = urls.map(u => headPing(u, 900).then(ok => (ok ? u : null)));
-  const hit = await firstTruthy(probes, (v) => Boolean(v));
+  const hit = await firstTruthy(probes as unknown as Promise<string>[], (v) => Boolean(v));
   return (hit as string | null) ?? null;
 }
 
@@ -238,7 +234,6 @@ async function killProcessTree(child: ChildProcess): Promise<void> {
     if (!child.pid) return done();
 
     if (process.platform === "win32") {
-      // Dödar hela trädet på Windows
       const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
       killer.on("exit", done);
       killer.on("error", done);
@@ -246,15 +241,12 @@ async function killProcessTree(child: ChildProcess): Promise<void> {
     }
 
     try {
-      // Signala processgruppen om möjligt
       try {
-        // -pid = grupp
-        process.kill(-child.pid, "SIGTERM");
+        process.kill(-child.pid, "SIGTERM"); // -pid = grupp
       } catch {
         try { child.kill("SIGTERM"); } catch { /* ignore */ }
       }
 
-      // Kort fallback till SIGKILL efter ~400ms
       setTimeout(() => {
         if (child.pid !== undefined) {
           try { process.kill(-child.pid, "SIGKILL"); } catch { /* ignore */ }
@@ -395,7 +387,6 @@ export async function runInlineStaticServer(
   const externalUri = await vscode.env.asExternalUri(vscode.Uri.parse(localUrl));
 
   const stop = async () => {
-    // Stoppa just denna instans
     if (activeInline === server) {
       await stopInlineServer();
     } else {
@@ -472,7 +463,6 @@ export async function runDevServer(
   child.on("exit", (code, signal) => {
     if (activeChild === child) activeChild = null;
     out.appendLine(`\n[server] Avslutad (code=${code}, signal=${signal})`);
-    // Om processen dog innan vi hittade URL – avsluta log-promise
     if (resolveLogUrl) {
       resolveLogUrl(null);
       resolveLogUrl = null;
@@ -504,7 +494,6 @@ export async function runDevServer(
   const external = await vscode.env.asExternalUri(vscode.Uri.parse(url));
 
   const stop = async () => {
-    // Stoppa just den här processen
     if (activeChild === child) {
       await stopDevServer();
     } else if (child.pid) {
@@ -513,4 +502,82 @@ export async function runDevServer(
   };
 
   return { localUrl: normalizeLocalUrl(url), externalUrl: external.toString(true), stop };
+}
+
+/* ─────────────────────────────────────────────────────────
+   Autodetektera TSX-entry → starta rätt server automatiskt
+   ───────────────────────────────────────────────────────── */
+
+async function findIndexHtml(dir: string): Promise<string | null> {
+  const cand = ["index.html", "public/index.html"];
+  for (const f of cand) {
+    const p = path.join(dir, f);
+    try {
+      const st = await fsp.stat(p);
+      if (st.isFile()) return p;
+    } catch { /* ignore */ }
+  }
+  return null;
+}
+
+async function detectTsModuleEntry(dir: string): Promise<string | null> {
+  const indexPath = await findIndexHtml(dir);
+  if (!indexPath) return null;
+  const html = await fsp.readFile(indexPath, "utf8");
+  // Fånga <script type="module" src="...ts|tsx">
+  const re = /<script\s+[^>]*type\s*=\s*["']module["'][^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/i;
+  const m = html.match(re);
+  if (!m) return null;
+  const src = m[1].trim();
+  if (/\.(ts|tsx)(\?|#|$)/i.test(src)) return src;
+  return null;
+}
+
+async function readPkgDevScript(dir: string): Promise<string | null> {
+  const p = path.join(dir, "package.json");
+  try {
+    const txt = await fsp.readFile(p, "utf8");
+    const pkg = JSON.parse(txt);
+    if (pkg?.scripts?.dev && typeof pkg.scripts.dev === "string") {
+      return "npm run dev";
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+/** Starta rätt server automatiskt:
+ * - Om index.html laddar .ts/.tsx som module → försök dev-server (npm run dev → vite → vite preview).
+ * - Annars → inline statisk server.
+ */
+export async function runSmartServer(
+  cwd: string,
+  explicitDevCmd?: string
+): Promise<{ localUrl: string; externalUrl: string; stop: () => Promise<void> }> {
+  const tsEntry = await detectTsModuleEntry(cwd);
+  if (tsEntry) {
+    // 1) använd explicit kommando om givet
+    if (explicitDevCmd && explicitDevCmd.trim()) {
+      return await runDevServer(explicitDevCmd, cwd);
+    }
+    // 2) scripts.dev finns?
+    const devScript = await readPkgDevScript(cwd);
+    if (devScript) {
+      try {
+        return await runDevServer(devScript, cwd);
+      } catch { /* prova nästa */ }
+    }
+    // 3) prova Vite dev
+    try {
+      return await runDevServer("npx vite --port 5173 --strictPort", cwd);
+    } catch { /* prova preview */ }
+    // 4) prova Vite preview (kräver build om inte redan byggt)
+    try {
+      return await runDevServer("npx vite preview --port 4173 --strictPort", cwd);
+    } catch {
+      // sista chans: fall tillbaka till inline (kan ge MIME-fel om TSX fortfarande pekas i index.html)
+    }
+  }
+
+  // Standard: inline statisk server (HTML/JS/CSS)
+  return await runInlineStaticServer(cwd);
 }

@@ -1,4 +1,3 @@
-# backend/app/main.py
 from __future__ import annotations
 
 """
@@ -111,6 +110,13 @@ async def task_status(task_id: str) -> Dict[str, Any]:
             pr_url = result.result.get("pr_url")
             if pr_url:
                 response["pr_url"] = pr_url
+            # Nya fält för direkt-applicering
+            path = result.result.get("path")
+            content = result.result.get("content")
+            if path:
+                response["path"] = path
+            if content:
+                response["content"] = content
     elif status == "FAILURE":
         response["error"] = str(result.result)
     return response
