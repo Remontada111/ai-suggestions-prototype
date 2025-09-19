@@ -1,9 +1,10 @@
 // extension/src/runner.ts
 // Robust dev-server runner + minimal inline static server.
-// - Autodetekterar TS/TSX module-entry i index.html → startar riktig dev-server (Vite) automatiskt
+// - Autostartar Vite/preview när index.html refererar .ts/.tsx/.jsx
+// - Auto-install av deps (npm/pnpm/yarn/bun) när node_modules saknas/lockfile ändrats
 // - Fångar URL:er från loggar för populära dev-servrar
 // - Portgissning (parallell) på vanliga portar
-// - Reachability-koll (HEAD/GET, "/", "/index.html")
+// - Reachability-koll (HEAD/GET, "/", "/index.html", "@vite/client")
 // - Processhantering med kill tree
 // - Ultralätt inline-server för statiska HTML-mappar
 
@@ -15,6 +16,7 @@ import * as os from "node:os";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import * as crypto from "node:crypto";
 import { AddressInfo } from "node:net";
 
 /* ─────────────────────────────────────────────────────────
@@ -77,9 +79,9 @@ function extractUrl(text: string): string | null {
 function normalizeLocalUrl(raw: string): string {
   try {
     const u = new URL(raw.trim());
-    // Normalisera till localhost för inbäddning i webview/proxy
+    // Normalisera till loopback för extensionens probes
     if (
-     u.hostname === "0.0.0.0" ||
+      u.hostname === "0.0.0.0" ||
       u.hostname === "::" ||
       u.hostname === "[::]" ||
       u.hostname === "localhost"
@@ -166,12 +168,12 @@ function getOk(url: string, timeoutMs = 1500): Promise<boolean> {
 async function waitForReachable(rawUrl: string, timeoutMs = 12000): Promise<boolean> {
   const until = Date.now() + timeoutMs;
   const base = normalizeLocalUrl(rawUrl);
-  const cand = [base, base + "index.html"];
+  const cand = [base, base + "index.html", base + "@vite/client"];
 
   while (Date.now() < until) {
     for (const u of cand) {
       if (await headPing(u, 900)) return true;
-      if (await getOk(u, 1500)) return true; // en del dev-servrar svarar inte på HEAD
+      if (await getOk(u, 1500)) return true; // vissa dev-servrar svarar inte på HEAD
     }
     await sleep(350);
   }
@@ -279,18 +281,21 @@ function contentType(p: string): string {
   const ext = path.extname(p).toLowerCase();
   const map: Record<string, string> = {
     ".html": "text/html; charset=utf-8",
-    ".js":  "text/javascript; charset=utf-8",
-    ".mjs": "text/javascript; charset=utf-8",
-    ".wasm":"application/wasm",
-    ".css": "text/css; charset=utf-8",
+    ".js":   "text/javascript; charset=utf-8",
+    ".mjs":  "text/javascript; charset=utf-8",
+    ".ts":   "text/javascript; charset=utf-8",   // OBS: transpilerar inte TS
+    ".tsx":  "text/javascript; charset=utf-8",   // OBS: transpilerar inte TSX
+    ".jsx":  "text/javascript; charset=utf-8",   // OBS: transpilerar inte JSX
+    ".wasm": "application/wasm",
+    ".css":  "text/css; charset=utf-8",
     ".json": "application/json; charset=utf-8",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
+    ".png":  "image/png",
+    ".jpg":  "image/jpeg",
     ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".svg": "image/svg+xml",
-    ".ico": "image/x-icon",
-    ".txt": "text/plain; charset=utf-8"
+    ".gif":  "image/gif",
+    ".svg":  "image/svg+xml",
+    ".ico":  "image/x-icon",
+    ".txt":  "text/plain; charset=utf-8"
   };
   return map[ext] ?? "application/octet-stream";
 }
@@ -423,7 +428,7 @@ export async function runDevServer(
       ...process.env,
       HOST: "127.0.0.1",  // undvik "::" / 0.0.0.0
       BROWSER: "none",    // förhindra att CLI öppnar systembrowser
-      // Viktigt: sätt INTE PORT=0 här – låt verktyget välja egen port
+      // Viktigt: sätt INTE PORT=0 här – låt verktyget välja egen port om vi inte explicit sätter det i kommandot
       NO_COLOR: "1",      // be CLIs att inte färga
       FORCE_COLOR: "0"    // säkerhetsbälte om NO_COLOR ignoreras
     },
@@ -505,11 +510,22 @@ export async function runDevServer(
 }
 
 /* ─────────────────────────────────────────────────────────
-   Autodetektera TSX-entry → starta rätt server automatiskt
+   Autodetektera module-entry → starta rätt server automatiskt
    ───────────────────────────────────────────────────────── */
 
 async function findIndexHtml(dir: string): Promise<string | null> {
-  const cand = ["index.html", "public/index.html"];
+  const cand = [
+    "index.html",
+    "public/index.html",
+    "dist/index.html", // byggd artefakt
+    // Vanliga monorepo/webview-layouter
+    "src/webview/index.html",
+    "src/webview/public/index.html",
+    "src/index.html",
+    "web/index.html",
+    "apps/web/index.html",
+    "packages/web/public/index.html",
+  ];
   for (const f of cand) {
     const p = path.join(dir, f);
     try {
@@ -520,17 +536,15 @@ async function findIndexHtml(dir: string): Promise<string | null> {
   return null;
 }
 
-async function detectTsModuleEntry(dir: string): Promise<string | null> {
+async function detectModuleEntry(dir: string): Promise<string | null> {
   const indexPath = await findIndexHtml(dir);
   if (!indexPath) return null;
   const html = await fsp.readFile(indexPath, "utf8");
-  // Fånga <script type="module" src="...ts|tsx">
   const re = /<script\s+[^>]*type\s*=\s*["']module["'][^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/i;
   const m = html.match(re);
   if (!m) return null;
   const src = m[1].trim();
-  if (/\.(ts|tsx)(\?|#|$)/i.test(src)) return src;
-  return null;
+  return /\.(ts|tsx|js|jsx)(\?|#|$)/i.test(src) ? src : null;
 }
 
 async function readPkgDevScript(dir: string): Promise<string | null> {
@@ -545,39 +559,136 @@ async function readPkgDevScript(dir: string): Promise<string | null> {
   return null;
 }
 
-/** Starta rätt server automatiskt:
- * - Om index.html laddar .ts/.tsx som module → försök dev-server (npm run dev → vite → vite preview).
- * - Annars → inline statisk server.
+/* ─────────────────────────────────────────────────────────
+   Auto-install (npm/pnpm/yarn/bun) vid behov
+   ───────────────────────────────────────────────────────── */
+
+function detectPM(cwd: string): { pm: "pnpm" | "yarn" | "bun" | "npm"; lock: string | null } {
+  if (fs.existsSync(path.join(cwd, "pnpm-lock.yaml"))) return { pm: "pnpm", lock: "pnpm-lock.yaml" };
+  if (fs.existsSync(path.join(cwd, "yarn.lock")))     return { pm: "yarn", lock: "yarn.lock" };
+  if (fs.existsSync(path.join(cwd, "bun.lockb")))     return { pm: "bun",  lock: "bun.lockb" };
+  if (fs.existsSync(path.join(cwd, "package-lock.json"))) return { pm: "npm", lock: "package-lock.json" };
+  return { pm: "npm", lock: null };
+}
+
+function hashFile(p: string): string | null {
+  try { return crypto.createHash("sha1").update(fs.readFileSync(p)).digest("hex"); } catch { return null; }
+}
+
+function installStampPath(cwd: string) {
+  return path.join(cwd, "node_modules", ".ai-figma-install.json");
+}
+
+function needsInstall(cwd: string): boolean {
+  const { lock } = detectPM(cwd);
+  const nodeMods = path.join(cwd, "node_modules");
+  const stampPath = installStampPath(cwd);
+
+  if (!lock) return !fs.existsSync(nodeMods); // inget lock → heuristik
+
+  const lockPath = path.join(cwd, lock);
+  if (!fs.existsSync(lockPath)) return false; // inget att installera
+  if (!fs.existsSync(nodeMods)) return true;
+
+  try {
+    const stamp = JSON.parse(fs.readFileSync(stampPath, "utf8"));
+    const cur = { lock: hashFile(lockPath), node: process.version };
+    return !(stamp && stamp.lock === cur.lock && stamp.node === cur.node);
+  } catch {
+    return true;
+  }
+}
+
+async function runInstall(cwd: string, out: vscode.OutputChannel) {
+  const { pm, lock } = detectPM(cwd);
+  const cmd =
+    pm === "pnpm" ? "pnpm install --frozen-lockfile" :
+    pm === "yarn" ? "yarn install --immutable || yarn install --frozen-lockfile" :
+    pm === "bun"  ? "bun install" :
+                    "npm ci";
+
+  out.appendLine(`[deps] Kör: ${cmd}`);
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(cmd, {
+      cwd,
+      shell: true,
+      env: process.env,
+      detached: os.platform() !== "win32",
+      windowsHide: true
+    });
+    child.stdout?.on("data", b => out.append(b.toString()));
+    child.stderr?.on("data", b => out.append(b.toString()));
+    child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`install exit ${code}`)));
+  });
+
+  try {
+    const lockHash = lock ? hashFile(path.join(cwd, lock)) : null;
+    const stamp = { lock: lockHash, node: process.version, ts: Date.now() };
+    await fsp.mkdir(path.join(cwd, "node_modules"), { recursive: true });
+    fs.writeFileSync(installStampPath(cwd), JSON.stringify(stamp), "utf8");
+  } catch { /* ignore */ }
+}
+
+/* ─────────────────────────────────────────────────────────
+   Smart server-start
+   ───────────────────────────────────────────────────────── */
+
+/**
+ * Starta rätt server automatiskt:
+ * 1) auto-installera deps om behövs
+ * 2) explicit kommando
+ * 3) package.json:s "dev"
+ * 4) module-entry hittad → prova Vite dev, sedan preview (port 0)
+ * 5) annars inline statisk server
+ *
+ * OBS: Om index.html refererar .ts/.tsx/.jsx och Vite/preview inte startar
+ *      kastas fel i stället för att falla tillbaka till inline.
  */
 export async function runSmartServer(
   cwd: string,
   explicitDevCmd?: string
 ): Promise<{ localUrl: string; externalUrl: string; stop: () => Promise<void> }> {
-  const tsEntry = await detectTsModuleEntry(cwd);
-  if (tsEntry) {
-    // 1) använd explicit kommando om givet
-    if (explicitDevCmd && explicitDevCmd.trim()) {
-      return await runDevServer(explicitDevCmd, cwd);
+  // Skapa output-kanal för ev. auto-install
+  const out = vscode.window.createOutputChannel("AI Figma Codegen – Dev Server");
+
+  // 0) auto-install om node_modules saknas eller lockfile ändrats
+  try {
+    if (needsInstall(cwd)) {
+      out.appendLine(`[deps] Upptäckte saknade/inkonsistenta beroenden i ${cwd}`);
+      await runInstall(cwd, out);
     }
-    // 2) scripts.dev finns?
-    const devScript = await readPkgDevScript(cwd);
-    if (devScript) {
-      try {
-        return await runDevServer(devScript, cwd);
-      } catch { /* prova nästa */ }
-    }
-    // 3) prova Vite dev
-    try {
-      return await runDevServer("npx vite --port 5173 --strictPort", cwd);
-    } catch { /* prova preview */ }
-    // 4) prova Vite preview (kräver build om inte redan byggt)
-    try {
-      return await runDevServer("npx vite preview --port 4173 --strictPort", cwd);
-    } catch {
-      // sista chans: fall tillbaka till inline (kan ge MIME-fel om TSX fortfarande pekas i index.html)
+  } catch (e: any) {
+    out.appendLine(`[deps] Installationsfel ignoreras: ${e?.message || String(e)}`);
+  }
+
+  // 1) explicit kommando
+  if (explicitDevCmd?.trim()) {
+    try { return await runDevServer(explicitDevCmd, cwd); } catch {}
+  }
+
+  // 2) package.json:s dev-script
+  const devScript = await readPkgDevScript(cwd);
+  if (devScript) {
+    try { return await runDevServer(devScript, cwd); } catch {}
+  }
+
+  // 3) module-entry ⇒ prova Vite
+  const modEntry = await detectModuleEntry(cwd);
+  if (modEntry) {
+    // Kör Vite på ledig port
+    try { return await runDevServer("npx vite --host 127.0.0.1 --port 0", cwd); } catch {}
+    try { return await runDevServer("npx vite preview --host 127.0.0.1 --port 0", cwd); } catch {}
+
+    // Om TS/TSX/JSX i index.html → kasta fel i stället för inline-fallback
+    if (/\.(ts|tsx|jsx)(\?|#|$)/i.test(modEntry)) {
+      throw new Error(
+        `index.html refererar ${modEntry}. Starta Vite (npm run dev) eller bygg + "vite preview". ` +
+        `Statisk server stödjer inte TS/TSX/JSX utan bundling.`
+      );
     }
   }
 
-  // Standard: inline statisk server (HTML/JS/CSS)
-  return await runInlineStaticServer(cwd);
+  // 4) inline fallback – statisk mapp (t.ex. dist/)
+  const idx = await findIndexHtml(cwd);
+  return await runInlineStaticServer(idx ? path.dirname(idx) : cwd);
 }

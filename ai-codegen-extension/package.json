@@ -83,6 +83,16 @@
           "type": "boolean",
           "default": true,
           "description": "Spara senaste placerings-/analysdata i workspaceState."
+        },
+        "aiFigmaCodegen.preferredPreviewPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolut eller workspace-relativ sökväg till mappen som alltid ska användas för preview. Exempel: \"frontendplay\" eller \"apps/frontendplay\"."
+        },
+        "aiFigmaCodegen.preferredPreviewDirName": {
+          "type": "string",
+          "default": "frontendplay",
+          "markdownDescription": "Fallback: välj kandidat vars mappnamn matchar detta om preferredPreviewPath inte är satt."
         }
       }
     }
@@ -134,6 +144,7 @@
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "strip-ansi": "^7.1.0",
+    "styled-components": "^6.1.19",
     "unidiff": "^1.0.4",
     "yaml": "^2.8.1",
     "zustand": "^5.0.6"

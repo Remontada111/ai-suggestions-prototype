@@ -380,8 +380,13 @@ function scoreCandidate(
   const has = (...names: string[]) => names.some(n => Object.prototype.hasOwnProperty.call(deps, n));
   const base = path.basename(dir).toLowerCase();
 
-  // Tung minus om “felmärkt” frontend med engines.vscode men inte VS Code-shape
-  if (pkg?.engines?.vscode && !isVSCExtensionLike(pkg)) { s -= 100; reasons.push("vscode-engines-without-extension-shape"); }
+  // Mildra engines.vscode-straff när frontend-signaler finns
+  const frontendSignals =
+    !!chooseScript(pkg) || configHints.length > 0 ||
+    hasDep(pkg, ["vite","react","next","vue","@sveltejs/kit","nuxt","astro","remix","solid-start","@angular/core"]);
+  if (pkg?.engines?.vscode && !isVSCExtensionLike(pkg) && !frontendSignals) {
+    s -= 20; reasons.push("vscode-engines-without-extension-shape");
+  }
 
   const devKey = ["dev","start","serve","preview"].find(k => scripts[k]);
   if (devKey) { s += 8; reasons.push(`script:${devKey}`); }
@@ -509,12 +514,13 @@ async function makeCandidateForDir(dir: string, excludeAbsDirs: string[]): Promi
 
 /** Comparator med tie-breakers för stabil rangordning */
 function cmp(a: Candidate, b: Candidate) {
+  // Dev-kommando väger tyngst
+  const aDev = a.devCmd ? 1 : 0, bDev = b.devCmd ? 1 : 0;
+  if (bDev !== aDev) return bDev - aDev;
   if (b.confidence !== a.confidence) return b.confidence - a.confidence;
   const aRoot = (a.entryHtml?.toLowerCase() === "index.html") ? 1 : 0;
   const bRoot = (b.entryHtml?.toLowerCase() === "index.html") ? 1 : 0;
   if (bRoot !== aRoot) return bRoot - aRoot;
-  const aDev = a.devCmd ? 1 : 0, bDev = b.devCmd ? 1 : 0;
-  if (bDev !== aDev) return bDev - aDev;
   const intent = (s: string) => /(^|[-_/])(frontend|web|client|app)([-_/]|$)/i.test(path.basename(s)) ? 1 : 0;
   const ai = intent(a.dir), bi = intent(b.dir);
   if (bi !== ai) return bi - ai;

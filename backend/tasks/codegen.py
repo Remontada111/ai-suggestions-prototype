@@ -1,23 +1,27 @@
+# backend/tasks/codegen.py
 from __future__ import annotations
 
 """
-Celery-worker: Figma-node ➜ kodpatch eller ny fil ➜ Pull Request
+Celery-worker: Figma-node → IR → kod → (AST-mount) → commit → returnera filinnehåll
 
-Flöde:
-1) Hämtar Figma-node (REST)
-2) Skannar repo för befintliga komponenter
-3) Bygger prompt och ber OpenAI om patch eller ny fil
-4) Applicerar ändringar, commit → push → Pull Request
+Skillnader mot tidigare:
+- Hämtar Figma → bygger IR (ingen fri tolkning direkt från modellen)
+- Använder OpenAI Structured Outputs (JSON Schema) för strikt svar
+- Skapar ny komponentfil under TARGET_COMPONENT_DIR
+- Monterar i main.tsx via AST-injektion (inte textdiff)
+- Patchar övriga filer via `git apply` om modellen väljer "patch"
+- Kör typecheck/lint innan commit
 """
 
 import json
 import logging
 import os
 import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Tuple, cast
 
-# Ladda .env tidigt så alla imports får rätt miljö
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 
@@ -25,50 +29,42 @@ import requests
 from fastapi import HTTPException
 from celery import Celery
 
-# OpenAI – håll samma API-stil som i projektet i övrigt
-import openai  # type: ignore
+# OpenAI v1 SDK (Structured Outputs)
+from openai import OpenAI  # type: ignore
 
-from .patcher import apply_patch
-from .utils import clone_repo, create_pr, list_components, unique_branch
+from .figma_ir import figma_to_ir
+from .utils import clone_repo, list_components, unique_branch
+from .schemas import build_codegen_schema
 
 # ─────────────────────────────────────────────────────────
 # Miljö & konfiguration
 # ─────────────────────────────────────────────────────────
 
-# Broker/Result kan sättas via .env / docker-compose
 BROKER_URL = (os.getenv("CELERY_BROKER_URL") or "redis://redis:6379/0").strip()
 RESULT_BACKEND = (os.getenv("CELERY_RESULT_BACKEND") or BROKER_URL).strip()
 
-# OpenAI
-openai.api_key = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ""
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-# Genereringsmål i repo:t
-TARGET_COMPONENT_DIR = os.getenv("TARGET_COMPONENT_DIR", "frontendplay/src/components/ai")
-# Enda filen vi tillåter patch av (monteringspunkt)
+TARGET_COMPONENT_DIR = os.getenv("TARGET_COMPONENT_DIR", "frontendplay/src/components/ai").strip().rstrip("/")
 ALLOW_PATCH = [
     p.strip().replace("\\", "/")
     for p in (os.getenv("ALLOW_PATCH", "frontendplay/src/main.tsx").split(";"))
     if p.strip()
 ]
 
-# Figma
 FIGMA_TOKEN: str | None = os.getenv("FIGMA_TOKEN")
 if not FIGMA_TOKEN:
-    raise RuntimeError("FIGMA_TOKEN saknas i miljön (.env) – krävs för att hämta Figma-data.")
+    raise RuntimeError("FIGMA_TOKEN saknas i miljön (.env).")
 
 # ─────────────────────────────────────────────────────────
-# Celery-app (fail-fast vid broker-problem)
+# Celery-app
 # ─────────────────────────────────────────────────────────
 
 app = Celery("codegen", broker=BROKER_URL, backend=RESULT_BACKEND)
-# Härda så att anslutningsfel yttrar sig direkt (inte 60 s häng)
 app.conf.broker_connection_retry_on_startup = False
 app.conf.broker_connection_timeout = 3
-# Om Redis används är det bra att sätta socket-timeout lågt
 app.conf.redis_socket_timeout = 3
-
-# Exportera en tydlig alias som andra moduler importerar
 celery_app: Celery = app
 
 # ─────────────────────────────────────────────────────────
@@ -83,6 +79,26 @@ logger.setLevel(logging.INFO)
 # ─────────────────────────────────────────────────────────
 # Hjälpfunktioner
 # ─────────────────────────────────────────────────────────
+
+def _run(cmd: list[str], cwd: str | Path) -> Tuple[int, str, str]:
+    """Kör ett kommando och returnerar (rc, stdout, stderr)."""
+    p = subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True)
+    return p.returncode, p.stdout, p.stderr
+
+def _git_apply(repo_root: Path, diff_text: str) -> None:
+    """Applicera unified diff via git apply (failar på reject)."""
+    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".patch") as f:
+        f.write(diff_text)
+        patch_path = f.name
+    try:
+        rc, out, err = _run(["git", "-C", str(repo_root), "apply", "--reject", "--whitespace=nowarn", patch_path], cwd=repo_root)
+        if rc != 0:
+            raise HTTPException(500, f"git apply misslyckades:\n{err or out}")
+    finally:
+        try:
+            os.unlink(patch_path)
+        except Exception:
+            pass
 
 def _fetch_figma_node(file_key: str, node_id: str) -> Dict[str, Any]:
     """Hämtar Figma-JSON för angiven node."""
@@ -101,76 +117,93 @@ def _fetch_figma_node(file_key: str, node_id: str) -> Dict[str, Any]:
         raise HTTPException(502, f"Ogiltigt JSON-svar från Figma: {e}") from e
     return cast(Dict[str, Any], data)
 
+from openai.types.chat import ChatCompletionSystemMessageParam, ChatCompletionUserMessageParam
 
-def _build_prompt(figma_json: dict, comp_map: dict[str, Path], placement: dict | None) -> str:
-    """Bygger system-prompt till OpenAI."""
+def _build_messages(ir: dict, components: dict[str, Path], placement: dict | None) -> list[Any]:
+    """System + User med strikt policy. User-innehåll som JSON."""
     try:
-        overview = (
-            "\n".join(f"- {name}: {path.relative_to(Path.cwd())}" for name, path in comp_map.items())
-            or "Inga komponenter hittades."
-        )
+        overview = {name: str(path.relative_to(Path.cwd())) for name, path in components.items()}
     except Exception:
-        # Om repo körs i tmp-dir utan relation till cwd, fall tillbaka till absoluta vägar
-        overview = "\n".join(f"- {name}: {path}" for name, path in comp_map.items()) or "Inga komponenter hittades."
+        overview = {name: str(path) for name, path in components.items()}
 
-    # Trunka för kompakthet
-    fig_excerpt = json.dumps(figma_json, ensure_ascii=False)[:4000]
-    placement_excerpt = json.dumps(placement or {}, ensure_ascii=False)[:2000]
+    user_payload = {
+        "ir": ir,
+        "components": overview,
+        "placement": placement or {},
+        "constraints": {
+            "no_inline_styles": True,
+            "framework": "react+vite",
+            "tokens_css": "frontendplay/src/styles/tokens.css",
+            "mount_anchor": "AI-INJECT-MOUNT",
+            "target_component_dir": TARGET_COMPONENT_DIR,
+            "allow_patch": ALLOW_PATCH,
+        },
+    }
 
-    return (
-        "Du är en senior frontend-utvecklare.\n\n"
-        "Projektöversikt – befintliga komponenter:\n"
-        f"{overview}\n\n"
-        "Instruktion:\n"
-        "• Om en passande komponent redan finns → returnera en unified diff (patch).\n"
-        "• Annars → returnera första raden som filnamn följt av hela filens innehåll.\n\n"
-        "Krav:\n"
-        f"• Nya filer får endast skapas under '{TARGET_COMPONENT_DIR}'.\n"
-        "• Patch är ENDAST tillåten på 'frontendplay/src/main.tsx' för att montera komponenten vid kommentaren 'AI-INJECT-MOUNT'.\n"
-        "• Använd React 18/19, Vite-miljö, inga Next-specifika APIs.\n"
-        "• Minimera ändringar och följ projektets stil.\n\n"
-        "Placering från webview (normaliserad till 1280×800):\n"
-        f"{placement_excerpt}\n\n"
-        "Figma-JSON (trunkerad):\n"
-        f"{fig_excerpt}\n"
+    system = (
+        "Du är en strikt kodgenerator. Returnera ENDAST JSON som matchar schema. "
+        "Inga inline-styles. Använd semantiska element, CSS-modul eller Tailwind, och följ tokens. "
+        "Montera komponenten i main.tsx via 'mount' (AST-injektion vid ankaret), wrappa inte <App/>. "
+        "Om befintlig komponent kan återanvändas: 'patch' den filen. Annars 'file' i target_component_dir."
     )
 
+    return [
+        ChatCompletionSystemMessageParam(role="system", content=system),
+        ChatCompletionUserMessageParam(role="user", content=json.dumps(user_payload, ensure_ascii=False)),
+    ]
 
-def _parse_gpt_reply(reply: str) -> Tuple[str, str, str]:
+def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
     """
-    Tolkar OpenAI-svaret → ('patch'|'file', target_path, payload).
-    Accepterar fenced code blocks och raw diff.
+    Kör TS/AST-injektion som säkerställer import + JSX-mount vid AI-INJECT-MOUNT.
+    Kräver scripts/ai_inject_mount.ts (ts-morph).
     """
-    text = reply.strip()
+    main_tsx = next(
+        (Path(repo_root, p) for p in ALLOW_PATCH if p.endswith("main.tsx")),
+        Path(repo_root, "frontendplay/src/main.tsx"),
+    )
+    if not main_tsx.exists():
+        raise HTTPException(500, f"Hittar inte main.tsx: {main_tsx}")
 
-    # Ta bort code fences om de finns
-    if text.startswith("```"):
-        text = text.strip("`")
-        first_nl = text.find("\n")
-        if first_nl != -1:
-            head = text[:first_nl].strip().lower()
-            if head.startswith(("diff", "patch")):
-                text = text[first_nl + 1 :].strip()
+    import_name = mount.get("import_name")
+    import_path = mount.get("import_path")
+    jsx = mount.get("jsx")
 
-    # Unified diff?
-    if text.startswith("--- ") or text.startswith("diff"):
-        lines = text.splitlines()
-        header = next((l for l in lines if l.startswith("--- ")), None)
-        if not header:
-            raise ValueError("Diff ser inte komplett ut (saknar '--- ' header).")
-        filename = header.split(" ", 1)[1].lstrip("ab/").strip()
-        if not filename:
-            raise ValueError("Kunde inte extrahera målfil från diff-header.")
-        return "patch", filename, text
+    if not (import_name and import_path and jsx):
+        raise HTTPException(500, "Mount-objektet saknar obligatoriska fält.")
 
-    # Annars: anta "ny fil"-format
-    first_line, *code = text.splitlines()
-    if not first_line.endswith((".tsx", ".ts", ".jsx", ".js", ".css")):
-        raise ValueError("Ogiltigt filnamn på första raden – förväntade *.tsx|*.ts|*.jsx|*.js|*.css.")
-    target = first_line.strip()
-    payload = "\n".join(code)
-    return "file", target, payload
+    # Node + tsx (eller ts-node) behövs i miljön
+    cmd = [
+        "node", "--loader", "tsx",
+        "scripts/ai_inject_mount.ts",
+        str(main_tsx),
+        str(import_name),
+        str(import_path),
+        str(jsx),
+    ]
+    rc, out, err = _run(cmd, cwd=repo_root)
+    if rc != 0:
+        raise HTTPException(500, f"AST-injektion misslyckades:\n{err or out}")
 
+def _typecheck_and_lint(repo_root: Path) -> None:
+    """Kör typecheck och lint/prettier. Får gärna vara no-op om script saknas."""
+    # Typecheck
+    rc, out, err = _run(["pnpm", "-s", "typecheck"], cwd=repo_root)
+    if rc != 0:
+        raise HTTPException(500, f"Typecheck misslyckades:\n{err or out}")
+
+    # Lint fix
+    rc, out, err = _run(["pnpm", "-s", "lint:fix"], cwd=repo_root)
+    if rc != 0:
+        # Låt lint-fel vara mjuka om formatters saknas
+        logger.warning("lint:fix returnerade felkod: %s\n%s", rc, err or out)
+
+def _normalize_target_for_file_mode(target_rel: str) -> str:
+    """För nya filer: tvinga in i TARGET_COMPONENT_DIR och behåll endast filnamn."""
+    try:
+        name = Path(target_rel).name
+    except Exception:
+        name = "GeneratedComponent.tsx"
+    return (Path(TARGET_COMPONENT_DIR) / name).as_posix()
 
 # ─────────────────────────────────────────────────────────
 # Celery-task
@@ -179,88 +212,118 @@ def _parse_gpt_reply(reply: str) -> Tuple[str, str, str]:
 @app.task(name="backend.tasks.codegen.integrate_figma_node")
 def integrate_figma_node(*, file_key: str, node_id: str, placement: Dict[str, Any] | None = None) -> Dict[str, str]:
     """
-    Asynkron pipeline: hämtar Figma-node, genererar/patchar kod och returnerar innehåll och sökväg.
-
     Returnerar: {"content": "<file contents>", "path": "<relativ/sökväg>"}.
+    Notera: Vi ändrar ev. flera filer i temp-repot (t.ex. main.tsx via AST),
+    men vi returnerar endast *en* fil (ny/patchad) för direkt-applicering i editor.
     """
     logger.info("Integrationsstart: file_key=%s node_id=%s", file_key, node_id)
 
-    # 1) Hämta Figma-data
+    # 1) Figma → IR
     figma_json = _fetch_figma_node(file_key, node_id)
-    logger.info("Figma-data hämtad.")
+    ir = figma_to_ir(figma_json, node_id)
+    logger.info("IR byggd.")
 
     # 2) Klona repo till temp
     tmp_dir, repo = clone_repo()
-    logger.info("Repo klonat till %s", tmp_dir)
+    tmp_root = Path(tmp_dir)
+    logger.info("Repo klonat till %s", tmp_root)
 
+    # 3) Skanna komponenter (för översikt till modellen)
+    components = list_components(str(tmp_root))
+    logger.info("Hittade %d komponent(er).", len(components))
+
+    # 4) OpenAI: strikt JSON enligt schema
+    schema = build_codegen_schema(TARGET_COMPONENT_DIR, ALLOW_PATCH)
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    messages = _build_messages(ir, components, placement)
+    logger.info("Skickar prompt till OpenAI (%s) …", OPENAI_MODEL)
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=messages,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "Codegen", "schema": schema, "strict": True},
+        },
+        temperature=0.2,
+    )
+
+    raw = resp.choices[0].message.content or "{}"
     try:
-        # 3) Skanna komponenter
-        components = list_components(tmp_dir)
-        logger.info("Hittade %d komponent(er).", len(components))
+        out = json.loads(raw)
+    except Exception as e:
+        raise HTTPException(500, f"Modellen returnerade ogiltig JSON: {e}")
 
-        # 4) Bygg prompt och kalla OpenAI
-        prompt = _build_prompt(figma_json, components, placement)
-        logger.info("Skickar prompt till OpenAI (%s) …", OPENAI_MODEL)
+    mode = out.get("mode")
+    target_rel = cast(str, out.get("target_path") or "")
+    mount = out.get("mount") or {}
+    file_code = out.get("file_code") or ""
+    unified_diff = out.get("unified_diff") or ""
 
-        completion = openai.chat.completions.create(  # type: ignore[attr-defined]
-            model=OPENAI_MODEL,
-            messages=[{"role": "system", "content": prompt}],
-            temperature=0.2,
-        )
-        raw_reply = completion.choices[0].message.content
-        if raw_reply is None:
-            raise HTTPException(500, "OpenAI returnerade tomt innehåll.")
-        gpt_reply = cast(str, raw_reply)
+    if not mode or not target_rel:
+        raise HTTPException(500, "Saknar 'mode' eller 'target_path' i modelsvaret.")
 
-        mode, target_rel, payload = _parse_gpt_reply(gpt_reply)
-        logger.info("OpenAI-svar parsat: mode=%s target=%s", mode, target_rel)
+    # 5) Git branch
+    branch = unique_branch(node_id)
+    repo.git.checkout("-b", branch)
 
-        # 5) Normalisera målväg / säkerhetsregler
-        if mode == "file":
-            # Tvinga ny fil in i komponentkatalog
-            try:
-                suggested = Path(target_rel)
-                target_rel = (Path(TARGET_COMPONENT_DIR) / suggested.name).as_posix()
-            except Exception:
-                target_rel = (Path(TARGET_COMPONENT_DIR) / "GeneratedComponent.tsx").as_posix()
-        elif mode == "patch":
-            norm = target_rel.replace("\\", "/")
-            if norm not in ALLOW_PATCH:
-                raise HTTPException(400, f"Patch ej tillåten för {norm}. Tillåtna: {ALLOW_PATCH}")
-
-        # 6) Git-gren
-        branch = unique_branch(node_id)
-        repo.git.checkout("-b", branch)
-
-        target_path = Path(tmp_dir, target_rel)
+    # 6) Tillämpa ändring
+    #    - file: skriv fil under TARGET_COMPONENT_DIR
+    #    - patch: git apply, men om målet är main.tsx → ignorera diff och använd AST-injektion
+    returned_path: str
+    if mode == "file":
+        target_rel = _normalize_target_for_file_mode(target_rel)
+        target_path = tmp_root / target_rel
         target_path.parent.mkdir(parents=True, exist_ok=True)
+        if not file_code:
+            raise HTTPException(500, "file_code saknas för mode='file'.")
+        target_path.write_text(file_code, encoding="utf-8")
+        returned_path = target_rel
 
-        # 7) Applicera ändring
-        if mode == "patch":
-            if not target_path.exists():
-                raise HTTPException(500, f"Patchfilen {target_rel} finns inte i repo:t.")
-            apply_patch(target_path, payload)
-            commit_msg = f"chore(ai): patch {target_rel}"
+    elif mode == "patch":
+        norm = target_rel.replace("\\", "/")
+        if norm not in ALLOW_PATCH:
+            raise HTTPException(400, f"Patch ej tillåten för {norm}. Tillåtna: {ALLOW_PATCH}")
+        # Om modellen försöker patcha main.tsx: ignorera diff och låt AST-injektion hantera mount.
+        if norm.endswith("main.tsx"):
+            logger.info("Ignorerar diff mot main.tsx; använder AST-injektion för montering.")
+            returned_path = norm  # vi returnerar main.tsx-innehåll efter AST för editor-apply
         else:
-            target_path.write_text(payload, encoding="utf-8")
-            commit_msg = f"feat(ai): add {target_rel}"
+            if not unified_diff:
+                raise HTTPException(500, "unified_diff saknas för mode='patch'.")
+            _git_apply(tmp_root, unified_diff)
+            returned_path = norm
+    else:
+        raise HTTPException(500, f"Okänt mode: {mode}")
 
-        repo.git.add(target_path.as_posix())
-        repo.index.commit(commit_msg)
-        logger.info("Commit klar: %s", commit_msg)
+    # 7) AST-injektion för mount (alltid)
+    _ast_inject_mount(tmp_root, mount)
 
-        # 8) Returnera innehållet istället för att skapa PR
-        content = target_path.read_text(encoding="utf-8")
-        logger.info("Code changes ready for direct apply: %s", target_rel)
-        return {"content": content, "path": target_rel}
+    # 8) Typecheck + lint
+    _typecheck_and_lint(tmp_root)
 
-    finally:
-        # Alltid städa temp
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        logger.info("Städade tempkatalog: %s", tmp_dir)
+    # 9) Commit
+    #    Stage både target-filen och main.tsx om den ändrats.
+    repo.git.add("--all")
+    commit_msg = (
+        f"feat(ai): add {returned_path}" if mode == "file" else f"chore(ai): patch {returned_path}"
+    )
+    repo.index.commit(commit_msg)
+    logger.info("Commit klar: %s", commit_msg)
 
+    # 10) Läs ut filinnehåll som ska skickas tillbaka till extension
+    #     Om vi valde att returnera main.tsx, läs den. Annars läs målfilen.
+    out_path = tmp_root / returned_path
+    if not out_path.exists():
+        # Om modellen skapade fil + vi samtidigt returnerar main.tsx
+        # kan returned_path peka på main.tsx. Då finns den.
+        raise HTTPException(500, f"Returnfil saknas: {returned_path}")
 
-# Se till att analysetasken registreras när workern startar
+    content = out_path.read_text(encoding="utf-8")
+    logger.info("Code changes ready for direct apply: %s", returned_path)
+    return {"content": content, "path": returned_path}
+
+# Registrera ev. analyze-tasks
 try:
     from . import analyze as _register_analyze  # noqa: F401
 except Exception as e:  # pragma: no cover

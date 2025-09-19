@@ -1,0 +1,165 @@
+/* frontendplay/src/styles/tokens.css
+   Design tokens som CSS-variabler. Använd endast var(--token).
+*/
+
+/* ─────────────────────────────────────────────────────────
+   Bas
+   ───────────────────────────────────────────────────────── */
+:root {
+  color-scheme: light;
+
+  /* Primärer (HSL för enklare toning) */
+  --brand-h: 220;
+  --brand-s: 85%;
+  --brand-l: 56%;
+
+  /* Semantiska färger */
+  --color-bg: #f8fafc;                 /* App-bakgrund */
+  --color-surface: #ffffff;            /* Kort, paneler */
+  --color-surface-2: #f3f4f6;          /* Sekundär yta */
+  --color-elevated: #ffffff;
+  --color-border: #e5e7eb;             /* 1px borders */
+  --color-fg: #0f172a;                 /* Primär text */
+  --color-muted: #6b7280;              /* Sekundär text */
+
+  --color-accent: hsl(var(--brand-h) var(--brand-s) var(--brand-l));
+  --color-accent-600: hsl(var(--brand-h) var(--brand-s) calc(var(--brand-l) - 6%));
+  --color-accent-700: hsl(var(--brand-h) var(--brand-s) calc(var(--brand-l) - 12%));
+  --color-on-accent: #ffffff;
+
+  --color-success: #16a34a;
+  --color-warning: #f59e0b;
+  --color-danger:  #dc2626;
+
+  /* Opaciteter */
+  --opacity-0: 0;
+  --opacity-10: .1;
+  --opacity-20: .2;
+  --opacity-40: .4;
+  --opacity-60: .6;
+  --opacity-80: .8;
+  --opacity-100: 1;
+
+  /* Avstånd (4px-bas) */
+  --space-0: 0px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;   /* används i exempel */
+  --space-4: 16px;   /* används i exempel */
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+  --space-20: 80px;
+  --space-24: 96px;
+
+  /* Radier */
+  --radius-xs: 4px;
+  --radius-sm: 6px;   /* används i exempel */
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-2xl: 24px;
+  --radius-pill: 9999px;
+
+  /* Border */
+  --border-width-0: 0;
+  --border-width-1: 1px;
+  --border-width-2: 2px;
+
+  /* Skuggor */
+  --shadow-1: 0 1px 2px rgba(15, 23, 42, 0.06), 0 1px 1px rgba(15, 23, 42, 0.04);
+  --shadow-2: 0 4px 8px rgba(15, 23, 42, 0.08), 0 2px 4px rgba(15, 23, 42, 0.06);
+  --shadow-3: 0 12px 24px rgba(15, 23, 42, 0.12), 0 6px 12px rgba(15, 23, 42, 0.08);
+
+  /* Typografi */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+
+  --text-xs: 12px;
+  --text-sm: 14px;
+  --text-base: 16px;
+  --text-lg: 18px;
+  --text-xl: 20px;
+  --text-2xl: 24px;
+  --text-3xl: 30px;
+
+  --leading-tight: 1.2;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.65;
+
+  /* Rörelse */
+  --duration-100: 120ms;
+  --duration-150: 160ms;
+  --duration-200: 200ms;
+  --duration-300: 300ms;
+  --ease-standard: cubic-bezier(.2, 0, 0, 1);
+  --ease-emphasized: cubic-bezier(.2, 0, 0, 1);
+
+  /* Brytpunkter (informativa) */
+  --bp-sm: 640px;
+  --bp-md: 768px;
+  --bp-lg: 1024px;
+  --bp-xl: 1280px;
+
+  /* Z-index */
+  --z-0: 0;
+  --z-1: 10;
+  --z-2: 20;
+  --z-3: 30;
+  --z-4: 40;
+  --z-5: 50;
+}
+
+/* ─────────────────────────────────────────────────────────
+   Mörkt läge
+   ───────────────────────────────────────────────────────── */
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+
+    --color-bg: #0b1220;
+    --color-surface: #0f172a;
+    --color-surface-2: #111827;
+    --color-elevated: #111827;
+    --color-border: #1f2937;
+    --color-fg: #e5e7eb;
+    --color-muted: #9ca3af;
+
+    /* Accent kan vara lite ljusare i mörkt läge */
+    --brand-l: 64%;
+  }
+}
+
+/* Manuell tema-växling: <html data-theme="dark"> */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --color-bg: #0b1220;
+  --color-surface: #0f172a;
+  --color-surface-2: #111827;
+  --color-elevated: #111827;
+  --color-border: #1f2937;
+  --color-fg: #e5e7eb;
+  --color-muted: #9ca3af;
+
+  --brand-l: 64%;
+}
+
+/* ─────────────────────────────────────────────────────────
+   Basreset (frivilligt men praktiskt)
+   ───────────────────────────────────────────────────────── */
+:root, body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  line-height: var(--leading-normal);
+}
+
+.hr-token {
+  height: 1px;
+  background: var(--color-border);
+  border: 0;
+}

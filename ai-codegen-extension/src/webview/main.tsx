@@ -5,7 +5,7 @@
 // - Välj en nod → flytta/resize med mus, hjul och tangentbord.
 // - Papperskorg visas för vald nod. Efter borttagning visas Undo tills återställd.
 // - Figma-bild hämtas via extension per nod och renderas ovanför devUrl-iframe.
-// - Accept låser interaktion, visar loading + Cancel.
+// - Accept låser interaktion och visar central loader, döljer project preview.
 
 import React, {
   useCallback,
@@ -20,6 +20,7 @@ import "./index.css";
 import ChatBar from "./ChatBar";
 import { getVsCodeApi } from "./vscodeApi";
 import { Trash2, RotateCcw } from "lucide-react";
+import Loader from "./Loader";
 
 const vscode = getVsCodeApi();
 
@@ -381,6 +382,7 @@ function App() {
 
       if (msg.type === "job-started") {
         setJob({ status: "running", taskId: msg.taskId });
+        setPhase("loading"); // försäkran
         return;
       }
 
@@ -392,7 +394,7 @@ function App() {
         } else {
           setJob({ status: "error" });
         }
-        // Return to default UI phase (show preview again)
+        // Återgå till preview
         setPhase("default");
         return;
       }
@@ -551,7 +553,7 @@ function App() {
     window.addEventListener("pointercancel", end, { once: true });
   }, [nodes, persistState, requestFullViewIfNeeded]);
 
-  // Flytt/resize handlers
+  // Flytt/resize-handlers
   const onOverlayPointerDown = useCallback((id: NodeId) => (e: React.PointerEvent) => {
     if (job.status === "running") return;
     const ns = nodes[id];
@@ -744,7 +746,7 @@ function App() {
     });
   }, [persistState, job.status]);
 
-  // Global ACCEPT – bygger och postar placement från vald eller första giltiga nod
+  // Global ACCEPT – döljer preview och visar central loader
   const handleAccept = useCallback(() => {
     const id = firstEligibleId; if (!id) return;
     const ns = nodes[id]; if (!ns?.rect || !ns.imgN || ns.deleted) return;
@@ -789,8 +791,8 @@ function App() {
       source: "webview/main.tsx",
     };
 
-    // Lås direkt; extension skickar senare job-started med taskId
     setJob({ status: "running" });
+    setPhase("loading"); // döljer preview direkt
     vscode.postMessage({ type: "placementAccepted", fileKey: ns.fileKey, nodeId: ns.nodeId, payload });
   }, [firstEligibleId, nodes]);
 
@@ -810,6 +812,9 @@ function App() {
     };
   }, [selectedId, nodes, stageDims, rootPadding]);
 
+  // Flagga om preview ska visas
+  const showPreview = phase !== "loading" && !!devUrl;
+
   return (
     <div
       ref={rootRef}
@@ -817,26 +822,54 @@ function App() {
       style={{ position: "fixed", inset: 0, padding: rootPadding }}
       onWheel={onWheel}
     >
-      {/* Laptop-UI */}
-      <div
-        className="laptop-shell"
-        style={{
-          position: "absolute",
-          left: stageDims.left + rootPadding,
-          top: stageDims.top + rootPadding,
-          width: stageDims.w,
-          height: stageDims.h,
-          zIndex: 5,
-          visibility: devUrl ? "visible" : "hidden",
-          overflow: "hidden",
-          borderRadius: 12,
-        }}
-      >
-        {(!devUrl || (phase !== "default" && phase !== "loading")) && (
-          <div className="skeleton" aria-hidden="true" style={{ width: "100%", height: "100%", borderRadius: 12 }} />
-        )}
+      {/* Laptop-UI: visas endast när inte loading */}
+      {showPreview && (
+        <div
+          className="laptop-shell"
+          style={{
+            position: "absolute",
+            left: stageDims.left + rootPadding,
+            top: stageDims.top + rootPadding,
+            width: stageDims.w,
+            height: stageDims.h,
+            zIndex: 5,
+            overflow: "hidden",
+            borderRadius: 12,
+          }}
+        >
+          {phase !== "default" && (
+            <div className="skeleton" aria-hidden="true" style={{ width: "100%", height: "100%", borderRadius: 12 }} />
+          )}
 
-        {devUrl && (
+          {devUrl && (
+            <div
+              style={{
+                position: "absolute",
+                left: 0, top: 0,
+                width: PROJECT_BASE.w,
+                height: PROJECT_BASE.h,
+                transform: `scale(${stageDims.scale})`,
+                transformOrigin: "top left",
+              }}
+            >
+              <iframe
+                key={devUrl}
+                title="preview"
+                src={devUrl}
+                sandbox="allow-scripts allow-forms allow-same-origin"
+                style={{
+                  width: PROJECT_BASE.w,
+                  height: PROJECT_BASE.h,
+                  border: 0,
+                  pointerEvents: "none",
+                  background: "#fff",
+                  display: "block",
+                }}
+              />
+            </div>
+          )}
+
+          {/* Overlays för alla noder */}
           <div
             style={{
               position: "absolute",
@@ -845,169 +878,152 @@ function App() {
               height: PROJECT_BASE.h,
               transform: `scale(${stageDims.scale})`,
               transformOrigin: "top left",
+              pointerEvents: "none",
             }}
           >
-            <iframe
-              key={devUrl}
-              title="preview"
-              src={devUrl}
-              sandbox="allow-scripts allow-forms allow-same-origin"
-              style={{
-                width: PROJECT_BASE.w,
-                height: PROJECT_BASE.h,
-                border: 0,
-                pointerEvents: "none",
-                background: "#fff",
-                display: "block",
-              }}
-            />
-          </div>
-        )}
-
-        {/* Overlays för alla noder */}
-        <div
-          style={{
-            position: "absolute",
-            left: 0, top: 0,
-            width: PROJECT_BASE.w,
-            height: PROJECT_BASE.h,
-            transform: `scale(${stageDims.scale})`,
-            transformOrigin: "top left",
-            pointerEvents: "none", // aktivera lokalt på overlay-lager
-          }}
-        >
-          {Object.entries(nodes).map(([id, ns]) => {
-            if (!ns.imgSrc || !ns.rect || ns.deleted) return null;
-            const isSelected = selectedId === id;
-            const rect = ns.rect;
-            return (
-              <div
-                key={id}
-                data-overlay="1"
-                onPointerDown={onOverlayPointerDown(id)}
-                onPointerMove={onOverlayPointerMove}
-                style={{
-                  position: "absolute",
-                  left: round(rect.x),
-                  top: round(rect.y),
-                  width: round(rect.w),
-                  height: round(rect.h),
-                  zIndex: isSelected ? 30 : 20,
-                  cursor: job.status === "running" ? "default" : "move",
-                  background: "transparent",
-                  borderRadius: 10,
-                  boxShadow: isSelected ? "0 0 0 2px rgba(0,0,0,.06), 0 2px 10px rgba(0,0,0,.25)" : "none",
-                  overflow: "visible",
-                  pointerEvents: "auto",
-                  opacity: job.status === "running" && isSelected ? 0.95 : 1,
-                }}
-              >
-                <div style={{ position: "absolute", inset: 0, borderRadius: 10, overflow: "hidden" }}>
-                  <img
-                    ref={(el) => { imgRefs.current[id] = el; }}
-                    src={ns.imgSrc}
-                    alt="Figma node"
-                    crossOrigin="anonymous"
-                    draggable={false}
-                    onLoad={onLoadFor(id)}
-                    onError={onErrorFor(id)}
-                    style={{
-                      width: "100%",
-                      height: "100%",
-                      display: "block",
-                      objectFit: "contain",
-                      userSelect: "none",
-                      pointerEvents: "none",
-                      filter: job.status === "running" && isSelected ? "grayscale(0.2)" : "none",
-                    }}
-                  />
-                  {showOverlay && isSelected && job.status !== "running" && (
-                    <div
-                      aria-hidden
+            {Object.entries(nodes).map(([id, ns]) => {
+              if (!ns.imgSrc || !ns.rect || ns.deleted) return null;
+              const isSelected = selectedId === id;
+              const rect = ns.rect;
+              return (
+                <div
+                  key={id}
+                  data-overlay="1"
+                  onPointerDown={onOverlayPointerDown(id)}
+                  onPointerMove={onOverlayPointerMove}
+                  style={{
+                    position: "absolute",
+                    left: round(rect.x),
+                    top: round(rect.y),
+                    width: round(rect.w),
+                    height: round(rect.h),
+                    zIndex: isSelected ? 30 : 20,
+                    cursor: job.status === "running" ? "default" : "move",
+                    background: "transparent",
+                    borderRadius: 10,
+                    boxShadow: isSelected ? "0 0 0 2px rgba(0,0,0,.06), 0 2px 10px rgba(0,0,0,.25)" : "none",
+                    overflow: "visible",
+                    pointerEvents: "auto",
+                    opacity: job.status === "running" && isSelected ? 0.95 : 1,
+                  }}
+                >
+                  <div style={{ position: "absolute", inset: 0, borderRadius: 10, overflow: "hidden" }}>
+                    <img
+                      ref={(el) => { imgRefs.current[id] = el; }}
+                      src={ns.imgSrc}
+                      alt="Figma node"
+                      crossOrigin="anonymous"
+                      draggable={false}
+                      onLoad={onLoadFor(id)}
+                      onError={onErrorFor(id)}
                       style={{
-                        position: "absolute",
-                        inset: 6,
-                        border: "1px dashed color-mix(in srgb, var(--accent) 60%, transparent)",
-                        borderRadius: 8,
+                        width: "100%",
+                        height: "100%",
+                        display: "block",
+                        objectFit: "contain",
+                        userSelect: "none",
                         pointerEvents: "none",
+                        filter: job.status === "running" && isSelected ? "grayscale(0.2)" : "none",
                       }}
                     />
+                    {showOverlay && isSelected && job.status !== "running" && (
+                      <div
+                        aria-hidden
+                        style={{
+                          position: "absolute",
+                          inset: 6,
+                          border: "1px dashed color-mix(in srgb, var(--accent) 60%, transparent)",
+                          borderRadius: 8,
+                          pointerEvents: "none",
+                        }}
+                      />
+                    )}
+                  </div>
+
+                  {/* Hörnhandtag */}
+                  {showOverlay && isSelected && job.status !== "running" && (
+                    <>
+                      {(["nw", "ne", "se", "sw"] as const).map((pos) => {
+                        const size = 16;
+                        const base: React.CSSProperties = {
+                          position: "absolute",
+                          width: size, height: size,
+                          background: "var(--accent)",
+                          borderRadius: 999,
+                          boxShadow: "0 1px 4px rgba(0,0,0,.35)",
+                          pointerEvents: "auto",
+                        };
+                        const styleMap: Record<typeof pos, React.CSSProperties> = {
+                          nw: { ...base, left: 0, top: 0, transform: "translate(-50%,-50%)", cursor: "nwse-resize" },
+                          ne: { ...base, right: 0, top: 0, transform: "translate(50%,-50%)", cursor: "nesw-resize" },
+                          se: { ...base, right: 0, bottom: 0, transform: "translate(50%,50%)", cursor: "nwse-resize" },
+                          sw: { ...base, left: 0, bottom: 0, transform: "translate(-50%,50%)", cursor: "nesw-resize" },
+                        };
+                        return (
+                          <div
+                            key={pos}
+                            onPointerDown={startResize(id, pos)}
+                            onPointerMove={onOverlayPointerMove}
+                            style={styleMap[pos]}
+                          />
+                        );
+                      })}
+                    </>
                   )}
                 </div>
+              );
+            })}
+          </div>
 
-                {/* Hörnhandtag */}
-                {showOverlay && isSelected && job.status !== "running" && (
-                  <>
-                    {(["nw", "ne", "se", "sw"] as const).map((pos) => {
-                      const size = 16;
-                      const base: React.CSSProperties = {
-                        position: "absolute",
-                        width: size, height: size,
-                        background: "var(--accent)",
-                        borderRadius: 999,
-                        boxShadow: "0 1px 4px rgba(0,0,0,.35)",
-                        pointerEvents: "auto",
-                      };
-                      const styleMap: Record<typeof pos, React.CSSProperties> = {
-                        nw: { ...base, left: 0, top: 0, transform: "translate(-50%,-50%)", cursor: "nwse-resize" },
-                        ne: { ...base, right: 0, top: 0, transform: "translate(50%,-50%)", cursor: "nesw-resize" },
-                        se: { ...base, right: 0, bottom: 0, transform: "translate(50%,50%)", cursor: "nwse-resize" },
-                        sw: { ...base, left: 0, bottom: 0, transform: "translate(-50%,50%)", cursor: "nesw-resize" },
-                      };
-                      return (
-                        <div
-                          key={pos}
-                          onPointerDown={startResize(id, pos)}
-                          onPointerMove={onOverlayPointerMove}
-                          style={styleMap[pos]}
-                        />
-                      );
-                    })}
-                  </>
-                )}
-              </div>
+          {/* Dolda probes för de noder som saknar imgN */}
+          {Object.entries(nodes).map(([id, ns]) => {
+            if (!ns.imgSrc || ns.imgN) return null;
+            return (
+              <img
+                key={`probe-${id}`}
+                src={ns.imgSrc}
+                alt=""
+                crossOrigin="anonymous"
+                onLoad={onLoadFor(id)}
+                onError={onErrorFor(id)}
+                style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
+              />
             );
           })}
         </div>
+      )}
 
-        {/* Dolda probes för de noder som saknar imgN */}
-        {Object.entries(nodes).map(([id, ns]) => {
-          if (!ns.imgSrc || ns.imgN) return null;
-          return (
-            <img
-              key={`probe-${id}`}
-              src={ns.imgSrc}
-              alt=""
-              crossOrigin="anonymous"
-              onLoad={onLoadFor(id)}
-              onError={onErrorFor(id)}
-              style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
-            />
-          );
-        })}
-
-        {/* Loading overlay under kodgenerering och applicering */}
-        {phase === "loading" && (
-          <div style={{
-            position: "absolute", inset: 0, zIndex: 100,
-            display: "grid", placeItems: "center",
-            background: "rgba(0, 0, 0, 0.4)"  /* semi-transparent dark overlay */
-          }}>
-            <div style={{
-              color: "#fff", textAlign: "center", padding: "16px 24px", borderRadius: 8
-            }}>
-              <p>🤖 <strong>Generating code</strong> based on design…</p>
-              <p>🤖 <strong>Applying changes</strong> to project preview…</p>
-              <button onClick={() => vscode.postMessage({ cmd: "cancelJob", taskId: job.taskId })}
-                      style={{ marginTop: 12, padding: "6px 12px",
-                               border: "1px solid var(--border)", borderRadius: 999,
-                               background: "var(--vscode-editorWidget-background)", color: "var(--foreground)" }}>
-                Cancel
-              </button>
-            </div>
+      {/* Central loader under kodgenerering: döljer preview */}
+      {phase === "loading" && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            zIndex: 200,
+            display: "grid",
+            placeItems: "center",
+            background: "var(--vscode-sideBar-background)"
+          }}
+        >
+          <div style={{ display: "grid", justifyItems: "center", gap: 12 }}>
+            <Loader />
+            <button
+              onClick={() => job.taskId && vscode.postMessage({ cmd: "cancelJob", taskId: job.taskId })}
+              disabled={!job.taskId}
+              style={{
+                padding: "6px 12px",
+                border: "1px solid var(--border)",
+                borderRadius: 999,
+                background: "var(--vscode-editorWidget-background)",
+                color: "var(--foreground)"
+              }}
+              title="Avbryt jobb"
+            >
+              Cancel
+            </button>
           </div>
-        )}
-      </div>
+        </div>
+      )}
 
       {/* Onboarding-kort */}
       <ChooseProjectCard visible={phase === "onboarding" && !devUrl} compact={!!devUrl && phase === "default"} busy={phase === "loading"} />
@@ -1102,15 +1118,14 @@ function App() {
       {phase === "default" && devUrl && (
         <>
           <style>{`
-            @keyframes spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }
             .fx-btn { position:absolute; height:32px; border-radius:999px; border:1px solid var(--border);
               background: var(--vscode-editorWidget-background); display:grid; place-items:center; cursor:pointer;
               padding: 0 12px; box-shadow: 0 4px 10px rgba(0,0,0,.15); }
             .fx-btn[disabled] { opacity:.7; cursor:default }
           `}</style>
 
-          {/* Per-nod action: Trash för vald icke-raderad nod, dolt under jobb */}
-          {job.status !== "running" && selectedId && selRectPx && nodes[selectedId] && !nodes[selectedId].deleted && (
+          {/* Per-nod action: Trash för vald icke-raderad nod */}
+          {selectedId && selRectPx && nodes[selectedId] && !nodes[selectedId].deleted && (
             <button
               data-keep-selection="1"
               onPointerDownCapture={(e) => e.stopPropagation()}
@@ -1133,8 +1148,8 @@ function App() {
             </button>
           )}
 
-          {/* Per-nod action: Undo för vald raderad nod, dolt under jobb */}
-          {job.status !== "running" && selectedId && selRectPx && nodes[selectedId] && nodes[selectedId].deleted && (
+          {/* Per-nod action: Undo för vald raderad nod */}
+          {selectedId && selRectPx && nodes[selectedId] && nodes[selectedId].deleted && (
             <button
               data-keep-selection="1"
               onPointerDownCapture={(e) => e.stopPropagation()}
@@ -1157,8 +1172,8 @@ function App() {
             </button>
           )}
 
-          {/* Global multi-stegs Undo (LIFO). Döljs när jobb kör eller en icke-raderad nod är vald. */}
-          {job.status !== "running" && deletedStack.length > 0 && !(selectedId && nodes[selectedId] && !nodes[selectedId].deleted) && (
+          {/* Global multi-stegs Undo (LIFO). Dölj när en icke-raderad nod är vald. */}
+          {deletedStack.length > 0 && !(selectedId && nodes[selectedId] && !nodes[selectedId].deleted) && (
             <button
               data-keep-selection="1"
               onPointerDownCapture={(e) => e.stopPropagation()}
@@ -1176,60 +1191,23 @@ function App() {
             </button>
           )}
 
-          {/* Accept: dold under jobb */}
-          {job.status !== "running" && (
-            <button
-              data-keep-selection="1"
-              onPointerDownCapture={(e) => e.stopPropagation()}
-              aria-label={canAccept ? "Acceptera placement" : "Ingen nod att acceptera"}
-              onClick={handleAccept}
-              disabled={!canAccept}
-              className="fx-accept-btn fx-btn"
-              style={{
-                left: Math.round(stageDims.left + rootPadding + stageDims.w - 140),
-                top:  Math.round(stageDims.top  + rootPadding + stageDims.h + 8),
-                zIndex: 60,
-              }}
-              title={canAccept ? "Accept" : "Ingen aktiv nod"}
-            >
-              Accept
-            </button>
-          )}
-
-          {/* Loading + Cancel under pågående jobb */}
-          {job.status === "running" && (
-            <>
-              <button
-                data-keep-selection="1"
-                className="fx-btn"
-                disabled
-                style={{
-                  left: Math.round(stageDims.left + rootPadding + stageDims.w - 180),
-                  top:  Math.round(stageDims.top  + rootPadding + stageDims.h + 8),
-                  width: 110, zIndex: 60,
-                }}
-                title="Skickar jobb…"
-              >
-                <span aria-hidden style={{ display:"inline-block", animation:"spin 1.2s linear infinite" }}>🤖</span>
-                &nbsp;Loading
-              </button>
-              <button
-                data-keep-selection="1"
-                className="fx-btn"
-                onPointerDownCapture={(e)=>e.stopPropagation()}
-                onClick={() => job.taskId && vscode.postMessage({ cmd: "cancelJob", taskId: job.taskId })}
-                disabled={!job.taskId}
-                style={{
-                  left: Math.round(stageDims.left + rootPadding + stageDims.w - 62),
-                  top:  Math.round(stageDims.top  + rootPadding + stageDims.h + 8),
-                  width: 60, zIndex: 60,
-                }}
-                title="Avbryt jobb"
-              >
-                Cancel
-              </button>
-            </>
-          )}
+          {/* Accept */}
+          <button
+            data-keep-selection="1"
+            onPointerDownCapture={(e) => e.stopPropagation()}
+            aria-label={canAccept ? "Acceptera placement" : "Ingen nod att acceptera"}
+            onClick={handleAccept}
+            disabled={!canAccept}
+            className="fx-accept-btn fx-btn"
+            style={{
+              left: Math.round(stageDims.left + rootPadding + stageDims.w - 140),
+              top:  Math.round(stageDims.top  + rootPadding + stageDims.h + 8),
+              zIndex: 60,
+            }}
+            title={canAccept ? "Accept" : "Ingen aktiv nod"}
+          >
+            Accept
+          </button>
         </>
       )}
     </div>

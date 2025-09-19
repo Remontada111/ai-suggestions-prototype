@@ -114,13 +114,11 @@ function startReloadWatcher(rootDir, baseUrl) {
         reloadTimer = setTimeout(() => {
             if (!currentPanel || !reloadBaseUrl)
                 return;
-            const bust = `${reloadBaseUrl}${reloadBaseUrl.includes("?") ? "&" : "?"}` +
-                `__ext_bust=${Date.now().toString(36)}`;
-            lastDevUrl = bust;
-            log("Auto-reload posting devurl (file change)", { path: p, url: safeUrl(bust) });
-            currentPanel.webview.postMessage({ type: "devurl", url: bust });
-            // ── Ny: verifiera att URL:en faktiskt svarar, annars öppna väljare
-            void verifyDevUrlAndMaybeRechoose(forLocalProbe(bust), "reload");
+            const busted = bustForIframe(reloadBaseUrl);
+            lastDevUrl = busted;
+            log("Auto-reload posting devurl (file change)", { path: p, url: safeUrl(busted) });
+            currentPanel.webview.postMessage({ type: "devurl", url: busted });
+            void verifyDevUrlAndMaybeRechoose(forLocalProbe(busted), "reload");
         }, 200);
     };
     reloadWatcher.onDidChange(onEvt);
@@ -181,6 +179,21 @@ function addBust(u) {
         return `${u}${sep}__ext_bust=${Date.now().toString(36)}`;
     }
 }
+// Säker cache-bust URL för iframe: tvinga /index.html om path är "/"
+function bustForIframe(u) {
+    try {
+        const url = new URL(u);
+        if (!url.pathname || url.pathname === "/")
+            url.pathname = "/index.html";
+        url.searchParams.set("__ext_bust", Date.now().toString(36));
+        return url.toString();
+    }
+    catch (_a) {
+        const base = u.endsWith("/") ? `${u}index.html` : `${u}/index.html`;
+        const sep = base.includes("?") ? "&" : "?";
+        return `${base}${sep}__ext_bust=${Date.now().toString(36)}`;
+    }
+}
 async function quickCheck(url) {
     const h = await probe(url, "HEAD");
     if (h) {
@@ -196,18 +209,30 @@ async function quickCheck(url) {
     return false;
 }
 async function rootReachable(urlRaw) {
-    const root = withSlash(urlRaw);
-    const h = await probe(root, "HEAD");
-    if (h) {
-        log("rootReachable OK (HEAD)", { url: safeUrl(root) });
-        return true;
+    let u;
+    try {
+        u = new URL(urlRaw);
     }
-    const g = await probe(root, "GET");
-    if (g) {
-        log("rootReachable OK (GET)", { url: safeUrl(root) });
-        return true;
+    catch (_a) {
+        return false;
     }
-    warn("rootReachable FAIL", { url: safeUrl(root) });
+    const origin = `${u.protocol}//${u.hostname}${u.port ? ":" + u.port : ""}`;
+    const p = u.pathname || "/";
+    const hasHtml = /\.[a-z0-9]+$/i.test(p);
+    const basePath = hasHtml ? p.replace(/[^/]+$/, "") : (p.endsWith("/") ? p : p + "/");
+    const candidates = [
+        u.toString(),
+        origin + basePath,
+        origin + basePath + "index.html" + (u.search || ""),
+        origin + basePath + "@vite/client"
+    ];
+    for (const url of candidates) {
+        if (await probe(url, "HEAD"))
+            return true;
+        if (await probe(url, "GET"))
+            return true;
+    }
+    warn("rootReachable FAIL", { url: safeUrl(urlRaw) });
     return false;
 }
 async function verifyDevUrlAndMaybeRechoose(url, reason) {
@@ -219,7 +244,6 @@ async function verifyDevUrlAndMaybeRechoose(url, reason) {
     const msg = `Preview verkar otillgänglig (${reason}) på ${url}.`;
     warn(msg);
     vscode.window.showWarningMessage(msg);
-    // Visa endast webviewns folder-UI. Ingen QuickPick här.
     lastUiPhase = "onboarding";
     pendingCandidate = null;
     try {
@@ -422,18 +446,15 @@ function buildProxyUrl(fileKey, nodeId, scale = "2", token) {
     u.searchParams.set("scale", scale);
     if (token)
         u.searchParams.set("token", token);
-    // OBS: tidigare satte vi flatten=0 här, vilket gav ljusare bild pga transparens över vit bakgrund.
-    // Vi skickar inte flatten-override längre. Backend auto-flattenar vid behov.
     const built = u.toString();
     log("buildProxyUrl →", { url: safeUrl(built) });
     return built;
 }
-// Vänta tills backend rapporterar frisk /healthz innan vi postar bild-URL till webview.
 async function waitForBackendHealth(attempts = 8, intervalMs = 300) {
     try {
         const base = vscode.workspace.getConfiguration(SETTINGS_NS).get("backendBaseUrl");
         if (!base)
-            return true; // inget att vänta på
+            return true;
         const health = new URL("/healthz", base).toString();
         for (let i = 1; i <= attempts; i++) {
             const ok = await quickCheck(health);
@@ -455,7 +476,6 @@ async function sendFreshFigmaImageUrlToWebview(node, source) {
     }
     const { fileKey, nodeId, figmaToken } = node;
     log("figma-image request", { source, fileKey, nodeId, hasToken: !!figmaToken });
-    // Nytt: säkerställ att backend är redo innan vi ger webview en URL att ladda.
     const healthy = await waitForBackendHealth();
     if (!healthy) {
         errlog("Backend /healthz nåddes inte i tid – hoppar inte över men varnar.");
@@ -475,7 +495,6 @@ async function sendFreshFigmaImageUrlToWebview(node, source) {
     lastUiPhase = "default";
     currentPanel.webview.postMessage({ type: "ui-phase", phase: "default" });
 }
-// ── NY: skicka sparad placement till webview om sådan finns (per nod)
 async function sendSeedPlacementIfAny(node) {
     var _a;
     if (!currentPanel)
@@ -537,7 +556,6 @@ function ensurePanel(context) {
             log("[wv→ext] message", (_b = (_a = msg === null || msg === void 0 ? void 0 : msg.type) !== null && _a !== void 0 ? _a : msg === null || msg === void 0 ? void 0 : msg.cmd) !== null && _b !== void 0 ? _b : msg);
             if ((msg === null || msg === void 0 ? void 0 : msg.type) === "ready") {
                 log("[wv→ext] ready");
-                // Rehydrera ev. tidigare noder
                 for (const n of activeNodes.values()) {
                     currentPanel.webview.postMessage({ type: "add-node", ...n });
                     await sendFreshFigmaImageUrlToWebview(n, "init");
@@ -555,7 +573,6 @@ function ensurePanel(context) {
                 }
                 return;
             }
-            // ── Ny: spara endast placement vid drag/resize/import (ingen backend)
             if ((msg === null || msg === void 0 ? void 0 : msg.type) === "placementPreview" && (msg === null || msg === void 0 ? void 0 : msg.payload)) {
                 try {
                     const persist = vscode.workspace.getConfiguration(SETTINGS_NS).get("persistPlacements", true);
@@ -589,7 +606,6 @@ function ensurePanel(context) {
                 }
                 return;
             }
-            // ── Spara placement per nod och TRIGGA backend-jobb direkt vid Accept.
             if ((msg === null || msg === void 0 ? void 0 : msg.type) === "placementAccepted" && (msg === null || msg === void 0 ? void 0 : msg.payload)) {
                 try {
                     const persist = vscode.workspace.getConfiguration(SETTINGS_NS).get("persistPlacements", true);
@@ -621,7 +637,6 @@ function ensurePanel(context) {
                             warn("placementAccepted utan fileKey/nodeId och >1 aktiv nod; hoppar över persist");
                         }
                     }
-                    // Starta backend-jobbet nu
                     try {
                         const base = vscode.workspace.getConfiguration(SETTINGS_NS).get("backendBaseUrl");
                         if (!base)
@@ -637,11 +652,9 @@ function ensurePanel(context) {
                             vscode.window.showWarningMessage("Backend returnerade inget task_id.");
                             return;
                         }
-                        // Informera webview om att jobb startat och visa loading-state
                         currentPanel === null || currentPanel === void 0 ? void 0 : currentPanel.webview.postMessage({ type: "job-started", taskId, fileKey, nodeId });
                         currentPanel === null || currentPanel === void 0 ? void 0 : currentPanel.webview.postMessage({ type: "ui-phase", phase: "loading" });
                         lastUiPhase = "loading";
-                        // Starta polling
                         const statusUrl = new URL(`/task/${encodeURIComponent(taskId)}`, base).toString();
                         const t = setInterval(async () => {
                             try {
@@ -658,7 +671,6 @@ function ensurePanel(context) {
                                         error: s.error,
                                     });
                                     if (s.status === "SUCCESS") {
-                                        // Skriv AI-genererat innehåll direkt till fil i workspace
                                         if (s.path && s.content) {
                                             const [folder] = vscode.workspace.workspaceFolders || [];
                                             if (folder) {
@@ -686,7 +698,6 @@ function ensurePanel(context) {
                     catch (e) {
                         vscode.window.showErrorMessage(`Kunde inte starta jobb: ${(e === null || e === void 0 ? void 0 : e.message) || String(e)}`);
                     }
-                    // Enkla kontroller
                     const p = msg.payload;
                     const issues = [];
                     if (((_k = p === null || p === void 0 ? void 0 : p.ar) === null || _k === void 0 ? void 0 : _k.deltaPct) > 0.02)
@@ -760,7 +771,6 @@ function ensurePanel(context) {
                 await pickFolderAndStart(extCtxRef);
                 return;
             }
-            // PR-öppning används inte längre
             if ((msg === null || msg === void 0 ? void 0 : msg.cmd) === "enterFullView") {
                 log("WV bad om enterFullView");
                 await enterFullView(currentPanel);
@@ -800,6 +810,55 @@ function ensurePanel(context) {
 }
 function postCandidateProposal(_c) { }
 /* ─────────────────────────────────────────────────────────
+   Preferenser för auto-val av projekt (frontendplay)
+   ───────────────────────────────────────────────────────── */
+function resolvePreferredDir() {
+    const cfg = vscode.workspace.getConfiguration(SETTINGS_NS);
+    const raw = (cfg.get("preferredPreviewPath", "") || "").trim();
+    if (raw) {
+        const abs = path.isAbsolute(raw)
+            ? raw
+            : (vscode.workspace.workspaceFolders || [])
+                .map(f => path.join(f.uri.fsPath, raw))
+                .find(p => { try {
+                return fs.existsSync(p) && fs.statSync(p).isDirectory();
+            }
+            catch (_a) {
+                return false;
+            } }) || "";
+        if (abs && fs.existsSync(abs) && fs.statSync(abs).isDirectory())
+            return abs;
+    }
+    // Fallback: mappnamn
+    const name = (cfg.get("preferredPreviewDirName", "frontendplay") || "frontendplay").toLowerCase();
+    for (const f of vscode.workspace.workspaceFolders || []) {
+        const cand = path.join(f.uri.fsPath, name);
+        try {
+            if (fs.existsSync(cand) && fs.statSync(cand).isDirectory())
+                return cand;
+        }
+        catch (_a) { }
+    }
+    return null;
+}
+function preferCandidate(cands) {
+    var _a;
+    const preferredDir = resolvePreferredDir();
+    if (preferredDir) {
+        const hitExact = cands.find(c => path.resolve(c.dir) === path.resolve(preferredDir));
+        if (hitExact)
+            return hitExact;
+        const base = path.basename(preferredDir).toLowerCase();
+        const byName = cands.find(c => path.basename(c.dir).toLowerCase() === base || (c.pkgName || "").toLowerCase() === base);
+        if (byName)
+            return byName;
+        // Om detectProjects inte hittade den, returnera minimal kandidat för smart-autostart
+        return { dir: preferredDir };
+    }
+    // Ingen preferens: högst confidence → första
+    return (_a = cands.sort((a, b) => { var _a, _b; return ((_a = b.confidence) !== null && _a !== void 0 ? _a : 0) - ((_b = a.confidence) !== null && _b !== void 0 ? _b : 0); })[0]) !== null && _a !== void 0 ? _a : null;
+}
+/* ─────────────────────────────────────────────────────────
    Upptäckt & uppstart
    ───────────────────────────────────────────────────────── */
 function selectLaunchCommand(c) {
@@ -831,6 +890,8 @@ async function findExistingHtml(c) {
     const candidates = [
         "index.html",
         "public/index.html",
+        "src/index.html",
+        "src/webview/index.html",
         "apps/web/index.html",
         "packages/web/public/index.html",
     ];
@@ -849,84 +910,89 @@ function normalizeRel(rel) {
     return rel.replace(/^\.\//, "").replace(/^\/+/, "");
 }
 async function startOrRespectfulFallback(c, context) {
-    // 0) Försök smart: TS/TSX i index.html ⇒ dev-server (npm run dev → Vite → preview), annars inline.
     try {
         log("Startar smart server", { cwd: redactPath(c.dir) });
-        const { externalUrl } = await (0, runner_1.runSmartServer)(c.dir, selectLaunchCommand(c));
-        // Säkerhetsbälte: om basen inte är direkt nåbar, prova index.html
+        const { localUrl, externalUrl } = await (0, runner_1.runSmartServer)(c.dir, selectLaunchCommand(c));
         try {
             const ok = await quickCheck(externalUrl);
             if (!ok) {
-                const base = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
-                if (await quickCheck(base + "index.html")) {
-                    const url = base + "index.html";
-                    log("Smart: föll tillbaka till index.html", { url: safeUrl(url) });
-                    return { externalUrl: url, mode: "dev" };
+                const baseExt = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
+                const baseLoc = localUrl.endsWith("/") ? localUrl : localUrl + "/";
+                if (await quickCheck(baseExt + "index.html")) {
+                    const eurl = baseExt + "index.html";
+                    const lurl = baseLoc + "index.html";
+                    log("Smart: föll tillbaka till index.html", { url: safeUrl(eurl) });
+                    return { localUrl: lurl, externalUrl: eurl, mode: "dev" };
                 }
             }
         }
         catch (_a) { }
-        return { externalUrl, mode: "dev" };
+        return { localUrl, externalUrl, mode: "dev" };
     }
     catch (e) {
         warn("Smart server misslyckades, provar legacy-fallback", e);
     }
-    // 1) Legacy: använd explicit dev-kommando om möjligt
     const cmd = selectLaunchCommand(c);
     if (cmd) {
         try {
             log("Startar dev-server", { cmd, cwd: redactPath(c.dir) });
-            const { externalUrl } = await (0, runner_1.runDevServer)(cmd, c.dir);
+            const { localUrl, externalUrl } = await (0, runner_1.runDevServer)(cmd, c.dir);
             log("Dev-server startad", { externalUrl: safeUrl(externalUrl) });
             if (/\bhttp-server\b/i.test(cmd)) {
                 const html = await findExistingHtml(c);
                 if (html) {
-                    const base = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
-                    const url = base + encodeURI(html.relHtml);
-                    log("http-server URL uppräknad mot HTML", { url: safeUrl(url) });
-                    return { externalUrl: url, mode: "http", watchRoot: html.root };
+                    const baseExt = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
+                    const baseLoc = localUrl.endsWith("/") ? localUrl : localUrl + "/";
+                    const eurl = baseExt + encodeURI(html.relHtml);
+                    const lurl = baseLoc + encodeURI(html.relHtml);
+                    log("http-server URL uppräknad mot HTML", { url: safeUrl(eurl) });
+                    return { localUrl: lurl, externalUrl: eurl, mode: "http", watchRoot: html.root };
                 }
-                return { externalUrl, mode: "http", watchRoot: c.dir };
+                return { localUrl, externalUrl, mode: "http", watchRoot: c.dir };
             }
             try {
                 const ok = await quickCheck(externalUrl);
                 if (!ok) {
-                    const base = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
-                    if (await quickCheck(base + "index.html")) {
-                        const url = base + "index.html";
-                        log("Föll tillbaka till index.html", { url: safeUrl(url) });
-                        return { externalUrl: url, mode: "dev" };
+                    const baseExt = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
+                    const baseLoc = localUrl.endsWith("/") ? localUrl : localUrl + "/";
+                    if (await quickCheck(baseExt + "index.html")) {
+                        const eurl = baseExt + "index.html";
+                        const lurl = baseLoc + "index.html";
+                        log("Föll tillbaka till index.html", { url: safeUrl(eurl) });
+                        return { localUrl: lurl, externalUrl: eurl, mode: "dev" };
                     }
                     if (c.entryHtml) {
-                        const url = base + encodeURI(normalizeRel(c.entryHtml));
-                        log("Föll tillbaka till entryHtml", { url: safeUrl(url) });
-                        return { externalUrl: url, mode: "dev" };
+                        const eurl = baseExt + encodeURI(normalizeRel(c.entryHtml));
+                        const lurl = baseLoc + encodeURI(normalizeRel(c.entryHtml));
+                        log("Föll tillbaka till entryHtml", { url: safeUrl(eurl) });
+                        return { localUrl: lurl, externalUrl: eurl, mode: "dev" };
                     }
                 }
             }
             catch (e) {
                 warn("quickCheck-fel ignoreras", e);
             }
-            return { externalUrl, mode: "dev" };
+            return { localUrl, externalUrl, mode: "dev" };
         }
         catch (e) {
             errlog("Dev-server start misslyckades:", (e === null || e === void 0 ? void 0 : e.message) || e);
         }
     }
-    // 2) Inline-fallback
     const html = await findExistingHtml(c);
     if (html) {
         log("Startar inline static server för HTML-root", { root: redactPath(html.root) });
-        const { externalUrl } = await (0, runner_1.runInlineStaticServer)(html.root);
-        const base = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
-        const url = base + encodeURI(html.relHtml);
-        log("Inline static server URL", { url: safeUrl(url) });
-        return { externalUrl: url, mode: "inline", watchRoot: html.root };
+        const { localUrl, externalUrl } = await (0, runner_1.runInlineStaticServer)(html.root);
+        const baseExt = externalUrl.endsWith("/") ? externalUrl : externalUrl + "/";
+        const baseLoc = localUrl.endsWith("/") ? localUrl : localUrl + "/";
+        const eurl = baseExt + encodeURI(html.relHtml);
+        const lurl = baseLoc + encodeURI(html.relHtml);
+        log("Inline static server URL", { url: safeUrl(eurl) });
+        return { localUrl: lurl, externalUrl: eurl, mode: "inline", watchRoot: html.root };
     }
     const storageDir = await ensureStoragePreview(context);
     log("Startar inline static server (storage preview)", { dir: redactPath(storageDir) });
-    const { externalUrl } = await (0, runner_1.runInlineStaticServer)(storageDir);
-    return { externalUrl, mode: "inline", watchRoot: storageDir };
+    const { localUrl, externalUrl } = await (0, runner_1.runInlineStaticServer)(storageDir);
+    return { localUrl, externalUrl, mode: "inline", watchRoot: storageDir };
 }
 async function ensureStoragePreview(context) {
     const root = context.globalStorageUri.fsPath;
@@ -978,7 +1044,7 @@ async function startCandidatePreviewWithFallback(c, context, opts) {
     if (!silent) {
         const storageDir = await ensureStoragePreview(context);
         placeholder = await (0, runner_1.runInlineStaticServer)(storageDir);
-        lastDevUrl = addBust(placeholder.externalUrl);
+        lastDevUrl = bustForIframe(placeholder.externalUrl);
         log("Placeholder preview startad", { url: safeUrl(lastDevUrl) });
         panel.webview.postMessage({ type: "devurl", url: lastDevUrl });
     }
@@ -988,12 +1054,12 @@ async function startCandidatePreviewWithFallback(c, context, opts) {
     (async () => {
         try {
             const res = await startOrRespectfulFallback(c, context);
-            const busted = addBust(res.externalUrl);
+            const busted = bustForIframe(res.externalUrl);
             lastDevUrl = busted;
             log("Postar devurl", { url: safeUrl(busted), mode: res.mode, watchRoot: redactPath(res.watchRoot) });
             panel.webview.postMessage({ type: "devurl", url: busted });
-            // ── Ny: verifiera att URL:en svarar, annars öppna projektväljaren
-            void verifyDevUrlAndMaybeRechoose(forLocalProbe(busted), "initial");
+            const localBusted = bustForIframe(res.localUrl);
+            void verifyDevUrlAndMaybeRechoose(forLocalProbe(localBusted), "initial");
             if ((res.mode === "inline" || res.mode === "http") && res.watchRoot) {
                 startReloadWatcher(res.watchRoot, res.externalUrl);
             }
@@ -1031,7 +1097,7 @@ function relToWorkspace(p) {
         if (!rel.startsWith(".."))
             return rel.replace(/\\/g, "/");
     }
-    return p.replace(/\\/g, "/"); // fallback: absolut path
+    return p.replace(/\\/g, "/");
 }
 function toPickItems(candidates) {
     return candidates.map((c, i) => ({
@@ -1043,7 +1109,6 @@ function toPickItems(candidates) {
 async function showProjectQuickPick(context) {
     const panel = ensurePanel(context);
     panel.reveal(vscode.ViewColumn.One);
-    // ── Ny: rescan varje gång
     try {
         lastCandidates = await (0, detector_1.detectProjects)([]);
         log("Detekterade kandidater", { count: lastCandidates.length });
@@ -1104,7 +1169,8 @@ async function pickFolderAndStart(context) {
             panel.webview.postMessage({ type: "ui-phase", phase: "onboarding" });
             return;
         }
-        pendingCandidate = candidates[0];
+        const picked = preferCandidate(candidates);
+        pendingCandidate = picked;
         await rememberCandidate(pendingCandidate, context);
         await tryAutoFullView(panel, context);
         await startCandidatePreviewWithFallback(pendingCandidate, context, { silentUntilReady: true });
@@ -1170,6 +1236,7 @@ function basicFallbackHtml(webview) {
 <title>Project Preview</title>
 </head>
 <body>
+<div id="root"></div>
 <script>window.addEventListener('load',()=>acquireVsCodeApi().postMessage({type:'ready'}));</script>
 </body>
 </html>`;
@@ -1277,7 +1344,6 @@ async function triggerFigmaHookWithPlacement() {
         vscode.window.showErrorMessage("Ingen importerad Figma-nod ännu.");
         return;
     }
-    // välj nod om flera
     let chosen;
     if (activeNodes.size === 1) {
         chosen = [...activeNodes.values()][0];
@@ -1369,8 +1435,18 @@ async function activate(context) {
                 return;
             }
             const panel = ensurePanel(context);
-            pendingCandidate = candidates[0];
+            const preferredDir = resolvePreferredDir();
+            const picked = preferCandidate(candidates);
+            pendingCandidate = picked;
             panel.reveal(vscode.ViewColumn.One);
+            if (preferredDir) {
+                lastUiPhase = "loading";
+                panel.webview.postMessage({ type: "ui-phase", phase: "loading" });
+                await rememberCandidate(pendingCandidate, context);
+                await tryAutoFullView(panel, context);
+                await startCandidatePreviewWithFallback(pendingCandidate, context, { silentUntilReady: true });
+                return;
+            }
             if (candidates.length === 1 || ((_a = pendingCandidate === null || pendingCandidate === void 0 ? void 0 : pendingCandidate.confidence) !== null && _a !== void 0 ? _a : 0) >= AUTO_START_SURE_THRESHOLD) {
                 lastUiPhase = "loading";
                 panel.webview.postMessage({ type: "ui-phase", phase: "loading" });
@@ -1420,8 +1496,10 @@ async function activate(context) {
             lastCandidates = candidates;
             log("openPanel detekterade kandidater", { count: lastCandidates.length });
             if (candidates.length) {
-                pendingCandidate = candidates[0];
-                if (candidates.length === 1 || ((_a = pendingCandidate === null || pendingCandidate === void 0 ? void 0 : pendingCandidate.confidence) !== null && _a !== void 0 ? _a : 0) >= AUTO_START_SURE_THRESHOLD) {
+                const preferredDir = resolvePreferredDir();
+                const picked = preferCandidate(candidates);
+                pendingCandidate = picked;
+                if (preferredDir || candidates.length === 1 || ((_a = pendingCandidate === null || pendingCandidate === void 0 ? void 0 : pendingCandidate.confidence) !== null && _a !== void 0 ? _a : 0) >= AUTO_START_SURE_THRESHOLD) {
                     lastUiPhase = "loading";
                     panel.webview.postMessage({ type: "ui-phase", phase: "loading" });
                     await rememberCandidate(pendingCandidate, context);
@@ -1449,7 +1527,6 @@ async function activate(context) {
         log("Cmd: forgetProject");
         await forgetRemembered(context);
     });
-    // ── NYTT: skicka placement till backend (välj nod vid flera)
     const sendPlacementCmd = vscode.commands.registerCommand("ai-figma-codegen.sendPlacement", async () => {
         log("Cmd: sendPlacement");
         await triggerFigmaHookWithPlacement();
@@ -1468,10 +1545,8 @@ async function activate(context) {
                 }
                 const token = vscode.workspace.getConfiguration(SETTINGS_NS).get("figmaToken") || undefined;
                 const panel = ensurePanel(context);
-                // Lägg till eller uppdatera nod i minnet
                 const n = { fileKey, nodeId, token, figmaToken: token };
                 activeNodes.set(nodeKey(fileKey, nodeId), n);
-                // Informera webview om ny nod och ladda dess bild
                 panel.webview.postMessage({ type: "add-node", ...n });
                 panel.reveal(vscode.ViewColumn.One);
                 await sendFreshFigmaImageUrlToWebview(n, "init");
@@ -1494,7 +1569,9 @@ async function activate(context) {
                             const cands = await (0, detector_1.detectProjects)([]);
                             log("URI detectProjects", { count: cands.length });
                             if (cands.length) {
-                                pendingCandidate = cands[0];
+                                const preferredDir = resolvePreferredDir();
+                                const picked = preferCandidate(cands);
+                                pendingCandidate = picked;
                                 await rememberCandidate(pendingCandidate, context);
                                 updateStatusBar(pendingCandidate);
                                 lastUiPhase = "loading";
