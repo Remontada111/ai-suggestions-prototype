@@ -288,10 +288,13 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
         if not script_path.exists():
             raise HTTPException(500, f"Saknar scripts/ai_inject_mount.ts: {script_path}")
 
+        tsx_loader = "tsx"
+
+
         cmd = [
-            "node",
-            "--loader",
-            str(tsx_loader),           # absolut loader, inte bara 'tsx'
+        "node",
+        "--loader",
+        str(tsx_loader),           # absolut loader, inte bara 'tsx'
             str(script_path),
             str(main_tsx),
             str(import_name),
