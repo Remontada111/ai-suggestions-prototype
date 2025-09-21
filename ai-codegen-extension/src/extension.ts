@@ -592,16 +592,43 @@ function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
                   });
 
                   if (s.status === "SUCCESS") {
-                    if (s.path && s.content) {
+                    const files: { path: string; content: string }[] = [];
+                    if (Array.isArray(s.changes)) {
+                      for (const file of s.changes) {
+                        if (file && typeof file.path === "string" && typeof file.content === "string") {
+                          files.push({ path: file.path, content: file.content });
+                        }
+                      }
+                    }
+                    if (!files.length && s.path && typeof s.content === "string") {
+                      files.push({ path: s.path, content: s.content });
+                    }
+                    if (!files.length) {
+                      vscode.window.showWarningMessage("Job succeeded but no files were returned to apply.");
+                    } else {
                       const [folder] = vscode.workspace.workspaceFolders || [];
-                      if (folder) {
-                        const filePath = path.join(folder.uri.fsPath, s.path);
-                        try {
-                          await fsp.mkdir(path.dirname(filePath), { recursive: true });
-                          await fsp.writeFile(filePath, s.content, "utf8");
-                          vscode.window.showInformationMessage(`✅ AI changes applied to ${s.path}`);
-                        } catch (err: any) {
-                          vscode.window.showErrorMessage(`Failed to apply AI changes: ${err.message}`);
+                      if (!folder) {
+                        vscode.window.showErrorMessage("Cannot apply AI changes without an open workspace.");
+                      } else {
+                        const applied: string[] = [];
+                        const failed: { file: string; error: string }[] = [];
+                        for (const file of files) {
+                          const filePath = path.join(folder.uri.fsPath, file.path);
+                          try {
+                            await fsp.mkdir(path.dirname(filePath), { recursive: true });
+                            await fsp.writeFile(filePath, file.content, "utf8");
+                            applied.push(file.path);
+                          } catch (error) {
+                            const message = error instanceof Error ? error.message : String(error);
+                            failed.push({ file: file.path, error: message });
+                          }
+                        }
+                        if (applied.length) {
+                          const note = applied.length === 1 ? applied[0] : applied.length + " files";
+                          vscode.window.showInformationMessage(`AI changes applied to ${note}`);
+                        }
+                        for (const item of failed) {
+                          vscode.window.showErrorMessage(`Failed to apply AI changes for ${item.file}: ${item.error}`);
                         }
                       }
                     }
@@ -1202,6 +1229,7 @@ type JobStatus = {
   error?: string;
   path?: string;
   content?: string;
+  changes?: { path: string; content: string }[];
 };
 
 async function fetchStatus(url: string, timeoutMs = 6000): Promise<JobStatus | null> {
@@ -1231,6 +1259,7 @@ async function fetchStatus(url: string, timeoutMs = 6000): Promise<JobStatus | n
                 error: body?.error,
                 path: body?.path,
                 content: body?.content,
+                changes: Array.isArray(body?.changes) ? body.changes : undefined,
               });
             } catch { resolve(null); }
           });

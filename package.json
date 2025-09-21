@@ -4,5 +4,6 @@
     "ts-morph": "^27.0.0",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2"
-  }
+  },
+  "packageManager": "npm@9.6.7"
 }

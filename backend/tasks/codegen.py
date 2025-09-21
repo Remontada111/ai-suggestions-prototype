@@ -12,7 +12,8 @@ Mål:
 - (Valfritt) visuell validering: kör Playwright/pixel-diff om testscript finns.
 
 Kräver att följande filer/script finns i repo (läggs till i projektet):
-- scripts/ai_inject_mount.ts  (körs med: node --loader tsx scripts/ai_inject_mount.ts <main.tsx> <importName> <importPath> <jsxFilePath>)
+- scripts/ai_inject_mount.ts
+  (körs med: node --import tsx scripts/ai_inject_mount.ts <main.tsx> <importName> <importPath> <jsxFilePath>)
 """
 
 import base64
@@ -20,7 +21,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -66,7 +66,9 @@ if not FIGMA_TOKEN:
     raise RuntimeError("FIGMA_TOKEN saknas i miljön (.env).")
 
 # Valfri visuell validering via Playwright/pixelmatch
-ENABLE_VISUAL_VALIDATE = (os.getenv("ENABLE_VISUAL_VALIDATE", "false").lower() in ("1", "true", "yes"))
+ENABLE_VISUAL_VALIDATE = (
+    os.getenv("ENABLE_VISUAL_VALIDATE", "false").lower() in ("1", "true", "yes")
+)
 
 # ─────────────────────────────────────────────────────────
 # Celery-app
@@ -158,27 +160,37 @@ def _read_rel(repo_root: Path, rel: str) -> Dict[str, str]:
 
 
 def _ensure_node_modules(repo_root: Path) -> None:
-    """Installera beroenden om node_modules saknas eller package.json saknas script."""
-    pkg = repo_root / "package.json"
-    if not pkg.exists():
-        # Många projekt ligger under /frontendplay. Försök där.
-        pkg = repo_root / "frontendplay" / "package.json"
-        if not pkg.exists():
-            logger.info("Hittar ingen package.json – hoppar över pnpm install.")
-            return
-        workdir = pkg.parent
-    else:
-        workdir = pkg.parent
+    """
+    Installera beroenden där package.json finns (både root och frontendplay).
+    Detta säkerställer att tsx faktiskt installeras där main.tsx lever.
+    """
+    candidates: List[Path] = []
+    root_pkg = repo_root / "package.json"
+    fp_pkg = repo_root / "frontendplay" / "package.json"
 
-    nm = workdir / "node_modules"
-    if not nm.exists():
-        logger.info("node_modules saknas – kör pnpm install …")
+    if root_pkg.exists():
+        candidates.append(repo_root)
+    if fp_pkg.exists():
+        candidates.append(fp_pkg.parent)
+
+    if not candidates:
+        logger.info("Hittar ingen package.json – hoppar över pnpm install.")
+        return
+
+    for workdir in candidates:
+        nm = workdir / "node_modules"
+        if nm.exists():
+            continue
+        logger.info("node_modules saknas – kör pnpm install i %s …", workdir)
         rc, out, err = _run(["pnpm", "-s", "install", "--frozen-lockfile"], cwd=workdir)
         if rc != 0:
-            logger.warning("pnpm install --frozen-lockfile misslyckades, provar utan flagga …\n%s", err or out)
+            logger.warning(
+                "pnpm install --frozen-lockfile misslyckades i %s, provar utan flagga …\n%s",
+                workdir, err or out
+            )
             rc2, out2, err2 = _run(["pnpm", "-s", "install"], cwd=workdir)
             if rc2 != 0:
-                raise HTTPException(500, f"pnpm install misslyckades:\n{err2 or out2}")
+                raise HTTPException(500, f"pnpm install misslyckades i {workdir}:\n{err2 or out2}")
 
 
 def _package_scripts(repo_root: Path) -> Dict[str, str]:
@@ -248,9 +260,9 @@ def _build_messages(ir: dict, components: dict[str, Path], placement: dict | Non
 def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
     """
     Kör TS/AST-injektion som säkerställer import + JSX-mount vid AI-INJECT-MOUNT.
-    Använder absolut path till tsx-loader så Node slipper resolva paketnamnet.
+    Node v20+ kräver att tsx laddas med --import (inte --loader).
     """
-    # Lokalisera main.tsx
+    # 1) Lokalisera main.tsx
     main_tsx = next(
         (Path(repo_root, p) for p in ALLOW_PATCH if p.endswith("main.tsx")),
         Path(repo_root, "frontendplay/src/main.tsx"),
@@ -261,24 +273,25 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
     import_name = mount.get("import_name")
     import_path = mount.get("import_path")
     jsx = mount.get("jsx")
-
     if not (import_name and import_path and jsx):
         raise HTTPException(500, "Mount-objektet saknar obligatoriska fält.")
 
-    # Skriv JSX till tempfil (robust mot specialtecken)
+    # 2) Skriv JSX till tempfil (robust mot specialtecken)
     with tempfile.NamedTemporaryFile("w", delete=False, suffix=".jsx.txt", encoding="utf-8") as tmp:
         tmp.write(str(jsx))
         jsx_file_path = tmp.name
 
     try:
-        # Hitta var package.json finns (repo-root eller frontendplay/)
-        base = repo_root
-        if not (base / "package.json").exists() and (repo_root / "frontendplay" / "package.json").exists():
-            base = repo_root / "frontendplay"
+        # 3) Base = närmaste package.json uppåt från main.tsx (fallback till frontendplay eller repo-root)
+        base = main_tsx.parent
+        while base != base.parent and not (base / "package.json").exists():
+            base = base.parent
+        if not (base / "package.json").exists():
+            fp_pkg = repo_root / "frontendplay" / "package.json"
+            base = fp_pkg.parent if fp_pkg.exists() else repo_root
 
-        # Absolut path till tsx-loader
-        tsx_loader = base / "node_modules" / "tsx" / "dist" / "loader.js"
-        if not tsx_loader.exists():
+        # 4) Verifiera att tsx finns installerat i base
+        if not (base / "node_modules" / "tsx").exists():
             raise HTTPException(
                 500,
                 f"tsx saknas i {base}. Installera med: pnpm -C {base} add -D tsx",
@@ -288,22 +301,25 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
         if not script_path.exists():
             raise HTTPException(500, f"Saknar scripts/ai_inject_mount.ts: {script_path}")
 
-        tsx_loader = "tsx"
-
-
+        # 5) Kör node med --import tsx och rätt CWD (base)
         cmd = [
-        "node",
-        "--loader",
-        str(tsx_loader),           # absolut loader, inte bara 'tsx'
+            "node",
+            "--import", "tsx",     # <-- korrekt för Node v20+
             str(script_path),
             str(main_tsx),
             str(import_name),
             str(import_path),
             str(jsx_file_path),
         ]
-        rc, out, err = _run(cmd, cwd=repo_root)
+        rc, out, err = _run(cmd, cwd=base)
         if rc != 0:
-            raise HTTPException(500, f"AST-injektion misslyckades:\n{err or out}")
+            # Fallback: pnpm exec tsx
+            rc2, out2, err2 = _run(
+                ["pnpm", "-s", "exec", "tsx", str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path)],
+                cwd=base
+            )
+            if rc2 != 0:
+                raise HTTPException(500, f"AST-injektion misslyckades:\n{err or out}\n{err2 or out2}")
     finally:
         try:
             os.unlink(jsx_file_path)
@@ -455,7 +471,7 @@ def integrate_figma_node(
     """
     Returnerar: {
       "status": "SUCCESS",
-      "changes": [{"path": "<rel>", "content": "<utf8>"}, ...],
+      "changes": [{"path": "<rel>", "content": "<utf8>"} , ...],
       "path": "<bakåtkompatibel enkel-path>",
       "content": "<bakåtkompatibelt innehåll>",
       "diff_summary": {...}  # valfri
@@ -473,7 +489,7 @@ def integrate_figma_node(
     tmp_root = Path(tmp_dir)
     logger.info("Repo klonat till %s", tmp_root)
 
-    # 3) pnpm install vid behov
+    # 3) pnpm install vid behov (root och/eller frontendplay)
     _ensure_node_modules(tmp_root)
 
     # 4) Skanna komponenter (för översikt till modellen)
@@ -611,24 +627,22 @@ def integrate_figma_node(
             uniq_paths.append(p)
             seen.add(p)
 
+    final_changes: List[Dict[str, str]] = []
     for rel in uniq_paths:
         try:
-            changes.append(_read_rel(tmp_root, rel))
+            final_changes.append(_read_rel(tmp_root, rel))
         except HTTPException:
-            # Om någon asset/fil inte finns, hoppa över tyst (kan ha filtrerats)
             logger.warning("Kunde inte läsa ut '%s' – hoppar över i changes.", rel)
 
-    if not changes:
-        # Sista försvar: returnera i alla fall primärfilen
-        changes.append(_read_rel(tmp_root, returned_primary_path))
+    if not final_changes:
+        final_changes.append(_read_rel(tmp_root, returned_primary_path))
 
-    # Bakåtkompatibelt fält (path/content) för äldre extension
-    primary = next((c for c in changes if c["path"] == returned_primary_path), changes[0])
+    primary = next((c for c in final_changes if c["path"] == returned_primary_path), final_changes[0])
 
-    logger.info("Code changes ready for direct apply: %s fil(er).", len(changes))
+    logger.info("Code changes ready for direct apply: %s fil(er).", len(final_changes))
     result: Dict[str, Any] = {
         "status": "SUCCESS",
-        "changes": changes,
+        "changes": final_changes,
         "path": primary["path"],
         "content": primary["content"],
     }
