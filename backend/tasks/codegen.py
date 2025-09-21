@@ -6,8 +6,8 @@ Celery-worker: Figma-node → IR → LLM-förslag → (AST-mount + patch/file) �
 
 Mål:
 - Determinism: strikt JSON-schema, låg temperatur, hård validering av svar.
-- Robusthet: säkra paths, hantera assets, kör pnpm install vid behov, tolerant lint.
-- Korrekt montering: AST-injektion i main.tsx via separat TS-script (ts-morph).
+- Robusthet: säkra paths, hantera assets, kör install med rätt paketmanager enligt packageManager/låsfil.
+- Korrekt montering: AST-injektion i main.tsx via separat TS-script (ts-morph/tsx).
 - Multi-file retur: extension kan skriva alla berörda filer, inte bara en.
 - (Valfritt) visuell validering: kör Playwright/pixel-diff om testscript finns.
 
@@ -90,7 +90,7 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 # ─────────────────────────────────────────────────────────
-# Hjälpfunktioner (shell, git, IO)
+# Hjälpfunktioner (shell, PM, git, IO)
 # ─────────────────────────────────────────────────────────
 
 
@@ -104,6 +104,75 @@ def _run(cmd: List[str], cwd: str | Path | None = None, timeout: int | None = No
         timeout=timeout,
     )
     return p.returncode, p.stdout, p.stderr
+
+
+def _detect_pm(workdir: Path) -> str:
+    """
+    Bestäm paketmanager för en katalog.
+    Prioritet: package.json:packageManager → låsfil → npm som fallback.
+    Returnerar ett av: "npm" | "pnpm" | "yarn" | "bun".
+    """
+    pkg = workdir / "package.json"
+    try:
+        if pkg.exists():
+            data = json.loads(pkg.read_text(encoding="utf-8"))
+            pm_field = str(data.get("packageManager") or "").lower()
+            if pm_field.startswith("npm@"):
+                return "npm"
+            if pm_field.startswith("pnpm@"):
+                return "pnpm"
+            if pm_field.startswith("yarn@"):
+                return "yarn"
+            if pm_field.startswith("bun@"):
+                return "bun"
+    except Exception:
+        pass
+
+    if (workdir / "package-lock.json").exists():
+        return "npm"
+    if (workdir / "pnpm-lock.yaml").exists():
+        return "pnpm"
+    if (workdir / "yarn.lock").exists():
+        return "yarn"
+    if (workdir / "bun.lockb").exists():
+        return "bun"
+    return "npm"
+
+
+def _run_install(workdir: Path) -> None:
+    """
+    Kör install enligt vald PM. För npm: försök 'ci' om package-lock.json finns, annars 'install'.
+    För pnpm/yarn: försök låsfil-variant först, sedan mjukare.
+    """
+    pm = _detect_pm(workdir)
+    tries: List[List[str]] = []
+
+    if pm == "npm":
+        if (workdir / "package-lock.json").exists():
+            tries.append(["npm", "ci", "--silent"])
+        tries.append(["npm", "install", "--silent"])
+    elif pm == "pnpm":
+        if (workdir / "pnpm-lock.yaml").exists():
+            tries.append(["pnpm", "-s", "install", "--frozen-lockfile"])
+        tries.append(["pnpm", "-s", "install"])
+    elif pm == "yarn":
+        tries.append(["yarn", "install", "--immutable"])
+        tries.append(["yarn", "install", "--frozen-lockfile"])
+        tries.append(["yarn", "install"])
+    elif pm == "bun":
+        tries.append(["bun", "install"])
+    else:
+        tries.append(["npm", "install", "--silent"])
+
+    last: Tuple[int, str, str] | None = None
+    for cmd in tries:
+        rc, out, err = _run(cmd, cwd=workdir)
+        if rc == 0:
+            return
+        last = (rc, out, err)
+
+    msg = (last or (1, "", "okänd install-fail"))[2] or (last or (1, "", "okänd install-fail"))[1]
+    raise HTTPException(500, f"Dependency install misslyckades i {workdir}:\n{msg}")
 
 
 def _git_apply(repo_root: Path, diff_text: str) -> None:
@@ -174,23 +243,15 @@ def _ensure_node_modules(repo_root: Path) -> None:
         candidates.append(fp_pkg.parent)
 
     if not candidates:
-        logger.info("Hittar ingen package.json – hoppar över pnpm install.")
+        logger.info("Hittar ingen package.json – hoppar över install.")
         return
 
     for workdir in candidates:
         nm = workdir / "node_modules"
         if nm.exists():
             continue
-        logger.info("node_modules saknas – kör pnpm install i %s …", workdir)
-        rc, out, err = _run(["pnpm", "-s", "install", "--frozen-lockfile"], cwd=workdir)
-        if rc != 0:
-            logger.warning(
-                "pnpm install --frozen-lockfile misslyckades i %s, provar utan flagga …\n%s",
-                workdir, err or out
-            )
-            rc2, out2, err2 = _run(["pnpm", "-s", "install"], cwd=workdir)
-            if rc2 != 0:
-                raise HTTPException(500, f"pnpm install misslyckades i {workdir}:\n{err2 or out2}")
+        logger.info("node_modules saknas – kör install i %s …", workdir)
+        _run_install(workdir)
 
 
 def _package_scripts(repo_root: Path) -> Dict[str, str]:
@@ -209,6 +270,24 @@ def _package_scripts(repo_root: Path) -> Dict[str, str]:
 def _has_script(repo_root: Path, name: str) -> bool:
     scripts = _package_scripts(repo_root)
     return name in scripts and isinstance(scripts[name], str) and len(scripts[name]) > 0
+
+
+def _run_pm_script(base: Path, script: str, extra_args: List[str] | None = None) -> Tuple[int, str, str]:
+    """
+    Kör ett npm/pnpm/yarn/bun-script beroende på vald PM i 'base'.
+    """
+    extra_args = extra_args or []
+    pm = _detect_pm(base)
+    if pm == "npm":
+        return _run(["npm", "run", script, "--silent", "--", *extra_args], cwd=base)
+    if pm == "pnpm":
+        return _run(["pnpm", "-s", script, *extra_args], cwd=base)
+    if pm == "yarn":
+        # yarn v1/v3 hanterar "yarn <script>" eller "yarn run <script>"
+        return _run(["yarn", script, *extra_args], cwd=base)
+    if pm == "bun":
+        return _run(["bun", "run", script, *extra_args], cwd=base)
+    return _run(["npm", "run", script, "--silent", "--", *extra_args], cwd=base)
 
 
 # ─────────────────────────────────────────────────────────
@@ -294,7 +373,7 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
         if not (base / "node_modules" / "tsx").exists():
             raise HTTPException(
                 500,
-                f"tsx saknas i {base}. Installera med: pnpm -C {base} add -D tsx",
+                f"tsx saknas i {base}. Installera med: npm i -D tsx",
             )
 
         script_path = repo_root / "scripts" / "ai_inject_mount.ts"
@@ -304,7 +383,7 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
         # 5) Kör node med --import tsx och rätt CWD (base)
         cmd = [
             "node",
-            "--import", "tsx",     # <-- korrekt för Node v20+
+            "--import", "tsx",     # Node v20+
             str(script_path),
             str(main_tsx),
             str(import_name),
@@ -313,9 +392,9 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
         ]
         rc, out, err = _run(cmd, cwd=base)
         if rc != 0:
-            # Fallback: pnpm exec tsx
+            # Fallback: npx tsx
             rc2, out2, err2 = _run(
-                ["pnpm", "-s", "exec", "tsx", str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path)],
+                ["npx", "tsx", str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path)],
                 cwd=base
             )
             if rc2 != 0:
@@ -333,14 +412,14 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
 
 
 def _typecheck_and_lint(repo_root: Path) -> None:
-    """Kör pnpm typecheck + lint:fix om scripts finns. Typecheck är hård, lint mjuk."""
+    """Kör typecheck + lint:fix om scripts finns. Typecheck är hård, lint mjuk."""
     base = repo_root
     if not (base / "package.json").exists() and (repo_root / "frontendplay" / "package.json").exists():
         base = repo_root / "frontendplay"
 
     # typecheck
     if _has_script(repo_root, "typecheck"):
-        rc, out, err = _run(["pnpm", "-s", "typecheck"], cwd=base)
+        rc, out, err = _run_pm_script(base, "typecheck")
         if rc != 0:
             raise HTTPException(500, f"Typecheck misslyckades:\n{err or out}")
     else:
@@ -348,7 +427,7 @@ def _typecheck_and_lint(repo_root: Path) -> None:
 
     # lint fix
     if _has_script(repo_root, "lint:fix"):
-        rc, out, err = _run(["pnpm", "-s", "lint:fix"], cwd=base)
+        rc, out, err = _run_pm_script(base, "lint:fix")
         if rc != 0:
             logger.warning("lint:fix returnerade felkod: %s\n%s", rc, err or out)
     else:
@@ -372,12 +451,11 @@ def _visual_validate(repo_root: Path) -> Dict[str, Any] | None:
         return None
 
     logger.info("Kör visuell validering …")
-    rc, out, err = _run(["pnpm", "-s", "test:visual", "--reporter=line"], cwd=base)
+    rc, out, err = _run_pm_script(base, "test:visual", ["--reporter=line"])
     if rc != 0:
         # Returnera detaljer som del av felet
         raise HTTPException(500, f"Visuell validering misslyckades:\n{err or out}")
 
-    # Om testerna i sig producerar metriker kan de läsas här (ex. från en JSON-artifact).
     return {"status": "ok"}
 
 
@@ -489,7 +567,7 @@ def integrate_figma_node(
     tmp_root = Path(tmp_dir)
     logger.info("Repo klonat till %s", tmp_root)
 
-    # 3) pnpm install vid behov (root och/eller frontendplay)
+    # 3) Installera beroenden vid behov (root och/eller frontendplay)
     _ensure_node_modules(tmp_root)
 
     # 4) Skanna komponenter (för översikt till modellen)

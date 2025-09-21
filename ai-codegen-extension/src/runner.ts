@@ -23,15 +23,6 @@ import { AddressInfo } from "node:net";
    URL-upptäckt i loggar
    ───────────────────────────────────────────────────────── */
 
-/**
- * Mönster plockade från:
- * - Vite/Astro/Nuxt: "Local:", "Network:", "Available on:"
- * - Next 13–15: "ready - started server on ... url: http://localhost:3000"
- * - Remix/Solid: "started server on http://localhost:xxxx"
- * - Storybook: "started ... at http://localhost:6006"
- * - CRA/Webpack: "Project is running at http://localhost:8080", "Local: http://localhost:3000"
- * - Generiska fall: http://localhost:PORT, 127.0.0.1, 0.0.0.0, IPv6
- */
 const URL_PATTERNS: RegExp[] = [
   // http-server
   /Available on:\s*(https?:\/\/[^\s/]+:\d+\/?)/i,
@@ -79,7 +70,6 @@ function extractUrl(text: string): string | null {
 function normalizeLocalUrl(raw: string): string {
   try {
     const u = new URL(raw.trim());
-    // Normalisera till loopback för extensionens probes
     if (
       u.hostname === "0.0.0.0" ||
       u.hostname === "::" ||
@@ -173,7 +163,7 @@ async function waitForReachable(rawUrl: string, timeoutMs = 12000): Promise<bool
   while (Date.now() < until) {
     for (const u of cand) {
       if (await headPing(u, 900)) return true;
-      if (await getOk(u, 1500)) return true; // vissa dev-servrar svarar inte på HEAD
+      if (await getOk(u, 1500)) return true;
     }
     await sleep(350);
   }
@@ -406,16 +396,10 @@ export async function runInlineStaticServer(
    Kör dev-kommando och hitta URL (race: loggar + portgissning)
    ───────────────────────────────────────────────────────── */
 
-/**
- * Kör ett dev-kommando och försök hitta URL att bädda in.
- * Rensar alltid upp ev. tidigare process först.
- * Returnerar även en stop()-funktion för explicit nedstängning.
- */
 export async function runDevServer(
   devCmd: string,
   cwd: string
 ): Promise<{ localUrl: string; externalUrl: string; stop: () => Promise<void> }> {
-  // Endast en aktiv server åt gången
   await stopDevServer();
 
   const out = vscode.window.createOutputChannel("AI Figma Codegen – Dev Server");
@@ -426,11 +410,10 @@ export async function runDevServer(
     shell: true,
     env: {
       ...process.env,
-      HOST: "127.0.0.1",  // undvik "::" / 0.0.0.0
-      BROWSER: "none",    // förhindra att CLI öppnar systembrowser
-      // Viktigt: sätt INTE PORT=0 här – låt verktyget välja egen port om vi inte explicit sätter det i kommandot
-      NO_COLOR: "1",      // be CLIs att inte färga
-      FORCE_COLOR: "0"    // säkerhetsbälte om NO_COLOR ignoreras
+      HOST: "127.0.0.1",
+      BROWSER: "none",
+      NO_COLOR: "1",
+      FORCE_COLOR: "0"
     },
     detached: os.platform() !== "win32",
     windowsHide: true
@@ -447,8 +430,8 @@ export async function runDevServer(
 
   const handleChunk = (buf: Buffer) => {
     const raw = buf.toString();
-    out.append(raw);               // visa original i Output
-    const text = stripAnsi(raw);   // strippa ANSI innan matchning
+    out.append(raw);
+    const text = stripAnsi(raw);
     if (!resolvedUrl) {
       const maybe = extractUrl(text);
       if (maybe) {
@@ -474,14 +457,11 @@ export async function runDevServer(
     }
   });
 
-  // Starta samtidigt snabb portgissning
   const portGuessPromise = guessPortsFast();
 
-  // Total deadline – generös för kallstart
-  const overallDeadlineMs = 30000; // 30s
+  const overallDeadlineMs = 30000;
   const overallTimeout = sleep(overallDeadlineMs).then(() => null as string | null);
 
-  // Race: loggar vs portgissning vs timeout
   const url = (await Promise.race([logUrlPromise, portGuessPromise, overallTimeout])) as string | null;
 
   if (!url) {
@@ -489,7 +469,6 @@ export async function runDevServer(
     throw new Error("Kunde inte hitta dev-serverns URL via loggar eller portgissning inom tidsgränsen.");
   }
 
-  // Säkerställ att servern är nåbar innan vi returnerar
   const reachable = await waitForReachable(url, 12000);
   if (!reachable) {
     await stopDevServer();
@@ -517,8 +496,7 @@ async function findIndexHtml(dir: string): Promise<string | null> {
   const cand = [
     "index.html",
     "public/index.html",
-    "dist/index.html", // byggd artefakt
-    // Vanliga monorepo/webview-layouter
+    "dist/index.html",
     "src/webview/index.html",
     "src/webview/public/index.html",
     "src/index.html",
@@ -564,10 +542,23 @@ async function readPkgDevScript(dir: string): Promise<string | null> {
    ───────────────────────────────────────────────────────── */
 
 function detectPM(cwd: string): { pm: "pnpm" | "yarn" | "bun" | "npm"; lock: string | null } {
-  if (fs.existsSync(path.join(cwd, "pnpm-lock.yaml"))) return { pm: "pnpm", lock: "pnpm-lock.yaml" };
-  if (fs.existsSync(path.join(cwd, "yarn.lock")))     return { pm: "yarn", lock: "yarn.lock" };
-  if (fs.existsSync(path.join(cwd, "bun.lockb")))     return { pm: "bun",  lock: "bun.lockb" };
-  if (fs.existsSync(path.join(cwd, "package-lock.json"))) return { pm: "npm", lock: "package-lock.json" };
+  // 1) package.json:packageManager vinner
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(cwd, "package.json"), "utf8"));
+    const pm: string | undefined = pkg?.packageManager;
+    if (typeof pm === "string") {
+      if (pm.startsWith("npm@"))  return { pm: "npm",  lock: "package-lock.json" };
+      if (pm.startsWith("pnpm@")) return { pm: "pnpm", lock: "pnpm-lock.yaml" };
+      if (pm.startsWith("yarn@")) return { pm: "yarn", lock: "yarn.lock" };
+      if (pm.startsWith("bun@"))  return { pm: "bun",  lock: "bun.lockb" };
+    }
+  } catch {}
+
+  // 2) Låsfil-preferens: npm först om package-lock finns
+  if (fs.existsSync(path.join(cwd, "package-lock.json"))) return { pm: "npm",  lock: "package-lock.json" };
+  if (fs.existsSync(path.join(cwd, "pnpm-lock.yaml")))   return { pm: "pnpm", lock: "pnpm-lock.yaml" };
+  if (fs.existsSync(path.join(cwd, "yarn.lock")))        return { pm: "yarn", lock: "yarn.lock" };
+  if (fs.existsSync(path.join(cwd, "bun.lockb")))        return { pm: "bun",  lock: "bun.lockb" };
   return { pm: "npm", lock: null };
 }
 
@@ -584,10 +575,10 @@ function needsInstall(cwd: string): boolean {
   const nodeMods = path.join(cwd, "node_modules");
   const stampPath = installStampPath(cwd);
 
-  if (!lock) return !fs.existsSync(nodeMods); // inget lock → heuristik
+  if (!lock) return !fs.existsSync(nodeMods);
 
   const lockPath = path.join(cwd, lock);
-  if (!fs.existsSync(lockPath)) return false; // inget att installera
+  if (!fs.existsSync(lockPath)) return false;
   if (!fs.existsSync(nodeMods)) return true;
 
   try {
@@ -600,65 +591,62 @@ function needsInstall(cwd: string): boolean {
 }
 
 async function runInstall(cwd: string, out: vscode.OutputChannel) {
-  const { pm, lock } = detectPM(cwd);
-  const cmd =
-    pm === "pnpm" ? "pnpm install --frozen-lockfile" :
-    pm === "yarn" ? "yarn install --immutable || yarn install --frozen-lockfile" :
-    pm === "bun"  ? "bun install" :
-                    "npm ci";
+  const primary = detectPM(cwd).pm;
+  const cmds = [
+    primary === "pnpm" ? "pnpm install --frozen-lockfile" :
+    primary === "yarn" ? "yarn install --immutable" :
+    primary === "bun"  ? "bun install" :
+                         "npm ci",
+    // Fallbacks
+    "npm ci",
+    "npm install"
+  ];
 
-  out.appendLine(`[deps] Kör: ${cmd}`);
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn(cmd, {
-      cwd,
-      shell: true,
-      env: process.env,
-      detached: os.platform() !== "win32",
-      windowsHide: true
-    });
-    child.stdout?.on("data", b => out.append(b.toString()));
-    child.stderr?.on("data", b => out.append(b.toString()));
-    child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`install exit ${code}`)));
-  });
+  let lastErr: any;
+  for (const cmd of cmds) {
+    try {
+      out.appendLine(`[deps] Kör: ${cmd}`);
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn(cmd, { cwd, shell: true, env: process.env, detached: os.platform() !== "win32", windowsHide: true });
+        child.stdout?.on("data", b => out.append(b.toString()));
+        child.stderr?.on("data", b => out.append(b.toString()));
+        child.on("error", reject);
+        child.on("exit", code => code === 0 ? resolve() : reject(new Error(`exit ${code}`)));
+      });
 
-  try {
-    const lockHash = lock ? hashFile(path.join(cwd, lock)) : null;
-    const stamp = { lock: lockHash, node: process.version, ts: Date.now() };
-    await fsp.mkdir(path.join(cwd, "node_modules"), { recursive: true });
-    fs.writeFileSync(installStampPath(cwd), JSON.stringify(stamp), "utf8");
-  } catch { /* ignore */ }
+      const { lock } = detectPM(cwd);
+      const lockHash = lock ? hashFile(path.join(cwd, lock)) : null;
+      const stamp = { lock: lockHash, node: process.version, ts: Date.now() };
+      await fsp.mkdir(path.join(cwd, "node_modules"), { recursive: true });
+      fs.writeFileSync(installStampPath(cwd), JSON.stringify(stamp), "utf8");
+      return;
+    } catch (e) {
+      lastErr = e;
+      out.appendLine(`[deps] ${cmd} misslyckades: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  throw lastErr ?? new Error("Install misslyckades");
 }
 
 /* ─────────────────────────────────────────────────────────
    Smart server-start
    ───────────────────────────────────────────────────────── */
 
-/**
- * Starta rätt server automatiskt:
- * 1) auto-installera deps om behövs
- * 2) explicit kommando
- * 3) package.json:s "dev"
- * 4) module-entry hittad → prova Vite dev, sedan preview (port 0)
- * 5) annars inline statisk server
- *
- * OBS: Om index.html refererar .ts/.tsx/.jsx och Vite/preview inte startar
- *      kastas fel i stället för att falla tillbaka till inline.
- */
 export async function runSmartServer(
   cwd: string,
   explicitDevCmd?: string
 ): Promise<{ localUrl: string; externalUrl: string; stop: () => Promise<void> }> {
-  // Skapa output-kanal för ev. auto-install
   const out = vscode.window.createOutputChannel("AI Figma Codegen – Dev Server");
 
-  // 0) auto-install om node_modules saknas eller lockfile ändrats
-  try {
-    if (needsInstall(cwd)) {
-      out.appendLine(`[deps] Upptäckte saknade/inkonsistenta beroenden i ${cwd}`);
+  // 0) auto-install
+  if (needsInstall(cwd)) {
+    out.appendLine(`[deps] Upptäckte saknade/inkonsistenta beroenden i ${cwd}`);
+    try {
       await runInstall(cwd, out);
+    } catch (e: any) {
+      vscode.window.showErrorMessage(`Dependency install failed i ${cwd}. Öppna "AI Figma Codegen – Dev Server" för loggar.`);
+      throw e;
     }
-  } catch (e: any) {
-    out.appendLine(`[deps] Installationsfel ignoreras: ${e?.message || String(e)}`);
   }
 
   // 1) explicit kommando
@@ -675,11 +663,9 @@ export async function runSmartServer(
   // 3) module-entry ⇒ prova Vite
   const modEntry = await detectModuleEntry(cwd);
   if (modEntry) {
-    // Kör Vite på ledig port
     try { return await runDevServer("npx vite --host 127.0.0.1 --port 0", cwd); } catch {}
     try { return await runDevServer("npx vite preview --host 127.0.0.1 --port 0", cwd); } catch {}
 
-    // Om TS/TSX/JSX i index.html → kasta fel i stället för inline-fallback
     if (/\.(ts|tsx|jsx)(\?|#|$)/i.test(modEntry)) {
       throw new Error(
         `index.html refererar ${modEntry}. Starta Vite (npm run dev) eller bygg + "vite preview". ` +
