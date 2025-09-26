@@ -105,21 +105,19 @@ async def task_status(task_id: str) -> Dict[str, Any]:
     result = integrate_figma_node.AsyncResult(task_id, app=_celery_app)
     status: str = result.state
     response: Dict[str, Any] = {"status": status}
-    if status == "SUCCESS":
-        if isinstance(result.result, dict):
-            pr_url = result.result.get("pr_url")
-            if pr_url:
-                response["pr_url"] = pr_url
-            # Nya fält för direkt-applicering
-            path = result.result.get("path")
-            content = result.result.get("content")
-            if path:
-                response["path"] = path
-            if content:
-                response["content"] = content
+    if status == "SUCCESS" and isinstance(result.result, dict):
+        res = result.result
+        logger.info("Task %s SUCCESS keys=%s", task_id, list(res.keys()))
+        for k in ("pr_url", "path", "content", "changes", "diff_summary"):
+            if k in res:
+                response[k] = res[k]
     elif status == "FAILURE":
-        response["error"] = str(result.result)
+        logger.error("Task %s FAILURE: %r", task_id, result.result)
+        response["error"] = repr(result.result)
+    else:
+        logger.info("Task %s status=%s", task_id, status)
     return response
+
 
 # ── POST /task/{task_id}/cancel ───────────────────────────────────────────
 @app.post("/task/{task_id}/cancel")

@@ -2,11 +2,12 @@
 from __future__ import annotations
 """
 Figma → IR (Intermediate Representation) för robust, deterministisk kodgenerering.
-[docstring oförändrad förkortad i detta svar]
+Nu med ikon-detektion så att vektorikoner kan hämtas som SVG och färgsättas korrekt.
 """
 
 from typing import Any, Dict, List, Optional, Tuple, cast
 import math
+import re
 
 # ────────────────────────────────────────────────────────────────────────────
 # Allmänna hjälpare
@@ -64,6 +65,11 @@ def _first(xs: List[Any], pred) -> Optional[Any]:
         if pred(x):
             return x
     return None
+
+def _slug(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return s or "icon"
 
 # ────────────────────────────────────────────────────────────────────────────
 # Färg och paints
@@ -465,6 +471,10 @@ def _css_from_node_base(n: Dict[str, Any]) -> Dict[str, Any]:
 
     return css
 
+# ────────────────────────────────────────────────────────────────────────────
+# Tailwind-syntes med konflikt-skydd
+# ────────────────────────────────────────────────────────────────────────────
+
 def _tailwind_hints(n: Dict[str, Any]) -> Dict[str, Any]:
     tw: List[str] = []
 
@@ -509,11 +519,17 @@ def _tailwind_hints(n: Dict[str, Any]) -> Dict[str, Any]:
     if s0 and s0.get("alpha",1)>=0.999 and s0.get("color"):
         tw.append(f"bg-[{s0['color']}]")
 
+    # Strokes → välj antingen exakt bredd eller fallback, aldrig både 'border' och 'border-[…]'
     strokes = n.get("strokes") or []
     if strokes:
         s = strokes[0]
-        if s.get("type")=="SOLID" and s.get("weight") and s.get("color"):
-            tw.extend(["border", f"border-[{_px(s['weight'])}]", f"border-[{s['color']}]"])
+        if s.get("type") == "SOLID" and s.get("color"):
+            w = s.get("weight")
+            if _is_num(w):
+                tw.append(f"border-[{_px(w)}]")     # exakt bredd
+            else:
+                tw.append("border")                 # fallback
+            tw.append(f"border-[{s['color']}]")     # färg
 
     r = n.get("radius") or {}
     if any(v for v in r.values()):
@@ -547,7 +563,24 @@ def _tailwind_hints(n: Dict[str, Any]) -> Dict[str, Any]:
         if st.get("textTransform") == "lowercase": tw.append("lowercase")
         if st.get("textTransform") == "capitalize": tw.append("capitalize")
 
-    return {"classes": " ".join([t for t in tw if t])}
+    # ——— Sanering: dedupe + konfliktregler ———
+    seen: set[str] = set()
+    clean: List[str] = []
+    for t in tw:
+        if t and t not in seen:
+            seen.add(t)
+            clean.append(t)
+
+    # Konflikt: absolute vs relative → behåll absolute
+    if "absolute" in clean and "relative" in clean:
+        clean = [t for t in clean if t != "relative"]
+
+    # Konflikt: border + border-[...] → om explicit bredd finns, ta bort 'border'
+    has_explicit_width = any(t.startswith("border-[") and t.endswith("px]") for t in clean)
+    if has_explicit_width and "border" in clean:
+        clean = [t for t in clean if t != "border"]
+
+    return {"classes": " ".join(clean)}
 
 # ────────────────────────────────────────────────────────────────────────────
 # Traversering och extraktion
@@ -566,6 +599,72 @@ def _bounds(node: Dict[str, Any]) -> Dict[str, float]:
         "h": cast(float, _round(h,3)),
     }
 
+# ——— Ikon-detektion: flagga vektorikoner exakt för SVG-export ———
+
+_ICON_TYPES = {
+    "VECTOR",
+    "BOOLEAN_OPERATION",
+    "ELLIPSE",
+    "RECTANGLE",
+    "LINE",
+    "REGULAR_POLYGON",
+    "STAR",
+    "INSTANCE",  # komponent-instans av ikon
+}
+
+def _is_iconish_name(name: str) -> bool:
+    s = (name or "").lower()
+    return any(t in s for t in ("icon", "ic/", "ico/", "glyph", "symbol"))
+
+def _single_visible_solid_fill(node: Dict[str, Any]) -> Tuple[Optional[str], Optional[float]]:
+    fills = node.get("fills") or []
+    solids = [p for p in fills if isinstance(p, dict) and p.get("type")=="SOLID" and _bool(p.get("visible",True), True)]
+    if len(solids) == 1:
+        hex_, a = _rgba_hex(cast(Optional[Dict[str, Any]], solids[0].get("color", {})))
+        return hex_, a
+    return None, None
+
+def _icon_hint(node: Dict[str, Any]) -> Dict[str, Any]:
+    b = _bounds(node)
+    name = _safe_name(node.get("name"))
+    t = _safe_name(node.get("type"))
+    has_children = bool(node.get("children"))
+    w, h = b["w"] or 0.0, b["h"] or 0.0
+
+    # Kandidatregler
+    small_enough = (w <= 64.01 and h <= 64.01)
+    type_ok = t in _ICON_TYPES
+    name_ok = _is_iconish_name(name) or (int(round(w)) in (16,20,24,28,32) and int(round(h)) in (16,20,24,28,32))
+
+    # INSTANCE tillåts som ikon om namnet antyder det eller storleken är typisk
+    if t == "INSTANCE":
+        child_ok = True
+    else:
+        child_ok = not has_children or t == "BOOLEAN_OPERATION"
+
+    is_icon = bool(type_ok and child_ok and small_enough and name_ok)
+
+    hex_col, alpha = _single_visible_solid_fill(node)
+    # Om ingen fill men stroke finns, ta stroke-färg som färgbarhet
+    if not hex_col:
+        strokes = node.get("strokes") or []
+        s0 = _first(strokes, lambda s: s.get("type")=="SOLID" and _bool(s.get("visible",True), True))
+        if s0:
+            hex_col, alpha = _rgba_hex(cast(Optional[Dict[str, Any]], (s0.get("color") or {})))
+
+    tintable = is_icon and bool(hex_col)  # exakt en dominerande färg → kan ersättas med currentColor
+    return {
+        "is_icon": is_icon,
+        "name": name,
+        "name_slug": _slug(name),
+        "type": t,
+        "bounds": b,
+        "dominant_color": hex_col,
+        "dominant_alpha": alpha if alpha is not None else 1.0,
+        "tintable": tintable,
+        "rotation": _round(_get(node, "rotation", 0.0), 3),
+    }
+
 def _node_to_ir(node: Dict[str, Any]) -> Dict[str, Any]:
     fills = [_paint_to_fill(p) for p in (node.get("fills") or []) if _bool(_get(p, "visible", True), True)]
     strokes, stroke_align = _stroke_to_ir(node)
@@ -577,6 +676,8 @@ def _node_to_ir(node: Dict[str, Any]) -> Dict[str, Any]:
     cons = _constraints(node)
     ov = _overflow_from_node(node)
     op = float(node.get("opacity", 1.0) or 1.0)
+
+    icon = _icon_hint(node)
 
     ir: Dict[str, Any] = {
         "id": _safe_name(node.get("id")),
@@ -597,6 +698,7 @@ def _node_to_ir(node: Dict[str, Any]) -> Dict[str, Any]:
         "clips_content": _bool(node.get("clipsContent"), False),
         "overflow": ov,
         "text": text,
+        "icon": icon,                 # ← ikon-hint för exakt SVG-export och färgsättning
         "children": [],
     }
 
@@ -646,7 +748,7 @@ def figma_to_ir(figma_json: Dict[str, Any], node_id: str, *, viewport: Tuple[int
     meta = {
         "nodeId": node_id,
         "viewport": {"w": viewport[0], "h": viewport[1]},
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "producedBy": "figma_ir.py"
     }
     return {"meta": meta, "root": root_ir}
@@ -704,6 +806,35 @@ def build_tailwind_map(ir_node: Dict[str, Any]) -> Dict[str, str]:
     return tw_map
 
 # ────────────────────────────────────────────────────────────────────────────
+# Hjälp: Ikon-noder (för SVG-export i pipelinen)
+# ────────────────────────────────────────────────────────────────────────────
+
+def collect_icon_nodes(ir_node: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Returnerar lista över ikon-noder i IR-trädet.
+    Varje element: { id, name, name_slug, bounds:{x,y,w,h}, tintable:bool, color:str|None }
+    """
+    out: List[Dict[str, Any]] = []
+
+    def rec(n: Dict[str, Any]):
+        ic = (n.get("icon") or {})
+        if ic.get("is_icon"):
+            out.append({
+                "id": n.get("id"),
+                "name": ic.get("name") or n.get("name"),
+                "name_slug": ic.get("name_slug"),
+                "bounds": ic.get("bounds") or n.get("bounds"),
+                "tintable": bool(ic.get("tintable")),
+                "color": ic.get("dominant_color"),
+                "alpha": ic.get("dominant_alpha", 1.0),
+            })
+        for ch in n.get("children", []):
+            rec(ch)
+
+    rec(ir_node)
+    return out
+
+# ────────────────────────────────────────────────────────────────────────────
 # CLI-test
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -717,3 +848,11 @@ if __name__ == "__main__":  # pragma: no cover
     nid = sys.argv[2]
     ir = figma_to_ir(payload, nid)
     print(json.dumps(ir, ensure_ascii=False, indent=2))
+
+__all__ = [
+    "figma_to_ir",
+    "collect_image_refs",
+    "build_css_map",
+    "build_tailwind_map",
+    "collect_icon_nodes",
+]

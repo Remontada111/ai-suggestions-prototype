@@ -1,6 +1,5 @@
 # backend/tasks/codegen.py
 from __future__ import annotations
-
 """
 Celery-worker: Figma-node → IR → LLM-förslag → (AST-mount + patch/file) → validering → commit → returnera *alla* ändrade filer
 
@@ -36,7 +35,7 @@ from openai.types.chat import (
     ChatCompletionUserMessageParam,
 )
 
-from .figma_ir import figma_to_ir
+from .figma_ir import figma_to_ir, collect_icon_nodes
 from .schemas import build_codegen_schema
 from .utils import clone_repo, list_components, unique_branch
 
@@ -60,6 +59,9 @@ ALLOW_PATCH = [
     for p in (os.getenv("ALLOW_PATCH", "frontendplay/src/main.tsx").split(";"))
     if p.strip()
 ]
+
+# Där vi lägger exporterade SVG-ikoner
+ICON_DIR = os.getenv("ICON_DIR", "frontendplay/src/assets/icons").strip().rstrip("/")
 
 FIGMA_TOKEN: str | None = os.getenv("FIGMA_TOKEN")
 if not FIGMA_TOKEN:
@@ -283,19 +285,62 @@ def _run_pm_script(base: Path, script: str, extra_args: List[str] | None = None)
     if pm == "pnpm":
         return _run(["pnpm", "-s", script, *extra_args], cwd=base)
     if pm == "yarn":
-        # yarn v1/v3 hanterar "yarn <script>" eller "yarn run <script>"
         return _run(["yarn", script, *extra_args], cwd=base)
     if pm == "bun":
         return _run(["bun", "run", script, *extra_args], cwd=base)
     return _run(["npm", "run", script, "--silent", "--", *extra_args], cwd=base)
 
+# ─────────────────────────────────────────────────────────
+# Ikon-export (SVG) från Figma Images API
+# ─────────────────────────────────────────────────────────
+
+
+def _fetch_svgs(file_key: str, ids: List[str]) -> Dict[str, str]:
+    """
+    Hämtar presignade SVG-URL:er för givna node-ids och laddar ner SVG-texterna.
+    Bevarar originalfärger och attribut för identisk rendering.
+    """
+    out: Dict[str, str] = {}
+    if not ids:
+        return out
+
+    url = f"https://api.figma.com/v1/images/{file_key}"
+    headers = {"X-Figma-Token": FIGMA_TOKEN}
+    try:
+        r = requests.get(
+            url,
+            params={"ids": ",".join(ids), "format": "svg", "use_absolute_bounds": "true"},
+            headers=headers,
+            timeout=20,
+        )
+        r.raise_for_status()
+        images = (r.json() or {}).get("images", {}) or {}
+    except requests.RequestException as e:
+        raise HTTPException(502, f"Figma Images API error: {e}")
+
+    for nid, presigned in images.items():
+        if not presigned:
+            continue
+        try:
+            svg_resp = requests.get(presigned, timeout=20)
+            svg_resp.raise_for_status()
+            svg_text = svg_resp.text
+            out[str(nid)] = svg_text
+        except requests.RequestException as e:
+            logger.warning("Misslyckades hämta SVG för %s: %s", nid, e)
+    return out
 
 # ─────────────────────────────────────────────────────────
 # LLM-prompt
 # ─────────────────────────────────────────────────────────
 
 
-def _build_messages(ir: dict, components: dict[str, Path], placement: dict | None) -> list[Any]:
+def _build_messages(
+    ir: dict,
+    components: dict[str, Path],
+    placement: dict | None,
+    icon_assets: List[Dict[str, Any]],
+) -> list[Any]:
     """System + User med strikt policy. User-innehåll som JSON."""
     try:
         overview = {name: str(path.relative_to(Path.cwd())) for name, path in components.items()}
@@ -306,6 +351,7 @@ def _build_messages(ir: dict, components: dict[str, Path], placement: dict | Non
         "ir": ir,
         "components": overview,
         "placement": placement or {},
+        "icon_assets": icon_assets,  # [{id,name,import_path,w,h}]
         "constraints": {
             "no_inline_styles": True,
             "no_dangerous_html": True,
@@ -322,7 +368,14 @@ def _build_messages(ir: dict, components: dict[str, Path], placement: dict | Non
         "Inga inline-styles. Använd semantiska element, CSS-modul eller Tailwind och följ tokens. "
         "Montera komponenten i main.tsx via 'mount' (AST-injektion vid ankaret), wrappa inte <App/>. "
         "Om befintlig komponent kan återanvändas: 'patch' den filen. Annars 'file' i target_component_dir. "
-        "Skriv aldrig markdown-triple-backticks i kodfält. Inga absoluta paths eller ../ i import_path."
+        "Skriv aldrig markdown-triple-backticks i kodfält. Inga absoluta paths eller ../ i import_path. "
+        "Sätt aldrig både 'border' och 'border-[…]' på samma element; välj en. "
+        "Sätt inte 'relative' på ett element som också har 'absolute'. "
+        "Ikoner: använd givna 'icon_assets'. Importera SVG som URL i Vite, t.ex. "
+        "import homeUrl from '<path>.svg'; "
+        "Rendera med <img src={homeUrl} alt='' aria-hidden='true' width={w} height={h} "
+        "className='inline-block align-middle'/>. Bevara originalfärger (modifiera inte fill/stroke). "
+        "Placering och storlek ska följa IR-bounds."
     )
 
     return [
@@ -330,6 +383,19 @@ def _build_messages(ir: dict, components: dict[str, Path], placement: dict | Non
         ChatCompletionUserMessageParam(role="user", content=json.dumps(user_payload, ensure_ascii=False)),
     ]
 
+# ─────────────────────────────────────────────────────────
+# Hjälpare för relativ import till main.tsx
+# ─────────────────────────────────────────────────────────
+
+
+def _rel_import_from_main(main_tsx: Path, target_file: Path) -> str:
+    """
+    Extensionless, *relativ* specifier från main.tsx till target_file, alltid med './'.
+    """
+    rel = os.path.relpath(target_file.with_suffix(""), main_tsx.parent).replace("\\", "/")
+    if not rel.startswith("."):
+        rel = "./" + rel
+    return rel
 
 # ─────────────────────────────────────────────────────────
 # AST-injektion (main.tsx)
@@ -339,7 +405,7 @@ def _build_messages(ir: dict, components: dict[str, Path], placement: dict | Non
 def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
     """
     Kör TS/AST-injektion som säkerställer import + JSX-mount vid AI-INJECT-MOUNT.
-    Node v20+ kräver att tsx laddas med --import (inte --loader).
+    Försöker flera körsätt för tsx: node --import tsx → npx tsx → node --loader tsx.
     """
     # 1) Lokalisera main.tsx
     main_tsx = next(
@@ -355,9 +421,9 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
     if not (import_name and import_path and jsx):
         raise HTTPException(500, "Mount-objektet saknar obligatoriska fält.")
 
-    # 2) Skriv JSX till tempfil (robust mot specialtecken)
+    # 2) Skriv JSX till tempfil (robust mot specialtecken) — SANITERA konflikter
     with tempfile.NamedTemporaryFile("w", delete=False, suffix=".jsx.txt", encoding="utf-8") as tmp:
-        tmp.write(str(jsx))
+        tmp.write(_sanitize_tailwind_conflicts(str(jsx)))
         jsx_file_path = tmp.name
 
     try:
@@ -369,42 +435,46 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
             fp_pkg = repo_root / "frontendplay" / "package.json"
             base = fp_pkg.parent if fp_pkg.exists() else repo_root
 
-        # 4) Verifiera att tsx finns installerat i base
-        if not (base / "node_modules" / "tsx").exists():
-            raise HTTPException(
-                500,
-                f"tsx saknas i {base}. Installera med: npm i -D tsx",
-            )
-
         script_path = repo_root / "scripts" / "ai_inject_mount.ts"
         if not script_path.exists():
             raise HTTPException(500, f"Saknar scripts/ai_inject_mount.ts: {script_path}")
 
-        # 5) Kör node med --import tsx och rätt CWD (base)
-        cmd = [
-            "node",
-            "--import", "tsx",     # Node v20+
-            str(script_path),
-            str(main_tsx),
-            str(import_name),
-            str(import_path),
-            str(jsx_file_path),
+        # 4) Kör injektorn med robusta fallbackar
+        logger.info("AST-inject start main=%s import_name=%s import_path=%s", main_tsx, import_name, import_path)
+
+        cmd1 = [
+            "node", "--import", "tsx",
+            str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path),
         ]
-        rc, out, err = _run(cmd, cwd=base)
+        rc, out, err = _run(cmd1, cwd=base)
+        logger.info("node --import tsx rc=%s\nstdout:\n%s\nstderr:\n%s", rc, (out or "").strip(), (err or "").strip())
+
         if rc != 0:
-            # Fallback: npx tsx
-            rc2, out2, err2 = _run(
-                ["npx", "tsx", str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path)],
-                cwd=base
-            )
+            cmd2 = ["npx", "tsx", str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path)]
+            rc2, out2, err2 = _run(cmd2, cwd=base)
+            logger.info("npx tsx rc=%s\nstdout:\n%s\nstderr:\n%s", rc2, (out2 or "").strip(), (err2 or "").strip())
+
             if rc2 != 0:
-                raise HTTPException(500, f"AST-injektion misslyckades:\n{err or out}\n{err2 or out2}")
+                cmd3 = [
+                    "node", "--loader", "tsx",
+                    str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path),
+                ]
+                rc3, out3, err3 = _run(cmd3, cwd=base)
+                logger.info("node --loader tsx rc=%s\nstdout:\n%s\nstderr:\n%s", rc3, (out3 or "").strip(), (err3 or "").strip())
+
+                if rc3 != 0:
+                    raise HTTPException(
+                        500,
+                        "AST-injektion misslyckades:\n"
+                        f"{' '.join(cmd1)}\n{err or out}\n\n"
+                        f"{' '.join(cmd2)}\n{err2 or out2}\n\n"
+                        f"{' '.join(cmd3)}\n{err3 or out3}"
+                    )
     finally:
         try:
             os.unlink(jsx_file_path)
         except Exception:
             pass
-
 
 # ─────────────────────────────────────────────────────────
 # Typecheck/lint/visual
@@ -453,11 +523,9 @@ def _visual_validate(repo_root: Path) -> Dict[str, Any] | None:
     logger.info("Kör visuell validering …")
     rc, out, err = _run_pm_script(base, "test:visual", ["--reporter=line"])
     if rc != 0:
-        # Returnera detaljer som del av felet
         raise HTTPException(500, f"Visuell validering misslyckades:\n{err or out}")
 
     return {"status": "ok"}
-
 
 # ─────────────────────────────────────────────────────────
 # Modellsvaret: validering och normalisering
@@ -465,6 +533,29 @@ def _visual_validate(repo_root: Path) -> Dict[str, Any] | None:
 
 
 _TRIPLE_BACKTICKS = re.compile(r"```")
+
+# ——— Tailwind-sanerare: tar bort klasskonflikter som ger VSCode-varningar ———
+_CLS_RE = re.compile(r'className\s*=\s*(?P<q>"|\')(?P<val>.*?)(?P=q)')
+
+
+def _sanitize_tailwind_conflicts(src: str) -> str:
+    def fix(m: re.Match) -> str:
+        q = m.group("q")
+        cls = m.group("val")
+
+        # ta bort 'border' om explicit bredd finns (border-[1.5px], border-[2px], etc)
+        if re.search(r'\bborder-\[[0-9.]+px\]', cls):
+            cls = re.sub(r'(?<!-)\bborder\b', '', cls)
+
+        # ta bort 'relative' om 'absolute' finns
+        if re.search(r'\babsolute\b', cls):
+            cls = re.sub(r'\brelative\b', '', cls)
+
+        # normalisera whitespace
+        cls = re.sub(r'\s+', ' ', cls).strip()
+        return f'className={q}{cls}{q}'
+
+    return _CLS_RE.sub(fix, src)
 
 
 def _normalize_target_for_file_mode(target_rel: str, import_name: str | None = None) -> str:
@@ -477,7 +568,6 @@ def _normalize_target_for_file_mode(target_rel: str, import_name: str | None = N
     except Exception:
         pass
 
-    # Valfri snyggning: om import_name finns, skapa PascalCase.tsx
     if import_name and not name.lower().endswith((".tsx", ".ts", ".jsx", ".js", ".css")):
         name = f"{import_name}.tsx"
 
@@ -489,22 +579,29 @@ def _validate_and_sanitize_model_output(out: Dict[str, Any]) -> Dict[str, Any]:
     if mode not in ("file", "patch"):
         raise HTTPException(500, f"Okänt mode: {mode}")
 
-    # Förbjud markdown fences i kod/diff
     for key in ("file_code", "unified_diff", "mount"):
         v = out.get(key)
         if isinstance(v, str) and _TRIPLE_BACKTICKS.search(v):
             raise HTTPException(500, f"Ogiltigt innehåll i '{key}': innehåller ```")
 
-    # Mount-fält
     mount = out.get("mount") or {}
-    for req in ("anchor", "import_name", "import_path", "jsx"):
+    # krävs: import_name, import_path, jsx
+    for req in ("import_name", "import_path", "jsx"):
         if not mount.get(req):
             raise HTTPException(500, f"Mount saknar '{req}'")
-    # Spärra farliga paths
-    imp: str = str(mount["import_path"])
+    # default-ankare om saknas
+    mount.setdefault("anchor", "AI-INJECT-MOUNT")
+
+    imp: str = str(mount["import_path"]).strip().replace("\\", "/")
+    if imp.endswith((".tsx", ".ts", ".jsx", ".js")):
+        imp = imp.rsplit(".", 1)[0]
     if imp.startswith("/") or ".." in imp:
         raise HTTPException(400, "import_path är ogiltig (absolut path eller '..').")
+    if not imp.startswith("."):
+        imp = "./" + imp
 
+    mount["import_path"] = imp
+    out["mount"] = mount
     return out
 
 
@@ -526,7 +623,6 @@ def _write_assets_if_any(repo_root: Path, out: Dict[str, Any]) -> List[str]:
                 continue
             if rel.startswith("/") or ".." in rel:
                 raise HTTPException(400, f"Otillåten asset-sökväg: {rel}")
-            # Skriv
             p = _safe_join(repo_root, rel)
             p.parent.mkdir(parents=True, exist_ok=True)
             data = base64.b64decode(b64)
@@ -535,7 +631,6 @@ def _write_assets_if_any(repo_root: Path, out: Dict[str, Any]) -> List[str]:
         except Exception as e:
             raise HTTPException(500, f"Kunde inte skriva asset '{a}': {e}")
     return created
-
 
 # ─────────────────────────────────────────────────────────
 # Celery-task
@@ -562,10 +657,35 @@ def integrate_figma_node(
     ir = figma_to_ir(figma_json, node_id)
     logger.info("IR byggd.")
 
+    # 1.5) Ikon-detektion i IR + exportera identiska SVG:er som lokala assets
+    icon_nodes = collect_icon_nodes(ir["root"])
+    svg_by_id = _fetch_svgs(file_key, [x["id"] for x in icon_nodes])
+    icon_assets: List[Dict[str, Any]] = []
+    logger.info("Hittade %d ikon(er).", len(icon_nodes))
+
     # 2) Klona repo till temp
     tmp_dir, repo = clone_repo()
     tmp_root = Path(tmp_dir)
     logger.info("Repo klonat till %s", tmp_root)
+
+    # 2.1) Skriv SVG-ikoner till repo (bevara originalfärger)
+    for ic in icon_nodes:
+        nid = ic["id"]
+        svg = svg_by_id.get(nid)
+        if not svg:
+            continue
+        fname = f"{ic['name_slug']}-{nid[:6]}.svg"
+        rel_path = f"{ICON_DIR}/{fname}"
+        abs_path = _safe_join(tmp_root, rel_path)
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+        abs_path.write_text(svg, encoding="utf-8")
+        icon_assets.append({
+            "id": nid,
+            "name": ic.get("name") or ic["name_slug"],
+            "import_path": rel_path,
+            "w": ic["bounds"]["w"],
+            "h": ic["bounds"]["h"],
+        })
 
     # 3) Installera beroenden vid behov (root och/eller frontendplay)
     _ensure_node_modules(tmp_root)
@@ -578,7 +698,7 @@ def integrate_figma_node(
     schema = build_codegen_schema(TARGET_COMPONENT_DIR, ALLOW_PATCH)
     client = OpenAI(api_key=OPENAI_API_KEY)
 
-    messages = _build_messages(ir, components, placement)
+    messages = _build_messages(ir, components, placement, icon_assets)
     logger.info("Skickar prompt till OpenAI (%s) …", OPENAI_MODEL)
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
@@ -616,18 +736,18 @@ def integrate_figma_node(
     # 8) Tillämpa ändring
     changes: List[Dict[str, str]] = []
     returned_primary_path: str
+    target_path: Path | None = None
 
     if mode == "file":
-        # Normalisera target till komponentkatalogen
         target_rel = _normalize_target_for_file_mode(target_rel, mount.get("import_name"))
         target_path = _safe_join(tmp_root, target_rel)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         if not isinstance(file_code, str) or not file_code.strip():
             raise HTTPException(500, "file_code saknas för mode='file'.")
-        target_path.write_text(file_code, encoding="utf-8")
+        # SANITERA innan skrivning för att undvika Tailwind-konflikter
+        target_path.write_text(_sanitize_tailwind_conflicts(file_code), encoding="utf-8")
         returned_primary_path = target_rel
 
-        # Ev. assets från modellen
         created_assets = _write_assets_if_any(tmp_root, out)
         logger.info("Skrev %d asset(s).", len(created_assets))
 
@@ -638,7 +758,7 @@ def integrate_figma_node(
 
         if norm.endswith("main.tsx"):
             logger.info("Ignorerar diff mot main.tsx; använder AST-injektion för montering.")
-            returned_primary_path = norm  # vi kommer läsa ut denna efter AST-steg
+            returned_primary_path = norm
         else:
             if not unified_diff or not isinstance(unified_diff, str):
                 raise HTTPException(500, "unified_diff saknas för mode='patch'.")
@@ -646,6 +766,33 @@ def integrate_figma_node(
             returned_primary_path = norm
     else:
         raise HTTPException(500, f"Okänt mode: {mode}")
+
+    # 8.5) Beräkna korrekt relativ import_path från main.tsx och överskriv modellens värde
+    main_candidates = [p for p in ALLOW_PATCH if p.endswith("main.tsx")]
+    main_rel = main_candidates[0] if main_candidates else "frontendplay/src/main.tsx"
+    main_abs = _safe_join(tmp_root, main_rel)
+
+    logger.info("Mount before norm: %s", dict(mount))
+    try:
+        if mode == "file" and target_path is not None:
+            mount["import_path"] = _rel_import_from_main(main_abs, target_path)
+        elif mode == "patch":
+            maybe_target = str(mount.get("import_path", "")).strip()
+            if maybe_target:
+                guess_name = Path(maybe_target).name
+                if guess_name.endswith((".tsx", ".ts", ".jsx", ".js")):
+                    guess_name = guess_name.rsplit(".", 1)[0]
+                comp_guess_rel = (Path(TARGET_COMPONENT_DIR) / f"{guess_name}.tsx").as_posix()
+                comp_guess_abs = _safe_join(tmp_root, comp_guess_rel)
+                if comp_guess_abs.exists():
+                    mount["import_path"] = _rel_import_from_main(main_abs, comp_guess_abs)
+                else:
+                    mount["import_path"] = str(mount["import_path"])
+            else:
+                mount["import_path"] = str(mount.get("import_path"))
+    except Exception as e:
+        logger.warning("Kunde inte normalisera import_path: %s", e)
+    logger.info("Mount after  norm: %s (main_rel=%s)", dict(mount), main_rel)
 
     # 9) AST-injektion för mount (alltid)
     _ast_inject_mount(tmp_root, mount)
@@ -660,7 +807,6 @@ def integrate_figma_node(
         if vis:
             diff_summary = vis
     except HTTPException:
-        # Låt felet bubbla upp (blockerande)
         raise
     except Exception as e:
         logger.warning("Visuell validering kastade oväntat undantag: %s", e)
@@ -679,26 +825,23 @@ def integrate_figma_node(
     # a) primärfilen
     changed_paths.append(returned_primary_path)
 
-    # b) main.tsx om ändrad eller om mount alltid påverkar den
-    main_candidates = [p for p in ALLOW_PATCH if p.endswith("main.tsx")]
-    main_rel = main_candidates[0] if main_candidates else "frontendplay/src/main.tsx"
-    main_path = _safe_join(tmp_root, main_rel)
-    if main_path.exists():
+    # b) main.tsx påverkas av injektion
+    if main_abs.exists():
         changed_paths.append(main_rel)
 
-    # c) ev. komponentfil vid patch av annan fil? (om modellen patchade en komponent och mount pekar dit)
-    if mode == "patch" and returned_primary_path != main_rel and returned_primary_path not in changed_paths:
-        changed_paths.append(returned_primary_path)
-
-    # d) ev. assets som skrevs
+    # c) modellens egna assets
     assets = out.get("assets") or []
     for a in assets if isinstance(assets, list) else []:
         rel = str(a.get("path", "")).replace("\\", "/")
         if rel:
             changed_paths.append(rel)
 
+    # d) exporterade ikon-SVG:er
+    for ia in icon_assets:
+        changed_paths.append(ia["import_path"])
+
     # Deduplicera och läs
-    uniq_paths = []
+    uniq_paths: List[str] = []
     seen = set()
     for p in changed_paths:
         if p not in seen:
@@ -717,7 +860,7 @@ def integrate_figma_node(
 
     primary = next((c for c in final_changes if c["path"] == returned_primary_path), final_changes[0])
 
-    logger.info("Code changes ready for direct apply: %s fil(er).", len(final_changes))
+    logger.info("Returning %d change(s): %s", len(final_changes), [c["path"] for c in final_changes])
     result: Dict[str, Any] = {
         "status": "SUCCESS",
         "changes": final_changes,

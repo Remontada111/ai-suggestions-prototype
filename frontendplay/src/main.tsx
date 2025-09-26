@@ -1,5 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
+import { Menu } from './components/ai/Menu';
+import './index.css';
 
 function App() {
   return (
@@ -8,7 +10,7 @@ function App() {
       <h2 style={{ margin: "0 0 12px 0", fontSize: 14, color: "#666" }}>
         A playground for frontend experiments
       </h2>
-      {/* AI-INJECT-MOUNT */}
+      <Menu />
     </div>
   );
 }
