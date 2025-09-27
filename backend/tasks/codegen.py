@@ -118,18 +118,19 @@ def _detect_pm(workdir: Path) -> str:
     try:
         if pkg.exists():
             data = json.loads(pkg.read_text(encoding="utf-8"))
-            pm_field = str(data.get("packageManager") or "").lower()
-            if pm_field.startswith("npm@"):
-                return "npm"
-            if pm_field.startswith("pnpm@"):
-                return "pnpm"
-            if pm_field.startswith("yarn@"):
-                return "yarn"
-            if pm_field.startswith("bun@"):
-                return "bun"
+        else:
+            data = {}
     except Exception:
-        pass
-
+        data = {}
+    pm_field = str((data.get("packageManager") or "")).lower()
+    if pm_field.startswith("npm@"):
+        return "npm"
+    if pm_field.startswith("pnpm@"):
+        return "pnpm"
+    if pm_field.startswith("yarn@"):
+        return "yarn"
+    if pm_field.startswith("bun@"):
+        return "bun"
     if (workdir / "package-lock.json").exists():
         return "npm"
     if (workdir / "pnpm-lock.yaml").exists():
@@ -371,10 +372,12 @@ def _build_messages(
         "Skriv aldrig markdown-triple-backticks i kodfält. Inga absoluta paths eller ../ i import_path. "
         "Sätt aldrig både 'border' och 'border-[…]' på samma element; välj en. "
         "Sätt inte 'relative' på ett element som också har 'absolute'. "
-        "Ikoner: använd givna 'icon_assets'. Importera SVG som URL i Vite, t.ex. "
-        "import homeUrl from '<path>.svg'; "
-        "Rendera med <img src={homeUrl} alt='' aria-hidden='true' width={w} height={h} "
-        "className='inline-block align-middle'/>. Bevara originalfärger (modifiera inte fill/stroke). "
+        "Alla mått ska vara px med Tailwinds godtyckliga värden (w-[NNpx], h-[NNpx], left-[NNpx], top-[NNpx], gap-[NNpx]). "
+        "Ikoner: använd EXAKT 'icon_assets' som skickas. Importera varje SVG som URL med '?url'. "
+        "Exempel: import homeUrl from '<path>.svg?url'; "
+        "Rendera med <img src={homeUrl} alt='' aria-hidden='true' width={w} height={h} className='inline-block align-middle'/>. "
+        "Ändra aldrig fill eller stroke i SVG:erna. Använd alltid de givna {w}×{h}. "
+        "FÖRBJUDET: div-rutor som låtsas vara ikoner, inline-SVG, mask/filter, eller annan storlek än {w}×{h}. "
         "Placering och storlek ska följa IR-bounds."
     )
 
@@ -421,7 +424,7 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
     if not (import_name and import_path and jsx):
         raise HTTPException(500, "Mount-objektet saknar obligatoriska fält.")
 
-    # 2) Skriv JSX till tempfil (robust mot specialtecken) — SANITERA konflikter
+    # 2) Skriv JSX till tempfil — sanera Tailwind-konflikter
     with tempfile.NamedTemporaryFile("w", delete=False, suffix=".jsx.txt", encoding="utf-8") as tmp:
         tmp.write(_sanitize_tailwind_conflicts(str(jsx)))
         jsx_file_path = tmp.name
@@ -534,7 +537,7 @@ def _visual_validate(repo_root: Path) -> Dict[str, Any] | None:
 
 _TRIPLE_BACKTICKS = re.compile(r"```")
 
-# ——— Tailwind-sanerare: tar bort klasskonflikter som ger VSCode-varningar ———
+# ——— Tailwind-sanerare: tar bort klasskonflikter ———
 _CLS_RE = re.compile(r'className\s*=\s*(?P<q>"|\')(?P<val>.*?)(?P=q)')
 
 
@@ -574,6 +577,23 @@ def _normalize_target_for_file_mode(target_rel: str, import_name: str | None = N
     return (Path(TARGET_COMPONENT_DIR) / name).as_posix()
 
 
+def _derive_import_name(source: str | None) -> str:
+    """Härled ett säkert PascalCase-namn från path eller fallback."""
+    base = (source or "GeneratedComponent")
+    try:
+        base = Path(base).name
+    except Exception:
+        pass
+    base = base.split(".")[0]
+    parts = re.split(r"[^A-Za-z0-9]+", base)
+    name = "".join(p[:1].upper() + p[1:] for p in parts if p)
+    if not name:
+        name = "GeneratedComponent"
+    if not re.match(r"[A-Za-z_]", name[0]):
+        name = "_" + name
+    return name
+
+
 def _validate_and_sanitize_model_output(out: Dict[str, Any]) -> Dict[str, Any]:
     mode = out.get("mode")
     if mode not in ("file", "patch"):
@@ -585,24 +605,33 @@ def _validate_and_sanitize_model_output(out: Dict[str, Any]) -> Dict[str, Any]:
             raise HTTPException(500, f"Ogiltigt innehåll i '{key}': innehåller ```")
 
     mount = out.get("mount") or {}
-    # krävs: import_name, import_path, jsx
-    for req in ("import_name", "import_path", "jsx"):
-        if not mount.get(req):
-            raise HTTPException(500, f"Mount saknar '{req}'")
-    # default-ankare om saknas
     mount.setdefault("anchor", "AI-INJECT-MOUNT")
 
-    imp: str = str(mount["import_path"]).strip().replace("\\", "/")
-    if imp.endswith((".tsx", ".ts", ".jsx", ".js")):
-        imp = imp.rsplit(".", 1)[0]
-    if imp.startswith("/") or ".." in imp:
-        raise HTTPException(400, "import_path är ogiltig (absolut path eller '..').")
-    if not imp.startswith("."):
-        imp = "./" + imp
+    # import_name: härled tidigt
+    if not mount.get("import_name"):
+        cand = mount.get("import_path") or out.get("target_path") or "GeneratedComponent"
+        mount["import_name"] = _derive_import_name(str(cand))
 
-    mount["import_path"] = imp
+    # import_path: normalisera om finns, annars provisorisk baserad på target_path
+    imp_raw = (mount.get("import_path") or "").strip().replace("\\", "/")
+    if not imp_raw:
+        tmp_rel = _normalize_target_for_file_mode(str(out.get("target_path") or mount["import_name"]), mount["import_name"])
+        imp_raw = Path(tmp_rel).with_suffix("").as_posix()
+    if imp_raw.endswith((".tsx", ".ts", ".jsx", ".js")):
+        imp_raw = imp_raw.rsplit(".", 1)[0]
+    if imp_raw.startswith("/") or ".." in imp_raw:
+        raise HTTPException(400, "import_path är ogiltig (absolut path eller '..').")
+    if not imp_raw.startswith("."):
+        imp_raw = "./" + imp_raw
+    mount["import_path"] = imp_raw
+
+    # jsx: autogenerera om saknas
+    if not mount.get("jsx"):
+        mount["jsx"] = f"<{mount['import_name']} />"
+
     out["mount"] = mount
     return out
+
 
 
 def _write_assets_if_any(repo_root: Path, out: Dict[str, Any]) -> List[str]:
@@ -631,6 +660,91 @@ def _write_assets_if_any(repo_root: Path, out: Dict[str, Any]) -> List[str]:
         except Exception as e:
             raise HTTPException(500, f"Kunde inte skriva asset '{a}': {e}")
     return created
+
+# ─────────────────────────────────────────────────────────
+# Ikon-krav: typer och hård validering
+# ─────────────────────────────────────────────────────────
+
+def _ensure_svg_types(repo_root: Path) -> str | None:
+    """
+    Säkerställ TS-deklarationer så att *.svg och *.svg?url importeras som string-URL.
+    Returnerar relativ path om fil skapades, annars None.
+    """
+    rel = "frontendplay/src/types/svg.d.ts"
+    p = _safe_join(repo_root, rel)
+    if p.exists():
+        return None
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        "declare module '*.svg' { const src: string; export default src }\n"
+        "declare module '*.svg?url' { const src: string; export default src }\n",
+        encoding="utf-8",
+    )
+    return rel
+
+_IMG_IMPORT = re.compile(r"import\s+(\w+)\s+from\s+['\"]([^'\"]+\.svg(?:\?url)?)['\"]")
+_IMG_TAG = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+_SRC_VAR = re.compile(r"src=\{(\w+)\}", re.IGNORECASE)
+_NUM_IN_ATTR = re.compile(
+    r"(width|height)\s*=\s*(?:\{\s*([0-9]+)\s*\}|['\"]\s*([0-9]+)\s*['\"])",
+    re.IGNORECASE,
+)
+
+def _assert_icons_used(file_code: str, icon_assets: List[Dict[str, Any]]) -> None:
+    """
+    Säkerställ att varje exporterad ikon importeras som '?url' och renderas som <img>
+    med exakt angiven bredd och höjd från IR-bounds.
+    """
+    if not icon_assets:
+        return
+
+    imports = {m.group(1): m.group(2) for m in _IMG_IMPORT.finditer(file_code)}
+    used_vars: set[str] = set()
+    size_by_var: Dict[str, Tuple[int | None, int | None]] = {}
+
+    for tag in _IMG_TAG.findall(file_code):
+        m = _SRC_VAR.search(tag)
+        if not m:
+            continue
+        var = m.group(1)
+        used_vars.add(var)
+        w = h = None
+        for attr, n1, n2 in _NUM_IN_ATTR.findall(tag):
+            val = int(n1 or n2) if (n1 or n2) else None
+            if attr.lower() == "width":
+                w = val
+            elif attr.lower() == "height":
+                h = val
+        size_by_var[var] = (w, h)
+
+    used_paths = {imports[v] for v in used_vars if v in imports}
+
+    missing: List[str] = []
+    size_issues: List[str] = []
+    for ia in icon_assets:
+        p = ia["import_path"]
+        ok = any(s.endswith(p) or s.endswith(p + "?url") for s in used_paths)
+        if not ok:
+            missing.append(p)
+            continue
+        w_target = int(round(float(ia.get("w") or 0)))
+        h_target = int(round(float(ia.get("h") or 0)))
+        vars_for_path = [v for v, path in imports.items() if path.endswith(p) or path.endswith(p + "?url")]
+        good = False
+        for v in vars_for_path:
+            w, h = size_by_var.get(v, (None, None))
+            if w == w_target and h == h_target:
+                good = True
+                break
+        if not good:
+            size_issues.append(f"{p} ska vara {w_target}x{h_target}px")
+    if missing or size_issues:
+        problems = []
+        if missing:
+            problems.append("saknar import+<img> för: " + ", ".join(missing))
+        if size_issues:
+            problems.append("fel storlek: " + "; ".join(size_issues))
+        raise HTTPException(500, "Ikonvalidering: " + " | ".join(problems))
 
 # ─────────────────────────────────────────────────────────
 # Celery-task
@@ -687,6 +801,9 @@ def integrate_figma_node(
             "h": ic["bounds"]["h"],
         })
 
+    # 2.2) Säkerställ TS-typer för SVG
+    created_svg_types_rel = _ensure_svg_types(tmp_root)
+
     # 3) Installera beroenden vid behov (root och/eller frontendplay)
     _ensure_node_modules(tmp_root)
 
@@ -734,7 +851,6 @@ def integrate_figma_node(
     repo.git.checkout("-b", branch)
 
     # 8) Tillämpa ändring
-    changes: List[Dict[str, str]] = []
     returned_primary_path: str
     target_path: Path | None = None
 
@@ -744,12 +860,13 @@ def integrate_figma_node(
         target_path.parent.mkdir(parents=True, exist_ok=True)
         if not isinstance(file_code, str) or not file_code.strip():
             raise HTTPException(500, "file_code saknas för mode='file'.")
-        # SANITERA innan skrivning för att undvika Tailwind-konflikter
+        # Ikonvalidering innan skrivning
+        _assert_icons_used(str(file_code), icon_assets)
+        # SANITERA och skriv
         target_path.write_text(_sanitize_tailwind_conflicts(file_code), encoding="utf-8")
         returned_primary_path = target_rel
 
-        created_assets = _write_assets_if_any(tmp_root, out)
-        logger.info("Skrev %d asset(s).", len(created_assets))
+        _write_assets_if_any(tmp_root, out)
 
     elif mode == "patch":
         norm = target_rel.replace("\\", "/")
@@ -764,6 +881,11 @@ def integrate_figma_node(
                 raise HTTPException(500, "unified_diff saknas för mode='patch'.")
             _git_apply(tmp_root, unified_diff)
             returned_primary_path = norm
+            # Ikonvalidering på den patchade filen om TS/JSX/TS
+            if returned_primary_path.endswith((".tsx", ".jsx", ".js", ".ts")):
+                patched_path = _safe_join(tmp_root, returned_primary_path)
+                if patched_path.exists():
+                    _assert_icons_used(patched_path.read_text(encoding="utf-8"), icon_assets)
     else:
         raise HTTPException(500, f"Okänt mode: {mode}")
 
@@ -795,7 +917,12 @@ def integrate_figma_node(
     logger.info("Mount after  norm: %s (main_rel=%s)", dict(mount), main_rel)
 
     # 9) AST-injektion för mount (alltid)
+    # 9) AST-injektion för mount (alltid)
+    # 9) AST-injektion för mount (alltid)
+    if not mount.get("jsx"):
+        mount["jsx"] = f"<{mount['import_name']} />"
     _ast_inject_mount(tmp_root, mount)
+
 
     # 10) Typecheck + lint
     _typecheck_and_lint(tmp_root)
@@ -839,6 +966,10 @@ def integrate_figma_node(
     # d) exporterade ikon-SVG:er
     for ia in icon_assets:
         changed_paths.append(ia["import_path"])
+
+    # e) ts-deklaration för svg om skapad
+    if created_svg_types_rel:
+        changed_paths.append(created_svg_types_rel)
 
     # Deduplicera och läs
     uniq_paths: List[str] = []
