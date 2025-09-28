@@ -2,7 +2,7 @@
 from __future__ import annotations
 """
 Figma → IR (Intermediate Representation) för robust, deterministisk kodgenerering.
-Nu med ikon-detektion så att vektorikoner kan hämtas som SVG och färgsättas korrekt.
+Fix: undvik ikon-dubbletter genom att stoppa rekursion under noder som redan klassats som ikon.
 """
 
 from typing import Any, Dict, List, Optional, Tuple, cast
@@ -609,7 +609,8 @@ _ICON_TYPES = {
     "LINE",
     "REGULAR_POLYGON",
     "STAR",
-    "INSTANCE",  # komponent-instans av ikon
+    "INSTANCE",
+    "GROUP",  # med stop-rekursion för att undvika förälder+barn-dubletter
 }
 
 def _is_iconish_name(name: str) -> bool:
@@ -631,28 +632,27 @@ def _icon_hint(node: Dict[str, Any]) -> Dict[str, Any]:
     has_children = bool(node.get("children"))
     w, h = b["w"] or 0.0, b["h"] or 0.0
 
-    # Kandidatregler
     small_enough = (w <= 64.01 and h <= 64.01)
     type_ok = t in _ICON_TYPES
-    name_ok = _is_iconish_name(name) or (int(round(w)) in (16,20,24,28,32) and int(round(h)) in (16,20,24,28,32))
+    size_typical = int(round(w)) in (16,20,24,28,32) and int(round(h)) in (16,20,24,28,32)
+    name_ok = _is_iconish_name(name) or size_typical or small_enough
 
-    # INSTANCE tillåts som ikon om namnet antyder det eller storleken är typisk
-    if t == "INSTANCE":
+    # För vissa nodtyper accepteras barn; vi stoppar rekursion senare vid trädsökning.
+    if t in ("INSTANCE", "GROUP", "BOOLEAN_OPERATION"):
         child_ok = True
     else:
-        child_ok = not has_children or t == "BOOLEAN_OPERATION"
+        child_ok = not has_children
 
     is_icon = bool(type_ok and child_ok and small_enough and name_ok)
 
     hex_col, alpha = _single_visible_solid_fill(node)
-    # Om ingen fill men stroke finns, ta stroke-färg som färgbarhet
     if not hex_col:
         strokes = node.get("strokes") or []
         s0 = _first(strokes, lambda s: s.get("type")=="SOLID" and _bool(s.get("visible",True), True))
         if s0:
             hex_col, alpha = _rgba_hex(cast(Optional[Dict[str, Any]], (s0.get("color") or {})))
 
-    tintable = is_icon and bool(hex_col)  # exakt en dominerande färg → kan ersättas med currentColor
+    tintable = is_icon and bool(hex_col)
     return {
         "is_icon": is_icon,
         "name": name,
@@ -698,7 +698,7 @@ def _node_to_ir(node: Dict[str, Any]) -> Dict[str, Any]:
         "clips_content": _bool(node.get("clipsContent"), False),
         "overflow": ov,
         "text": text,
-        "icon": icon,                 # ← ikon-hint för exakt SVG-export och färgsättning
+        "icon": icon,
         "children": [],
     }
 
@@ -811,7 +811,8 @@ def build_tailwind_map(ir_node: Dict[str, Any]) -> Dict[str, str]:
 
 def collect_icon_nodes(ir_node: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Returnerar lista över ikon-noder i IR-trädet.
+    Returnerar lista över ikon-noder i IR-trädet utan dubbletter.
+    Strategi: om en nod klassas som ikon läggs den till och rekursionen under den stoppas.
     Varje element: { id, name, name_slug, bounds:{x,y,w,h}, tintable:bool, color:str|None }
     """
     out: List[Dict[str, Any]] = []
@@ -828,11 +829,18 @@ def collect_icon_nodes(ir_node: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "color": ic.get("dominant_color"),
                 "alpha": ic.get("dominant_alpha", 1.0),
             })
+            return  # Viktigt: stoppa rekursion för att undvika förälder+barn-dubletter
         for ch in n.get("children", []):
             rec(ch)
 
     rec(ir_node)
-    return out
+
+    # Extra skydd mot ev. dubletter: dedupe per id
+    uniq: Dict[str, Dict[str, Any]] = {}
+    for x in out:
+        if x["id"] and x["id"] not in uniq:
+            uniq[x["id"]] = x
+    return list(uniq.values())
 
 # ────────────────────────────────────────────────────────────────────────────
 # CLI-test

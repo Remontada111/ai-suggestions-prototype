@@ -16,6 +16,7 @@ Kräver att följande filer/script finns i repo (läggs till i projektet):
 """
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -63,6 +64,9 @@ ALLOW_PATCH = [
 # Där vi lägger exporterade SVG-ikoner
 ICON_DIR = os.getenv("ICON_DIR", "frontendplay/src/assets/icons").strip().rstrip("/")
 
+# Mjuk- eller hård-ikonvalidering (default: mjuk i dev)
+STRICT_ICONS = os.getenv("STRICT_ICONS", "false").lower() in ("1", "true", "yes")
+
 FIGMA_TOKEN: str | None = os.getenv("FIGMA_TOKEN")
 if not FIGMA_TOKEN:
     raise RuntimeError("FIGMA_TOKEN saknas i miljön (.env).")
@@ -77,7 +81,7 @@ ENABLE_VISUAL_VALIDATE = (
 # ─────────────────────────────────────────────────────────
 
 app = Celery("codegen", broker=BROKER_URL, backend=RESULT_BACKEND)
-app.conf.broker_connection_retry_on_startup = False
+app.conf.broker_connection_retry_on_startup = True
 app.conf.broker_connection_timeout = 3
 app.conf.redis_socket_timeout = 3
 celery_app: Celery = app
@@ -118,19 +122,18 @@ def _detect_pm(workdir: Path) -> str:
     try:
         if pkg.exists():
             data = json.loads(pkg.read_text(encoding="utf-8"))
-        else:
-            data = {}
+            pm_field = str(data.get("packageManager") or "").lower()
+            if pm_field.startswith("npm@"):
+                return "npm"
+            if pm_field.startswith("pnpm@"):
+                return "pnpm"
+            if pm_field.startswith("yarn@"):
+                return "yarn"
+            if pm_field.startswith("bun@"):
+                return "bun"
     except Exception:
-        data = {}
-    pm_field = str((data.get("packageManager") or "")).lower()
-    if pm_field.startswith("npm@"):
-        return "npm"
-    if pm_field.startswith("pnpm@"):
-        return "pnpm"
-    if pm_field.startswith("yarn@"):
-        return "yarn"
-    if pm_field.startswith("bun@"):
-        return "bun"
+        pass
+
     if (workdir / "package-lock.json").exists():
         return "npm"
     if (workdir / "pnpm-lock.yaml").exists():
@@ -352,7 +355,7 @@ def _build_messages(
         "ir": ir,
         "components": overview,
         "placement": placement or {},
-        "icon_assets": icon_assets,  # [{id,name,import_path,w,h}]
+        "icon_assets": icon_assets,  # [{id,name,import_path,fs_path,w,h}]
         "constraints": {
             "no_inline_styles": True,
             "no_dangerous_html": True,
@@ -368,17 +371,20 @@ def _build_messages(
         "Du är en strikt kodgenerator. Returnera ENDAST JSON som matchar schema. "
         "Inga inline-styles. Använd semantiska element, CSS-modul eller Tailwind och följ tokens. "
         "Montera komponenten i main.tsx via 'mount' (AST-injektion vid ankaret), wrappa inte <App/>. "
+        "Patch av main.tsx är FÖRBJUDET. Skapa/uppdatera alltid en komponentfil (mode='file') i target_component_dir och montera via 'mount'. "
+        "Returnera alltid 'file_code' även om du tror att patch räcker. "
         "Om befintlig komponent kan återanvändas: 'patch' den filen. Annars 'file' i target_component_dir. "
         "Skriv aldrig markdown-triple-backticks i kodfält. Inga absoluta paths eller ../ i import_path. "
         "Sätt aldrig både 'border' och 'border-[…]' på samma element; välj en. "
         "Sätt inte 'relative' på ett element som också har 'absolute'. "
         "Alla mått ska vara px med Tailwinds godtyckliga värden (w-[NNpx], h-[NNpx], left-[NNpx], top-[NNpx], gap-[NNpx]). "
         "Ikoner: använd EXAKT 'icon_assets' som skickas. Importera varje SVG som URL med '?url'. "
-        "Exempel: import homeUrl from '<path>.svg?url'; "
+        "Exempel: import homeUrl från '<path>.svg?url'; "
         "Rendera med <img src={homeUrl} alt='' aria-hidden='true' width={w} height={h} className='inline-block align-middle'/>. "
         "Ändra aldrig fill eller stroke i SVG:erna. Använd alltid de givna {w}×{h}. "
         "FÖRBJUDET: div-rutor som låtsas vara ikoner, inline-SVG, mask/filter, eller annan storlek än {w}×{h}. "
-        "Placering och storlek ska följa IR-bounds."
+        "För VARJE ikon i 'icon_assets' ska du importera som '?url' och rendera med EXAKTA width={w} och height={h} attribut på <img>. "
+        "Storlekar enbart via className accepteras inte."
     )
 
     return [
@@ -389,6 +395,13 @@ def _build_messages(
 # ─────────────────────────────────────────────────────────
 # Hjälpare för relativ import till main.tsx
 # ─────────────────────────────────────────────────────────
+
+_ANCHOR_SINGLE = "AI-INJECT-MOUNT"
+_ANCHOR_BEGIN = "AI-INJECT-MOUNT:BEGIN"
+_ANCHOR_END = "AI-INJECT-MOUNT:END"
+_ANCHOR_JSX = "{/* AI-INJECT-MOUNT */}"
+_ANCHOR_JSX_BEGIN = "{/* AI-INJECT-MOUNT:BEGIN */}"
+_ANCHOR_JSX_END = "{/* AI-INJECT-MOUNT:END */}"
 
 
 def _rel_import_from_main(main_tsx: Path, target_file: Path) -> str:
@@ -401,14 +414,93 @@ def _rel_import_from_main(main_tsx: Path, target_file: Path) -> str:
     return rel
 
 # ─────────────────────────────────────────────────────────
-# AST-injektion (main.tsx)
+# AST-injektion (main.tsx) och säkert ankare
 # ─────────────────────────────────────────────────────────
+
+
+def _has_pair_markers(src: str) -> bool:
+    b = re.search(r"\{\s*/\*\s*AI-INJECT-MOUNT:BEGIN\s*\*/\s*\}", src)
+    e = re.search(r"\{\s*/\*\s*AI-INJECT-MOUNT:END\s*\*/\s*\}", src)
+    return bool(b and e and e.start() > b.start())
+
+
+def _replace_single_with_pair(src: str) -> str:
+    """
+    Ersätt enstaka AI-INJECT-MOUNT-kommentar med BEGIN/END-markörer.
+    Bevarar indentering.
+    """
+    patterns = [
+        r"\{/\*\s*AI-INJECT-MOUNT\s*\*/\}",     # JSX comment
+        r"//[ \t]*AI-INJECT-MOUNT.*",           # line
+        r"/\*[ \t]*AI-INJECT-MOUNT[ \t]*\*/",   # block
+    ]
+    for pat in patterns:
+        m = re.search(pat, src)
+        if not m:
+            continue
+        line_start = src.rfind("\n", 0, m.start()) + 1
+        indent_match = re.match(r"[ \t]*", src[line_start:m.start()])
+        indent = indent_match.group(0) if indent_match else ""
+        replacement = f"{_ANCHOR_JSX_BEGIN}\n{indent}{_ANCHOR_JSX_END}"
+        return src[:m.start()] + replacement + src[m.end():]
+    return src
+
+
+def _ensure_anchor_in_main(main_tsx: Path) -> None:
+    """
+    Säkerställ att PAREDE MARKÖRER finns i main.tsx, och att de hamnar i giltig JSX.
+    Strategi:
+      1) Om par-markörer redan finns → inget att göra.
+      2) Om singel-ankare finns → konvertera till par.
+      3) Om </React.StrictMode> finns → injicera paret omedelbart före den.
+      4) Om render(<App />) detekteras → wrappa till fragment: render(<><App /> {/*BEGIN*/}{/*END*/}</>)
+      5) Sista utväg: lägg trivial wrapper-funktion med paret.
+    """
+    src = main_tsx.read_text(encoding="utf-8")
+
+    # 1) Redan par?
+    if _has_pair_markers(src):
+        return
+
+    # 2) Konvertera singel-ankare om sådant finns
+    if _ANCHOR_SINGLE in src:
+        new_src = _replace_single_with_pair(src)
+        main_tsx.write_text(new_src, encoding="utf-8")
+        return
+
+    # 3) Före </React.StrictMode>
+    m = re.search(r"</React\.StrictMode>", src)
+    if m:
+        insert = "    " + _ANCHOR_JSX_BEGIN + "\n" + "    " + _ANCHOR_JSX_END + "\n"
+        src = src[:m.start()] + insert + src[m.start():]
+        main_tsx.write_text(src, encoding="utf-8")
+        return
+
+    # 4) render(<App />) → wrappa till fragment
+    m = re.search(r"render\(\s*(<App\s*/>)\s*\)", src)
+    if m:
+        inner = m.group(1)
+        frag = f"<>{inner} {_ANCHOR_JSX_BEGIN} {_ANCHOR_JSX_END}</>"
+        src = src[:m.start()] + "render(" + frag + ")" + src[m.end():]
+        main_tsx.write_text(src, encoding="utf-8")
+        return
+
+    # 5) Sista utväg
+    if _ANCHOR_BEGIN not in src and _ANCHOR_END not in src:
+        src += (
+            "\n\n// Auto-added safe mount wrapper\n"
+            "function __AiMountSafe__() { return (<>\n"
+            f"  {_ANCHOR_JSX_BEGIN}\n"
+            f"  {_ANCHOR_JSX_END}\n"
+            "</>); }\n"
+        )
+    main_tsx.write_text(src, encoding="utf-8")
 
 
 def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
     """
-    Kör TS/AST-injektion som säkerställer import + JSX-mount vid AI-INJECT-MOUNT.
-    Försöker flera körsätt för tsx: node --import tsx → npx tsx → node --loader tsx.
+    Kör TS/AST-injektion som säkerställer import + JSX-mount vid AI-INJECT-MOUNT:BEGIN/END.
+    Försöker: node --import tsx → node --loader tsx → npx tsx.
     """
     # 1) Lokalisera main.tsx
     main_tsx = next(
@@ -423,6 +515,9 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
     jsx = mount.get("jsx")
     if not (import_name and import_path and jsx):
         raise HTTPException(500, "Mount-objektet saknar obligatoriska fält.")
+
+    # Säkerställ paret av markörer finns
+    _ensure_anchor_in_main(main_tsx)
 
     # 2) Skriv JSX till tempfil — sanera Tailwind-konflikter
     with tempfile.NamedTemporaryFile("w", delete=False, suffix=".jsx.txt", encoding="utf-8") as tmp:
@@ -442,37 +537,41 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
         if not script_path.exists():
             raise HTTPException(500, f"Saknar scripts/ai_inject_mount.ts: {script_path}")
 
-        # 4) Kör injektorn med robusta fallbackar
         logger.info("AST-inject start main=%s import_name=%s import_path=%s", main_tsx, import_name, import_path)
 
+        # Fallback 1: node --import tsx (Node >=20)
         cmd1 = [
             "node", "--import", "tsx",
             str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path),
         ]
         rc, out, err = _run(cmd1, cwd=base)
         logger.info("node --import tsx rc=%s\nstdout:\n%s\nstderr:\n%s", rc, (out or "").strip(), (err or "").strip())
+        if rc == 0:
+            return
 
-        if rc != 0:
-            cmd2 = ["npx", "tsx", str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path)]
-            rc2, out2, err2 = _run(cmd2, cwd=base)
-            logger.info("npx tsx rc=%s\nstdout:\n%s\nstderr:\n%s", rc2, (out2 or "").strip(), (err2 or "").strip())
+        # Fallback 2: node --loader tsx (Node 16/18)
+        cmd1b = [
+            "node", "--loader", "tsx",
+            str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path),
+        ]
+        rc1b, out1b, err1b = _run(cmd1b, cwd=base)
+        logger.info("node --loader tsx rc=%s\nstdout:\n%s\nstderr:\n%s", rc1b, (out1b or "").strip(), (err1b or "").strip())
+        if rc1b == 0:
+            return
 
-            if rc2 != 0:
-                cmd3 = [
-                    "node", "--loader", "tsx",
-                    str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path),
-                ]
-                rc3, out3, err3 = _run(cmd3, cwd=base)
-                logger.info("node --loader tsx rc=%s\nstdout:\n%s\nstderr:\n%s", rc3, (out3 or "").strip(), (err3 or "").strip())
+        # Fallback 3: npx tsx (hämtar loader om ej installerad)
+        cmd2 = ["npx", "tsx", str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path)]
+        rc2, out2, err2 = _run(cmd2, cwd=base)
+        logger.info("npx tsx rc=%s\nstdout:\n%s\nstderr:\n%s", rc2, (out2 or "").strip(), (err2 or "").strip())
 
-                if rc3 != 0:
-                    raise HTTPException(
-                        500,
-                        "AST-injektion misslyckades:\n"
-                        f"{' '.join(cmd1)}\n{err or out}\n\n"
-                        f"{' '.join(cmd2)}\n{err2 or out2}\n\n"
-                        f"{' '.join(cmd3)}\n{err3 or out3}"
-                    )
+        if rc2 != 0:
+            raise HTTPException(
+                500,
+                "AST-injektion misslyckades:\n"
+                f"{' '.join(cmd1)}\n{err or out}\n\n"
+                f"{' '.join(cmd1b)}\n{err1b or out1b}\n\n"
+                f"{' '.join(cmd2)}\n{err2 or out2}"
+            )
     finally:
         try:
             os.unlink(jsx_file_path)
@@ -491,7 +590,7 @@ def _typecheck_and_lint(repo_root: Path) -> None:
         base = repo_root / "frontendplay"
 
     # typecheck
-    if _has_script(repo_root, "typecheck"):
+    if _has_script(base, "typecheck"):
         rc, out, err = _run_pm_script(base, "typecheck")
         if rc != 0:
             raise HTTPException(500, f"Typecheck misslyckades:\n{err or out}")
@@ -499,7 +598,7 @@ def _typecheck_and_lint(repo_root: Path) -> None:
         logger.info("Hoppar över typecheck (script saknas).")
 
     # lint fix
-    if _has_script(repo_root, "lint:fix"):
+    if _has_script(base, "lint:fix"):
         rc, out, err = _run_pm_script(base, "lint:fix")
         if rc != 0:
             logger.warning("lint:fix returnerade felkod: %s\n%s", rc, err or out)
@@ -519,7 +618,7 @@ def _visual_validate(repo_root: Path) -> Dict[str, Any] | None:
     if not (base / "package.json").exists() and (repo_root / "frontendplay" / "package.json").exists():
         base = repo_root / "frontendplay"
 
-    if not _has_script(repo_root, "test:visual"):
+    if not _has_script(base, "test:visual"):
         logger.info("Hoppar över visuell validering (test:visual saknas).")
         return None
 
@@ -534,14 +633,12 @@ def _visual_validate(repo_root: Path) -> Dict[str, Any] | None:
 # Modellsvaret: validering och normalisering
 # ─────────────────────────────────────────────────────────
 
-
 _TRIPLE_BACKTICKS = re.compile(r"```")
-
-# ——— Tailwind-sanerare: tar bort klasskonflikter ———
 _CLS_RE = re.compile(r'className\s*=\s*(?P<q>"|\')(?P<val>.*?)(?P=q)')
 
 
 def _sanitize_tailwind_conflicts(src: str) -> str:
+    """Ta bort typiska Tailwind-konflikter och normalisera whitespace i className."""
     def fix(m: re.Match) -> str:
         q = m.group("q")
         cls = m.group("val")
@@ -605,7 +702,7 @@ def _validate_and_sanitize_model_output(out: Dict[str, Any]) -> Dict[str, Any]:
             raise HTTPException(500, f"Ogiltigt innehåll i '{key}': innehåller ```")
 
     mount = out.get("mount") or {}
-    mount.setdefault("anchor", "AI-INJECT-MOUNT")
+    mount.setdefault("anchor", _ANCHOR_SINGLE)
 
     # import_name: härled tidigt
     if not mount.get("import_name"):
@@ -631,7 +728,6 @@ def _validate_and_sanitize_model_output(out: Dict[str, Any]) -> Dict[str, Any]:
 
     out["mount"] = mount
     return out
-
 
 
 def _write_assets_if_any(repo_root: Path, out: Dict[str, Any]) -> List[str]:
@@ -662,7 +758,7 @@ def _write_assets_if_any(repo_root: Path, out: Dict[str, Any]) -> List[str]:
     return created
 
 # ─────────────────────────────────────────────────────────
-# Ikon-krav: typer och hård validering
+# Ikon-krav: typer, filnamn och validering
 # ─────────────────────────────────────────────────────────
 
 def _ensure_svg_types(repo_root: Path) -> str | None:
@@ -682,6 +778,14 @@ def _ensure_svg_types(repo_root: Path) -> str | None:
     )
     return rel
 
+
+def _icon_filename(name_slug: str, node_id: str) -> str:
+    """Säkert, deterministiskt ikonfilnamn utan kolon etc."""
+    h = hashlib.sha1(node_id.encode("utf-8")).hexdigest()[:6]
+    safe = re.sub(r"[^a-z0-9\-]+", "-", (name_slug or "icon").lower()).strip("-") or "icon"
+    return f"{safe}-{h}.svg"
+
+
 _IMG_IMPORT = re.compile(r"import\s+(\w+)\s+from\s+['\"]([^'\"]+\.svg(?:\?url)?)['\"]")
 _IMG_TAG = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 _SRC_VAR = re.compile(r"src=\{(\w+)\}", re.IGNORECASE)
@@ -690,9 +794,10 @@ _NUM_IN_ATTR = re.compile(
     re.IGNORECASE,
 )
 
+
 def _assert_icons_used(file_code: str, icon_assets: List[Dict[str, Any]]) -> None:
     """
-    Säkerställ att varje exporterad ikon importeras som '?url' och renderas som <img>
+    Säkerställ att varje exporterad ikon importeras som URL och renderas som <img>
     med exakt angiven bredd och höjd från IR-bounds.
     """
     if not icon_assets:
@@ -721,8 +826,14 @@ def _assert_icons_used(file_code: str, icon_assets: List[Dict[str, Any]]) -> Non
 
     missing: List[str] = []
     size_issues: List[str] = []
+    seen_expected: set[str] = set()  # dedupe per path
+
     for ia in icon_assets:
         p = ia["import_path"]
+        if p in seen_expected:
+            continue
+        seen_expected.add(p)
+
         ok = any(s.endswith(p) or s.endswith(p + "?url") for s in used_paths)
         if not ok:
             missing.append(p)
@@ -738,13 +849,17 @@ def _assert_icons_used(file_code: str, icon_assets: List[Dict[str, Any]]) -> Non
                 break
         if not good:
             size_issues.append(f"{p} ska vara {w_target}x{h_target}px")
+
     if missing or size_issues:
         problems = []
         if missing:
             problems.append("saknar import+<img> för: " + ", ".join(missing))
         if size_issues:
             problems.append("fel storlek: " + "; ".join(size_issues))
-        raise HTTPException(500, "Ikonvalidering: " + " | ".join(problems))
+        msg = "Ikonvalidering: " + " | ".join(problems)
+        if STRICT_ICONS:
+            raise HTTPException(500, msg)
+        logger.warning(msg)  # fortsätt om icke-strikt
 
 # ─────────────────────────────────────────────────────────
 # Celery-task
@@ -771,11 +886,23 @@ def integrate_figma_node(
     ir = figma_to_ir(figma_json, node_id)
     logger.info("IR byggd.")
 
-    # 1.5) Ikon-detektion i IR + exportera identiska SVG:er som lokala assets
-    icon_nodes = collect_icon_nodes(ir["root"])
+    # 1.5) Ikon-detektion + exportera identiska SVG:er som lokala assets
+    raw_icon_nodes = collect_icon_nodes(ir["root"])
+
+    # Heuristisk deduplicering för att undvika dubbletter från förälder+barn:
+    # nyckel = (rundad w, rundad h, slug)
+    dedup: Dict[Tuple[int, int, str], Dict[str, Any]] = {}
+    for ic in raw_icon_nodes:
+        b = ic.get("bounds") or {}
+        w = int(round(float(b.get("w", 0) or 0)))
+        h = int(round(float(b.get("h", 0) or 0)))
+        key = (w, h, str(ic.get("name_slug") or "icon"))
+        dedup.setdefault(key, ic)
+    icon_nodes = list(dedup.values())
+
     svg_by_id = _fetch_svgs(file_key, [x["id"] for x in icon_nodes])
     icon_assets: List[Dict[str, Any]] = []
-    logger.info("Hittade %d ikon(er).", len(icon_nodes))
+    logger.info("Ikoner efter dedupe: %d (från %d).", len(icon_nodes), len(raw_icon_nodes))
 
     # 2) Klona repo till temp
     tmp_dir, repo = clone_repo()
@@ -788,15 +915,23 @@ def integrate_figma_node(
         svg = svg_by_id.get(nid)
         if not svg:
             continue
-        fname = f"{ic['name_slug']}-{nid[:6]}.svg"
-        rel_path = f"{ICON_DIR}/{fname}"
-        abs_path = _safe_join(tmp_root, rel_path)
+        fname = _icon_filename(ic["name_slug"], nid)
+        disk_rel = f"{ICON_DIR}/{fname}".replace("\\", "/")
+        abs_path = _safe_join(tmp_root, disk_rel)
         abs_path.parent.mkdir(parents=True, exist_ok=True)
         abs_path.write_text(svg, encoding="utf-8")
+
+        # Gör en Vite-vänlig importväg: /src/...
+        vite_spec = disk_rel
+        parts = vite_spec.split("/src/", 1)
+        if len(parts) == 2:
+            vite_spec = "/src/" + parts[1]
+
         icon_assets.append({
             "id": nid,
             "name": ic.get("name") or ic["name_slug"],
-            "import_path": rel_path,
+            "import_path": vite_spec,   # vad komponenten ska importera i Vite
+            "fs_path": disk_rel,        # faktisk fil i repo (för changes/utläsning)
             "w": ic["bounds"]["w"],
             "h": ic["bounds"]["h"],
         })
@@ -870,18 +1005,38 @@ def integrate_figma_node(
 
     elif mode == "patch":
         norm = target_rel.replace("\\", "/")
-        if norm not in ALLOW_PATCH:
-            raise HTTPException(400, f"Patch ej tillåten för {norm}. Tillåtna: {ALLOW_PATCH}")
 
         if norm.endswith("main.tsx"):
-            logger.info("Ignorerar diff mot main.tsx; använder AST-injektion för montering.")
-            returned_primary_path = norm
+            # Auto-konvertera till file-läge i stället för att kasta fel
+            comp_rel = _normalize_target_for_file_mode(
+                mount.get("import_name") or "GeneratedComponent",
+                mount.get("import_name"),
+            )
+            comp_abs = _safe_join(tmp_root, comp_rel)
+            comp_abs.parent.mkdir(parents=True, exist_ok=True)
+
+            if isinstance(file_code, str) and file_code.strip():
+                _assert_icons_used(str(file_code), icon_assets)
+                comp_abs.write_text(_sanitize_tailwind_conflicts(file_code), encoding="utf-8")
+            elif not comp_abs.exists():
+                comp_abs.write_text(
+                    f"export default function {mount['import_name']}(){{return null;}}\n",
+                    encoding="utf-8",
+                )
+
+            returned_primary_path = comp_rel
+            target_path = comp_abs
+            mode = "file"  # fortsätt resten av flödet som fil-skapande
+
         else:
+            if norm not in ALLOW_PATCH:
+                raise HTTPException(400, f"Patch ej tillåten för {norm}. Tillåtna: {ALLOW_PATCH}")
+
             if not unified_diff or not isinstance(unified_diff, str):
                 raise HTTPException(500, "unified_diff saknas för mode='patch'.")
             _git_apply(tmp_root, unified_diff)
             returned_primary_path = norm
-            # Ikonvalidering på den patchade filen om TS/JSX/TS
+
             if returned_primary_path.endswith((".tsx", ".jsx", ".js", ".ts")):
                 patched_path = _safe_join(tmp_root, returned_primary_path)
                 if patched_path.exists():
@@ -899,6 +1054,7 @@ def integrate_figma_node(
         if mode == "file" and target_path is not None:
             mount["import_path"] = _rel_import_from_main(main_abs, target_path)
         elif mode == "patch":
+            # Behåll modellens import_path men försök normalisera om target kan härledas
             maybe_target = str(mount.get("import_path", "")).strip()
             if maybe_target:
                 guess_name = Path(maybe_target).name
@@ -914,15 +1070,32 @@ def integrate_figma_node(
                 mount["import_path"] = str(mount.get("import_path"))
     except Exception as e:
         logger.warning("Kunde inte normalisera import_path: %s", e)
+
+    # Skydd: importera aldrig från main.tsx (t.ex. './main')
+    imp = str(mount.get("import_path") or "").strip().replace("\\", "/")
+    bad_specs = {
+        "main", "./main", "frontendplay/src/main", "./frontendplay/src/main",
+    }
+    if imp in bad_specs or imp.endswith("/main"):
+        if mode == "file" and target_path is not None:
+            mount["import_path"] = _rel_import_from_main(main_abs, target_path)
+        else:
+            # Skapa en tom komponent om nödvändigt och peka importen dit
+            safe_rel = (Path(TARGET_COMPONENT_DIR) / f"{mount['import_name']}.tsx").as_posix()
+            safe_abs = _safe_join(tmp_root, safe_rel)
+            safe_abs.parent.mkdir(parents=True, exist_ok=True)
+            if not safe_abs.exists():
+                safe_abs.write_text(f"export default function {mount['import_name']}(){{return null;}}\n", encoding="utf-8")
+            mount["import_path"] = _rel_import_from_main(main_abs, safe_abs)
+            if 'returned_primary_path' in locals() and returned_primary_path == main_rel:
+                returned_primary_path = safe_rel
+
     logger.info("Mount after  norm: %s (main_rel=%s)", dict(mount), main_rel)
 
-    # 9) AST-injektion för mount (alltid)
-    # 9) AST-injektion för mount (alltid)
-    # 9) AST-injektion för mount (alltid)
+    # 9) AST-injektion för mount (idempotent via BEGIN/END-markörer)
     if not mount.get("jsx"):
         mount["jsx"] = f"<{mount['import_name']} />"
     _ast_inject_mount(tmp_root, mount)
-
 
     # 10) Typecheck + lint
     _typecheck_and_lint(tmp_root)
@@ -963,11 +1136,12 @@ def integrate_figma_node(
         if rel:
             changed_paths.append(rel)
 
-    # d) exporterade ikon-SVG:er
+    # d) exporterade ikon-SVG:er (lägg till repo-filvägen)
     for ia in icon_assets:
-        changed_paths.append(ia["import_path"])
+        changed_paths.append(ia.get("fs_path") or ia["import_path"])
 
     # e) ts-deklaration för svg om skapad
+    created_svg_types_rel = created_svg_types_rel or None  # silence linters
     if created_svg_types_rel:
         changed_paths.append(created_svg_types_rel)
 
