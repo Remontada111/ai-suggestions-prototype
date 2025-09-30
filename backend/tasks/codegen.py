@@ -1,4 +1,3 @@
-# backend/tasks/codegen.py
 from __future__ import annotations
 """
 Celery-worker: Figma-node → IR → LLM-förslag → (AST-mount + patch/file) → validering → commit → returnera *alla* ändrade filer
@@ -64,8 +63,8 @@ ALLOW_PATCH = [
 # Där vi lägger exporterade SVG-ikoner
 ICON_DIR = os.getenv("ICON_DIR", "frontendplay/src/assets/icons").strip().rstrip("/")
 
-# Mjuk- eller hård-ikonvalidering (default: mjuk i dev)
-STRICT_ICONS = os.getenv("STRICT_ICONS", "false").lower() in ("1", "true", "yes")
+# Gör ikonregler hårda som default
+STRICT_ICONS = os.getenv("STRICT_ICONS", "true").lower() in ("1", "true", "yes")
 
 FIGMA_TOKEN: str | None = os.getenv("FIGMA_TOKEN")
 if not FIGMA_TOKEN:
@@ -335,6 +334,32 @@ def _fetch_svgs(file_key: str, ids: List[str]) -> Dict[str, str]:
     return out
 
 # ─────────────────────────────────────────────────────────
+# Text-extraktion ur IR (för täckningskrav)
+# ─────────────────────────────────────────────────────────
+
+
+def _collect_visible_texts(n: Dict[str, Any], out: List[str]) -> None:
+    if n.get("visible", True):
+        t = (((n.get("text") or {}).get("content")) or "").strip()
+        if t:
+            out.append(t)
+    for ch in n.get("children", []):
+        _collect_visible_texts(ch, out)
+
+
+def _required_texts(ir: Dict[str, Any]) -> List[str]:
+    acc: List[str] = []
+    _collect_visible_texts(ir["root"], acc)
+    # dedupe, korta rimliga etiketter
+    seen: set[str] = set()
+    out: List[str] = []
+    for s in acc:
+        if len(s) <= 80 and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+# ─────────────────────────────────────────────────────────
 # LLM-prompt
 # ─────────────────────────────────────────────────────────
 
@@ -356,6 +381,7 @@ def _build_messages(
         "components": overview,
         "placement": placement or {},
         "icon_assets": icon_assets,  # [{id,name,import_path,fs_path,w,h}]
+        "required_texts": _required_texts(ir),
         "constraints": {
             "no_inline_styles": True,
             "no_dangerous_html": True,
@@ -384,7 +410,8 @@ def _build_messages(
         "Ändra aldrig fill eller stroke i SVG:erna. Använd alltid de givna {w}×{h}. "
         "FÖRBJUDET: div-rutor som låtsas vara ikoner, inline-SVG, mask/filter, eller annan storlek än {w}×{h}. "
         "För VARJE ikon i 'icon_assets' ska du importera som '?url' och rendera med EXAKTA width={w} och height={h} attribut på <img>. "
-        "Storlekar enbart via className accepteras inte."
+        "Storlekar enbart via className accepteras inte. "
+        "VIKTIGT: 'required_texts' som skickas i användarpayloaden måste alla förekomma ordagrant i JSX-utdata. Saknas någon är svaret ogiltigt."
     )
 
     return [
@@ -651,6 +678,9 @@ def _sanitize_tailwind_conflicts(src: str) -> str:
         if re.search(r'\babsolute\b', cls):
             cls = re.sub(r'\brelative\b', '', cls)
 
+        # ta bort ogiltiga tokens som är bara '-[... ]' utan prefix
+        cls = re.sub(r'(^|\s)-\[[^\]]+\]', ' ', cls)
+
         # normalisera whitespace
         cls = re.sub(r'\s+', ' ', cls).strip()
         return f'className={q}{cls}{q}'
@@ -729,34 +759,6 @@ def _validate_and_sanitize_model_output(out: Dict[str, Any]) -> Dict[str, Any]:
     out["mount"] = mount
     return out
 
-
-def _write_assets_if_any(repo_root: Path, out: Dict[str, Any]) -> List[str]:
-    """
-    Skriv ev. assets som modellen bifogat: [{path, b64}]
-    Returnerar lista över relativa paths som skapats.
-    """
-    created: List[str] = []
-    assets = out.get("assets") or []
-    if not isinstance(assets, list):
-        return created
-
-    for a in assets:
-        try:
-            rel = str(a.get("path", "")).replace("\\", "/")
-            b64 = str(a.get("b64", ""))
-            if not rel or not b64:
-                continue
-            if rel.startswith("/") or ".." in rel:
-                raise HTTPException(400, f"Otillåten asset-sökväg: {rel}")
-            p = _safe_join(repo_root, rel)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            data = base64.b64decode(b64)
-            p.write_bytes(data)
-            created.append(rel)
-        except Exception as e:
-            raise HTTPException(500, f"Kunde inte skriva asset '{a}': {e}")
-    return created
-
 # ─────────────────────────────────────────────────────────
 # Ikon-krav: typer, filnamn och validering
 # ─────────────────────────────────────────────────────────
@@ -798,7 +800,7 @@ _NUM_IN_ATTR = re.compile(
 def _assert_icons_used(file_code: str, icon_assets: List[Dict[str, Any]]) -> None:
     """
     Säkerställ att varje exporterad ikon importeras som URL och renderas som <img>
-    med exakt angiven bredd och höjd från IR-bounds.
+    med exakt angiven bredd och höjd från IR-bounds. Exakt 1 användning per ikon.
     """
     if not icon_assets:
         return
@@ -822,11 +824,12 @@ def _assert_icons_used(file_code: str, icon_assets: List[Dict[str, Any]]) -> Non
                 h = val
         size_by_var[var] = (w, h)
 
-    used_paths = {imports[v] for v in used_vars if v in imports}
+    used_paths = [imports[v] for v in used_vars if v in imports]
 
     missing: List[str] = []
+    duplicates: List[str] = []
     size_issues: List[str] = []
-    seen_expected: set[str] = set()  # dedupe per path
+    seen_expected: set[str] = set()
 
     for ia in icon_assets:
         p = ia["import_path"]
@@ -838,6 +841,12 @@ def _assert_icons_used(file_code: str, icon_assets: List[Dict[str, Any]]) -> Non
         if not ok:
             missing.append(p)
             continue
+
+        # exakt 1 användning per ikon
+        count = sum(1 for s in used_paths if s.endswith(p) or s.endswith(p + "?url"))
+        if count != 1:
+            duplicates.append(f"{p} användningar: {count}")
+
         w_target = int(round(float(ia.get("w") or 0)))
         h_target = int(round(float(ia.get("h") or 0)))
         vars_for_path = [v for v, path in imports.items() if path.endswith(p) or path.endswith(p + "?url")]
@@ -850,16 +859,28 @@ def _assert_icons_used(file_code: str, icon_assets: List[Dict[str, Any]]) -> Non
         if not good:
             size_issues.append(f"{p} ska vara {w_target}x{h_target}px")
 
-    if missing or size_issues:
+    if missing or size_issues or duplicates:
         problems = []
         if missing:
             problems.append("saknar import+<img> för: " + ", ".join(missing))
+        if duplicates:
+            problems.append("måste användas exakt 1 gång: " + "; ".join(duplicates))
         if size_issues:
             problems.append("fel storlek: " + "; ".join(size_issues))
         msg = "Ikonvalidering: " + " | ".join(problems)
         if STRICT_ICONS:
             raise HTTPException(500, msg)
-        logger.warning(msg)  # fortsätt om icke-strikt
+        logger.warning(msg)
+
+# ─────────────────────────────────────────────────────────
+# Text-täckningsvalidering
+# ─────────────────────────────────────────────────────────
+
+def _assert_text_coverage(ir: Dict[str, Any], file_code: str) -> None:
+    exp = _required_texts(ir)
+    missing = [s for s in exp if s not in file_code]
+    if missing:
+        raise HTTPException(500, "Saknade textnoder i genererad kod: " + ", ".join(missing[:15]))
 
 # ─────────────────────────────────────────────────────────
 # Celery-task
@@ -887,22 +908,10 @@ def integrate_figma_node(
     logger.info("IR byggd.")
 
     # 1.5) Ikon-detektion + exportera identiska SVG:er som lokala assets
-    raw_icon_nodes = collect_icon_nodes(ir["root"])
-
-    # Heuristisk deduplicering för att undvika dubbletter från förälder+barn:
-    # nyckel = (rundad w, rundad h, slug)
-    dedup: Dict[Tuple[int, int, str], Dict[str, Any]] = {}
-    for ic in raw_icon_nodes:
-        b = ic.get("bounds") or {}
-        w = int(round(float(b.get("w", 0) or 0)))
-        h = int(round(float(b.get("h", 0) or 0)))
-        key = (w, h, str(ic.get("name_slug") or "icon"))
-        dedup.setdefault(key, ic)
-    icon_nodes = list(dedup.values())
-
+    icon_nodes = collect_icon_nodes(ir["root"])  # använd som-är, ingen extra dedupe
     svg_by_id = _fetch_svgs(file_key, [x["id"] for x in icon_nodes])
     icon_assets: List[Dict[str, Any]] = []
-    logger.info("Ikoner efter dedupe: %d (från %d).", len(icon_nodes), len(raw_icon_nodes))
+    logger.info("Ikoner: %d.", len(icon_nodes))
 
     # 2) Klona repo till temp
     tmp_dir, repo = clone_repo()
@@ -995,13 +1004,14 @@ def integrate_figma_node(
         target_path.parent.mkdir(parents=True, exist_ok=True)
         if not isinstance(file_code, str) or not file_code.strip():
             raise HTTPException(500, "file_code saknas för mode='file'.")
-        # Ikonvalidering innan skrivning
+        # Validera innan skrivning
         _assert_icons_used(str(file_code), icon_assets)
+        _assert_text_coverage(ir, str(file_code))
         # SANITERA och skriv
         target_path.write_text(_sanitize_tailwind_conflicts(file_code), encoding="utf-8")
         returned_primary_path = target_rel
 
-        _write_assets_if_any(tmp_root, out)
+        
 
     elif mode == "patch":
         norm = target_rel.replace("\\", "/")
@@ -1017,6 +1027,7 @@ def integrate_figma_node(
 
             if isinstance(file_code, str) and file_code.strip():
                 _assert_icons_used(str(file_code), icon_assets)
+                _assert_text_coverage(ir, str(file_code))
                 comp_abs.write_text(_sanitize_tailwind_conflicts(file_code), encoding="utf-8")
             elif not comp_abs.exists():
                 comp_abs.write_text(
@@ -1040,7 +1051,9 @@ def integrate_figma_node(
             if returned_primary_path.endswith((".tsx", ".jsx", ".js", ".ts")):
                 patched_path = _safe_join(tmp_root, returned_primary_path)
                 if patched_path.exists():
-                    _assert_icons_used(patched_path.read_text(encoding="utf-8"), icon_assets)
+                    code_now = patched_path.read_text(encoding="utf-8")
+                    _assert_icons_used(code_now, icon_assets)
+                    _assert_text_coverage(ir, code_now)
     else:
         raise HTTPException(500, f"Okänt mode: {mode}")
 
