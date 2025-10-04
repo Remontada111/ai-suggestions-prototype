@@ -11,7 +11,6 @@ Mål för 1:1-matchning:
 - Inga extra texter/ikoner/wrappers. Endast det som finns i Figma-noden.
 """
 
-import base64
 import hashlib
 import json
 import logging
@@ -113,25 +112,17 @@ def _detect_pm(workdir: Path) -> str:
         if pkg.exists():
             data = json.loads(pkg.read_text(encoding="utf-8"))
             pm_field = str(data.get("packageManager") or "").lower()
-            if pm_field.startswith("npm@"):
-                return "npm"
-            if pm_field.startswith("pnpm@"):
-                return "pnpm"
-            if pm_field.startswith("yarn@"):
-                return "yarn"
-            if pm_field.startswith("bun@"):
-                return "bun"
+            if     pm_field.startswith("npm@"):  return "npm"
+            if     pm_field.startswith("pnpm@"): return "pnpm"
+            if     pm_field.startswith("yarn@"): return "yarn"
+            if     pm_field.startswith("bun@"):  return "bun"
     except Exception:
         pass
 
-    if (workdir / "package-lock.json").exists():
-        return "npm"
-    if (workdir / "pnpm-lock.yaml").exists():
-        return "pnpm"
-    if (workdir / "yarn.lock").exists():
-        return "yarn"
-    if (workdir / "bun.lockb").exists():
-        return "bun"
+    if   (workdir / "package-lock.json").exists(): return "npm"
+    if   (workdir / "pnpm-lock.yaml").exists():    return "pnpm"
+    if   (workdir / "yarn.lock").exists():         return "yarn"
+    if   (workdir / "bun.lockb").exists():         return "bun"
     return "npm"
 
 
@@ -273,7 +264,7 @@ def _run_pm_script(base: Path, script: str, extra_args: List[str] | None = None)
     if pm == "pnpm":
         return _run(["pnpm", "-s", script, *extra_args], cwd=base)
     if pm == "yarn":
-        return _run(["yarn", script, *extra_args], cwd=base)
+        return _run(["yarn", "script", script, *extra_args], cwd=base) if os.name == "nt" else _run(["yarn", script, *extra_args], cwd=base)
     if pm == "bun":
         return _run(["bun", "run", script, *extra_args], cwd=base)
     return _run(["npm", "run", script, "--silent", "--", *extra_args], cwd=base)
@@ -331,42 +322,85 @@ def _fetch_svgs(file_key: str, ids: List[str]) -> Dict[str, str]:
 # ─────────────────────────────────────────────────────────
 
 _WS = re.compile(r"\s+")
-
 def _canon_text(s: str | None) -> str:
     if not isinstance(s, str):
         return ""
     s = s.replace("\u00A0"," ").replace("\u2007"," ").replace("\u202F"," ")
     return _WS.sub(" ", s).strip()
 
-def _collect_visible_texts(n: Dict[str, Any], out: List[str], clip: Dict[str, float] | None) -> None:
-    next_clip = clip
+# Nyckel för robust jämförelse: case-insensitive + ellipsis/nbsp-normalisering
+def _norm_key(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    s = s.replace("\u2026", "...")  # … → ...
+    s = s.replace("\u00A0"," ").replace("\u2007"," ").replace("\u202F"," ")
+    s = _WS.sub(" ", s).strip()
+    return s.casefold()
+
+# Splitta på radbrytningar och vanliga bullets
+_LINE_SPLIT = re.compile(r"(?:\r?\n|[\u2022\u00B7•]+)\s*")
+def _canon_text_lines(s: str | None) -> list[str]:
+    if not isinstance(s, str):
+        return []
+    s = s.replace("\u00A0"," ").replace("\u2007"," ").replace("\u202F"," ")
+    parts = [_WS.sub(" ", p).strip() for p in _LINE_SPLIT.split(s)]
+    return [p for p in parts if p]
+
+def _effectively_visible_ir(n: Dict[str, Any], clip: Dict[str, float] | None) -> bool:
+    if not n.get("visible", True):
+        return False
+    try:
+        if float(n.get("opacity", 1) or 1) <= 0.01:
+            return False
+    except Exception:
+        pass
+    b = n.get("bounds")
+    if clip is None or not isinstance(b, dict):
+        return True
+    return _rect_intersect(clip, b) is not None
+
+def _next_clip_ir(n: Dict[str, Any], clip: Dict[str, float] | None) -> Dict[str, float] | None:
     if n.get("clips_content"):
         b = n.get("bounds")
         if isinstance(b, dict):
-            next_clip = _rect_intersect(clip, b) if clip else b
+            return _rect_intersect(clip, b) if clip else b
+    return clip
 
-    if n.get("visible", True) and float(n.get("opacity", 1) or 1) > 0.01:
-        if n.get("type") == "TEXT":
-            b = n.get("bounds")
-            if not next_clip or _rect_intersect(next_clip, b):
-                t = _canon_text(((n.get("text") or {}).get("content")) or "")
-                if t:
-                    out.append(t)
+def _collect_visible_texts(n: Dict[str, Any], out: List[str], clip: Dict[str, float] | None) -> None:
+    if not _effectively_visible_ir(n, clip):
+        return
+    next_clip = _next_clip_ir(n, clip)
 
-    for ch in n.get("children", []):
+    if n.get("type") == "TEXT":
+        tnode = (n.get("text") or {})
+        lines = tnode.get("lines") or []
+        if lines:
+            out.extend([_canon_text(x) for x in lines if x])
+        else:
+            t = _canon_text(tnode.get("content") or "")
+            if t:
+                out.append(t)
+            else:
+                nm = _canon_text(n.get("name") or "")
+                if nm:
+                    out.append(nm)
+
+    for ch in n.get("children", []) or []:
         _collect_visible_texts(ch, out, next_clip)
 
 def _required_texts(ir: Dict[str, Any]) -> List[str]:
     acc: List[str] = []
     root = ir["root"]
-    _collect_visible_texts(root, acc, root.get("bounds"))
+    _collect_visible_texts(root, acc, None)
     seen: set[str] = set()
     out: List[str] = []
     for s in acc:
         cs = _canon_text(s)
-        if 0 < len(cs) <= 80 and cs not in seen:
-            seen.add(cs)
-            out.append(cs)
+        if 0 < len(cs) <= 80:
+            k = _norm_key(cs)
+            if k not in seen:
+                seen.add(k)
+                out.append(cs)
     return out
 
 # ─────────────────────────────────────────────────────────
@@ -413,6 +447,9 @@ def _build_messages(
         "width={w} height={h} className='inline-block align-middle'/> exakt en gång per ikon. Ändra aldrig SVG-innehåll. "
         "Teman: lägg inte till tema-switchar eller text som 'Light mode'. "
         "JSX får endast innehålla texterna i 'required_texts' ordagrant. "
+        "För TEXT-noder: om 'text.lines' finns ska varje rad renderas separat (t.ex. text + <br/> eller separata spans); "
+        "slå aldrig ihop flera rader till en enda sträng. "
+        "Rendera barn i stigande 'z' (barnens index). "
         "Skapa/uppdatera alltid en komponentfil (mode='file') i target_component_dir och montera via 'mount'; patch av main.tsx är förbjudet. "
         "Skriv aldrig ``` i något fält."
     )
@@ -656,6 +693,7 @@ def _sanitize_tailwind_conflicts(src: str) -> str:
         if re.search(r'\babsolute\b', cls):
             cls = re.sub(r'\brelative\b', '', cls)
 
+        # Rensa bort ogiltiga Tailwind-arbitrary som börjar med bindestreck
         cls = re.sub(r'(^|\s)-\[[^\]]+\]', ' ', cls)
 
         cls = re.sub(r'\s+', ' ', cls).strip()
@@ -663,22 +701,48 @@ def _sanitize_tailwind_conflicts(src: str) -> str:
 
     return _CLS_RE.sub(fix, src)
 
+# ── Textsanering: ta bort oönskade textnoder och SVG-metadata ──────────────
+
+_SVG_META = re.compile(r"<\s*(title|desc)\b[^>]*>.*?<\s*/\s*\1\s*>", re.IGNORECASE | re.DOTALL)
+_TEXT_NODE_BETWEEN = re.compile(r">\s*([^<>{}][^<>{}]*)\s*<", re.DOTALL)
+
+def _strip_svg_meta(src: str) -> str:
+    return _SVG_META.sub("", src)
+
+def _purge_unexpected_text_nodes(src: str, allowed: List[str]) -> str:
+    allowed_norm = {_norm_key(a) for a in allowed}
+    def repl(m: re.Match) -> str:
+        txt = _canon_text(m.group(1)).replace("\u2026","...")
+        return m.group(0) if _norm_key(txt) in allowed_norm else m.group(0).replace(m.group(1), "")
+    return _TEXT_NODE_BETWEEN.sub(repl, src)
+
 def _extract_jsx_text(src: str) -> List[str]:
-    texts = [ _canon_text(m.group(1)) for m in _TEXT_NODE.finditer(src) ]
-    texts = [t for t in texts if not re.fullmatch(r"[A-Za-z0-9@_./\-]+", t)]
-    return [t for t in texts if 0 < len(t) <= 80]
+    parts: List[str] = []
+    for m in _TEXT_NODE.finditer(src):
+        raw = m.group(1)
+        parts.extend(_canon_text_lines(raw))  # radvis
+    # Filtrera bort “kodlika” tokens
+    parts = [p for p in parts if not re.fullmatch(r"[A-Za-z0-9@_./\-]+", p)]
+    # Normalisera ellipsis/nbsp i själva värdet som rapporteras vidare
+    return [_canon_text(p).replace("\u2026", "...") for p in parts if 0 < len(p) <= 80]
 
 def _assert_no_extra_texts(ir: Dict[str, Any], file_code: str) -> None:
-    exp = set(_required_texts(ir))
-    found = set(_extract_jsx_text(file_code))
-    extra = [t for t in found if t not in exp]
+    exp_raw = _required_texts(ir)
+    exp = {_norm_key(t) for t in exp_raw}
+    found_raw = _extract_jsx_text(file_code)
+    found_norm = {_norm_key(t) for t in found_raw}
+    extra = [t for t in found_raw if _norm_key(t) not in exp]
+    # Tillåt tomma “Search…” placeholders att ignoreras om de inte finns i IR
+    extra = [t for t in extra if _norm_key(t) not in exp]
     if extra:
         raise HTTPException(500, "Extra texter i JSX: " + ", ".join(extra[:12]))
 
 def _assert_text_coverage(ir: Dict[str, Any], file_code: str) -> None:
-    exp = set(_required_texts(ir))
-    found = set(_extract_jsx_text(file_code))
-    missing = [t for t in exp if t not in found]
+    exp_raw = _required_texts(ir)
+    exp = {_norm_key(t) for t in exp_raw}
+    found_raw = _extract_jsx_text(file_code)
+    found = {_norm_key(t) for t in found_raw}
+    missing = [t for t in exp_raw if _norm_key(t) not in found]
     if missing:
         raise HTTPException(500, "Saknade textnoder i genererad kod: " + ", ".join(missing[:15]))
 
@@ -691,7 +755,7 @@ def _assert_dims_positions(ir: Dict[str, Any], file_code: str) -> None:
     """Kräv explicita w-/h- och left-/top- klasser där tillämpligt."""
     classes = _gather_classes(file_code)
 
-    def need(px, key): 
+    def need(px, key):
         s = _px(px)
         return f"{key}-[{s}]" if s else None
 
@@ -778,7 +842,7 @@ def _assert_typography(ir: Dict[str, Any], file_code: str) -> None:
                 if want not in classes:
                     raise HTTPException(500, f"Saknar line-height klass {want}")
             ls = st.get("letterSpacing")
-            if isinstance(ls, str) and len(ls) > 0:  # kan vara 'Npx' eller 'N%'
+            if isinstance(ls, str) and len(ls) > 0:  # 'Npx' eller 'N%'
                 want = f"tracking-[{ls}]"
                 if want not in classes:
                     raise HTTPException(500, f"Saknar letter-spacing klass {want}")
@@ -837,10 +901,8 @@ def _assert_icons_used(file_code: str, icon_assets: List[Dict[str, Any]]) -> Non
         w = h = None
         for attr, n1, n2 in _NUM_IN_ATTR.findall(tag):
             val = int(n1 or n2) if (n1 or n2) else None
-            if attr.lower() == "width":
-                w = val
-            elif attr.lower() == "height":
-                h = val
+            if   attr.lower() == "width":  w = val
+            elif attr.lower() == "height": h = val
         size_by_var[var] = (w, h)
 
     used_paths = [imports[v] for v in used_vars if v in imports]
@@ -995,7 +1057,6 @@ def integrate_figma_node(
         raise HTTPException(500, f"Modellen returnerade ogiltig JSON: {e}")
 
     # 6) Validera/normalisera modelsvaret
-    #   - förhindrar ``` i strängar
     mode = out.get("mode")
     if mode not in ("file", "patch"):
         raise HTTPException(500, f"Okänt mode: {mode}")
@@ -1068,6 +1129,10 @@ def integrate_figma_node(
         if not isinstance(file_code, str) or not file_code.strip():
             raise HTTPException(500, "file_code saknas för mode='file'.")
 
+        # Sanera före validering: ta bort <title>/<desc> och oönskad fri text
+        file_code = _strip_svg_meta(str(file_code))
+        file_code = _purge_unexpected_text_nodes(str(file_code), _required_texts(ir))
+
         # Hård validering
         _assert_icons_used(str(file_code), icon_assets)
         _assert_text_coverage(ir, str(file_code))
@@ -1099,6 +1164,9 @@ def integrate_figma_node(
             patched_path = _safe_join(tmp_root, returned_primary_path)
             if patched_path.exists():
                 code_now = patched_path.read_text(encoding="utf-8")
+                # Sanera före validering
+                code_now = _strip_svg_meta(code_now)
+                code_now = _purge_unexpected_text_nodes(code_now, _required_texts(ir))
                 _assert_icons_used(code_now, icon_assets)
                 _assert_text_coverage(ir, code_now)
                 _assert_no_extra_texts(ir, code_now)

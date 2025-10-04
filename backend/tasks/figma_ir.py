@@ -11,6 +11,7 @@ Mål: bära ALL visuell information utan approximation och ge tydliga CSS/Tailwi
 
 from typing import Any, Dict, List, Optional, Tuple, cast
 import math
+import os
 import re
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -76,12 +77,26 @@ def _canon_text(s: str | None) -> str:
     s = s.replace("\u00A0", " ").replace("\u2007", " ").replace("\u202F", " ")
     return _WS.sub(" ", s).strip()
 
+# Radsäker normalisering: splitta på \n och typiska bullet-tecken
+_LINE_SPLIT = re.compile(r"(?:\r?\n|[\u2022\u00B7•]+)\s*")
+def _canon_text_lines(s: str | None) -> List[str]:
+    if not isinstance(s, str):
+        return []
+    s = s.replace("\u00A0", " ").replace("\u2007", " ").replace("\u202F", " ")
+    parts = [_WS.sub(" ", p).strip() for p in _LINE_SPLIT.split(s)]
+    return [p for p in parts if p]
+
 # ────────────────────────────────────────────────────────────────────────────
 # Geometri, synlighet och klippning
 # ────────────────────────────────────────────────────────────────────────────
 
 def _bounds(node: Dict[str, Any]) -> Dict[str, float]:
-    bb = node.get("absoluteBoundingBox") or {}
+    # Möjlighet att använda render-bounds (inkl. skuggor) via env-flag
+    use_render = (os.getenv("FIGMA_USE_RENDER_BOUNDS", "false").lower() in ("1", "true", "yes"))
+    bb0 = node.get("absoluteBoundingBox") or {}
+    rb0 = node.get("absoluteRenderBounds") or {}
+    bb = (rb0 if use_render and rb0 else bb0) or {}
+
     fx = _to_float(_get(bb, "x", node.get("x")))
     fy = _to_float(_get(bb, "y", node.get("y")))
     fw = _to_float(_get(bb, "width",  node.get("width")))
@@ -311,7 +326,10 @@ def _is_absolute(node: Dict[str, Any]) -> bool:
 def _text_ir(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if _get(node, "type") != "TEXT":
         return None
-    content = _canon_text(_get(node, "characters", "") or "")
+    raw_chars = _get(node, "characters", "") or ""
+    content = _canon_text(raw_chars)
+    lines = _canon_text_lines(raw_chars)
+
     st = node.get("style", {}) or {}
 
     lh_px = st.get("lineHeightPx")
@@ -373,6 +391,7 @@ def _text_ir(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     return {
         "content": content,
+        "lines": lines,  # radvis representation för deterministisk textvalidering
         "style": {
             "fontFamily": st.get("fontFamily") or (st.get("fontName") or {}).get("family"),
             "fontSize": st.get("fontSize"),
@@ -645,6 +664,10 @@ def _tailwind_hints(n: Dict[str, Any]) -> Dict[str, Any]:
     # TEXT typografi
     if n.get("type") == "TEXT":
         st = (n.get("text") or {}).get("style") or {}
+        lines = (n.get("text") or {}).get("lines") or []
+        if isinstance(lines, list) and len(lines) >= 2:
+            # Hjälper modellen att bevara radbrytningar i en enda nod (utan extra wrappers)
+            tw.append("whitespace-pre-wrap")
         if st.get("textAlign"):
             tw.append({"left":"text-left","center":"text-center","right":"text-right","justify":"text-justify"}[st["textAlign"]])
         if st.get("fontSize") is not None:
@@ -802,6 +825,12 @@ def _node_to_ir(node: Dict[str, Any], *, _z: int = 0) -> Dict[str, Any]:
         "children": [],
     }
 
+    # Stabil ordning (för render-determinism): först visuellt (y,x), sedan deklarativt (_z)
+    by = int(round((ir["bounds"].get("y") or 0)))
+    bx = int(round((ir["bounds"].get("x") or 0)))
+    ir["order"] = _z
+    ir["order_key"] = [by, bx, _z]
+
     css = _css_from_node_base(ir)
     ir["css"] = css
     ir["tw"]  = _tailwind_hints(ir)
@@ -869,7 +898,7 @@ def collect_image_refs(ir_node: Dict[str, Any]) -> List[str]:
                     out.append(ref)
         for ch in n.get("children", []):
             rec(ch, next_clip)
-    rec(ir_node, ir_node.get("bounds"))
+    rec(ir_node, None)
     seen = set()
     uniq: List[str] = []
     for r in out:
@@ -918,6 +947,8 @@ def collect_icon_nodes(ir_node: Dict[str, Any]) -> List[Dict[str, Any]]:
       - Om noden är en ikon → lägg till och STOPPA rekursion under noden.
       - Om noden är GROUP/INSTANCE/COMPONENT/COMPONENT_SET och innehåller exakt EN synlig vektor-leaf
         → behandla den leafen som ikon och STOPPA rekursion (för att undvika dubbletter).
+      - NYTT: Om containern innehåller 2–4 synliga vektor-leaves och har typiska ikonmått
+        → behandla containern som EN ikon och STOPPA rekursion.
     Varje element: { id, name, name_slug, bounds:{x,y,w,h}, tintable:bool, color:str|None, alpha:float }
     """
     out: List[Dict[str, Any]] = []
@@ -947,6 +978,21 @@ def collect_icon_nodes(ir_node: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "alpha": ic.get("dominant_alpha", 1.0),
                     })
                     return  # stoppa här
+            # liten samling vektor-leaves (2–4) i ikon-typiska mått → behandla som EN ikon
+            if 1 < len(leafs) <= 4:
+                nb = (n.get("bounds") or {})
+                w = int(round(nb.get("w", 0) or 0)); h = int(round(nb.get("h", 0) or 0))
+                if 12 <= w <= 48 and 12 <= h <= 48 and (w*h) >= 4:
+                    out.append({
+                        "id": n.get("id"),
+                        "name": n.get("name"),
+                        "name_slug": _slug(n.get("name") or "icon"),
+                        "bounds": nb,
+                        "tintable": True,
+                        "color": None,
+                        "alpha": 1.0,
+                    })
+                    return  # stoppa här
 
         ic = (n.get("icon") or {})
         if ic.get("is_icon"):
@@ -967,7 +1013,8 @@ def collect_icon_nodes(ir_node: Dict[str, Any]) -> List[Dict[str, Any]]:
         for ch in n.get("children", []):
             rec(ch, next_clip)
 
-    rec(ir_node, ir_node.get("bounds"))
+    rec(ir_node, None)
+
 
     # dedupe per id
     uniq: Dict[str, Dict[str, Any]] = {}
