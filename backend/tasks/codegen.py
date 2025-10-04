@@ -1,4 +1,3 @@
-# backend/tasks/codegen.py
 from __future__ import annotations
 """
 Celery-worker: Figma-node → IR → LLM-förslag → (AST-mount + patch/file) → validering → commit → returnera ändringar
@@ -385,7 +384,6 @@ def _collect_visible_texts(n: Dict[str, Any], out: List[str], clip: Dict[str, fl
     next_clip = _next_clip_ir(n, clip)
 
     if is_text:
-        # Endast synlighets-/opacity-koll för TEXT
         if not n.get("visible", True):
             return
         try:
@@ -435,7 +433,7 @@ def _build_messages(
     icon_assets: List[Dict[str, Any]],
 ) -> list[Any]:
     try:
-        overview = {name: str(path.relative_to(Path.cwd())) for name, path in components.items()}
+        overview = {name: str(path.relative_to(Path.cwd())) for name, path in components.items() if isinstance(path, Path)}
     except Exception:
         overview = {name: str(path) for name, path in components.items()}
 
@@ -751,7 +749,6 @@ def _assert_no_extra_texts(ir: Dict[str, Any], file_code: str) -> None:
     found_raw = _extract_jsx_text(file_code)
     found_norm = {_norm_key(t) for t in found_raw}
     extra = [t for t in found_raw if _norm_key(t) not in exp]
-    # Tillåt tomma “Search…” placeholders att ignoreras om de inte finns i IR
     extra = [t for t in extra if _norm_key(t) not in exp]
     if extra:
         raise HTTPException(500, "Extra texter i JSX: " + ", ".join(extra[:12]))
@@ -771,15 +768,15 @@ def _gather_classes(file_code: str) -> str:
     return " ".join(m.group("val") for m in _CLS_RE.finditer(file_code))
 
 def _assert_dims_positions(ir: Dict[str, Any], file_code: str) -> None:
-    """Kräv explicita w-/h- och left-/top- klasser där tillämpligt."""
+    """Kräv explicita w-/h- och left-/top- klasser där tillämpligt, endast för effektivt synliga noder."""
     classes = _gather_classes(file_code)
 
     def need(px, key):
         s = _px(px)
         return f"{key}-[{s}]" if s else None
 
-    def rec(n: Dict[str,Any]):
-        if not n.get("visible", True):
+    def rec(n: Dict[str,Any], clip: Dict[str, float] | None):
+        if not _effectively_visible_ir(n, clip):
             return
         b = n.get("bounds") or {}
         if b:
@@ -790,21 +787,24 @@ def _assert_dims_positions(ir: Dict[str, Any], file_code: str) -> None:
             for tok in filter(None, [need(b.get("x"), "left"), need(b.get("y"), "top")]):
                 if tok and tok not in classes:
                     raise HTTPException(500, f"Saknar klass {tok}")
+        next_clip = _next_clip_ir(n, clip)
         for ch in n.get("children") or []:
-            rec(ch)
-    rec(ir["root"])
+            rec(ch, next_clip)
+
+    rec(ir["root"], None)
 
 def _hex_to_rgba_str(hex_col: str, a: float) -> str:
     r = int(hex_col[1:3],16); g = int(hex_col[3:5],16); b = int(hex_col[5:7],16)
     return f"rgba({r}, {g}, {b}, {a})"
 
 def _assert_colors_shadows_and_gradients(ir: Dict[str, Any], file_code: str) -> None:
-    """Kräv explicita text-/bg-färger och skuggor, samt gradientklass där gradient används."""
+    """Kräv explicita text-/bg-färger och skuggor, samt gradientklass, endast för effektivt synliga noder."""
     classes = _gather_classes(file_code)
 
-    def rec(n: Dict[str,Any]):
+    def rec(n: Dict[str,Any], clip: Dict[str, float] | None):
+        if not _effectively_visible_ir(n, clip):
+            return
         fills = n.get("fills") or []
-        # Första synliga fill
         for f in fills:
             if _bool(f.get("visible", True), True):
                 t = str(f.get("type") or "")
@@ -824,19 +824,19 @@ def _assert_colors_shadows_and_gradients(ir: Dict[str, Any], file_code: str) -> 
                     if "bg-[linear-gradient(" not in classes:
                         raise HTTPException(500, "Saknar gradientklass bg-[linear-gradient(...)]")
                     break
-        # Skugga
         css = n.get("css") or {}
         if css.get("boxShadow"):
             want = f"shadow-[{css['boxShadow']}]"
             if want not in classes:
                 raise HTTPException(500, f"Saknar skuggklass {want}")
-        # Nästa
+        next_clip = _next_clip_ir(n, clip)
         for ch in n.get("children") or []:
-            rec(ch)
-    rec(ir["root"])
+            rec(ch, next_clip)
+
+    rec(ir["root"], None)
 
 def _assert_typography(ir: Dict[str, Any], file_code: str) -> None:
-    """Kräv text-[NNpx], optional leading-[NNpx], optional tracking-[...], tolerera font-weight."""
+    """Kräv text-[NNpx], optional leading-[NNpx], optional tracking-[...], tolerera font-weight, endast för synliga TEXT."""
     classes = _gather_classes(file_code)
 
     def weight_ok(weight: int) -> List[str]:
@@ -847,7 +847,9 @@ def _assert_typography(ir: Dict[str, Any], file_code: str) -> None:
         cand = [map_std.get(weight,""), f"font-[{weight}]", f"font-{weight}"]
         return [c for c in cand if c]
 
-    def rec(n: Dict[str,Any]):
+    def rec(n: Dict[str,Any], clip: Dict[str, float] | None):
+        if not _effectively_visible_ir(n, clip):
+            return
         if n.get("type") == "TEXT":
             st = (n.get("text") or {}).get("style") or {}
             fs = st.get("fontSize")
@@ -861,7 +863,7 @@ def _assert_typography(ir: Dict[str, Any], file_code: str) -> None:
                 if want not in classes:
                     raise HTTPException(500, f"Saknar line-height klass {want}")
             ls = st.get("letterSpacing")
-            if isinstance(ls, str) and len(ls) > 0:  # 'Npx' eller 'N%'
+            if isinstance(ls, str) and len(ls) > 0:
                 want = f"tracking-[{ls}]"
                 if want not in classes:
                     raise HTTPException(500, f"Saknar letter-spacing klass {want}")
@@ -869,9 +871,11 @@ def _assert_typography(ir: Dict[str, Any], file_code: str) -> None:
             if isinstance(fw, int) and fw in range(100, 1000, 100):
                 if not any(w in classes for w in weight_ok(fw)):
                     raise HTTPException(500, f"Saknar font-weight klass för {fw}")
+        next_clip = _next_clip_ir(n, clip)
         for ch in n.get("children") or []:
-            rec(ch)
-    rec(ir["root"])
+            rec(ch, next_clip)
+
+    rec(ir["root"], None)
 
 # ─────────────────────────────────────────────────────────
 # Ikon-krav: typer, filnamn och validering
@@ -982,7 +986,7 @@ def _assert_icons_used(file_code: str, icon_assets: List[Dict[str, Any]]) -> Non
         logger.warning(msg)
 
 # ─────────────────────────────────────────────────────────
-# Små hjälpare för IR-insikter
+# Små hjälpare för IR-insikter och DEBUG
 # ─────────────────────────────────────────────────────────
 
 def _ir_stats(n: Dict[str, Any]) -> Dict[str,int]:
@@ -998,6 +1002,79 @@ def _ir_stats(n: Dict[str, Any]) -> Dict[str,int]:
 def _ir_has_text(n: Dict[str, Any]) -> bool:
     if n.get("type") == "TEXT": return True
     return any(_ir_has_text(ch) for ch in (n.get("children") or []))
+
+# --- BEGIN: DEBUG TEXT NODES -------------------------------------------------
+def _debug_text_nodes(root: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Returnerar en översikt över alla TEXT-noder: vilka som är effektivt synliga
+    och vilka som är dolda (med orsak). Använder samma clip/opacity/visible-logik
+    som i _collect_visible_texts.
+    """
+    visible: List[Dict[str, Any]] = []
+    hidden: List[Dict[str, Any]] = []
+
+    def rec(n: Dict[str, Any], clip: Dict[str, float] | None):
+        is_text = (n.get("type") == "TEXT")
+
+        raw_visible = bool(n.get("visible", True))
+        try:
+            op = float(n.get("opacity", 1) or 1)
+        except Exception:
+            op = 1.0
+        b = n.get("bounds") or {}
+        in_clip = True
+        if clip is not None and isinstance(b, dict):
+            in_clip = _rect_intersect(clip, b) is not None
+
+        effective_visible = raw_visible and (op > 0.01) and in_clip
+
+        if is_text:
+            t = (n.get("text") or {})
+            content = (t.get("content") or "")
+            lines = [x for x in (t.get("lines") or []) if x]
+            preview = (content or " / ".join(lines))[:80]
+
+            info = {
+                "id": n.get("id"),
+                "name": n.get("name"),
+                "preview": preview,
+                "raw_visible": raw_visible,
+                "opacity": op,
+                "in_clip": in_clip,
+                "effective_visible": effective_visible,
+            }
+
+            if effective_visible and (preview.strip() != ""):
+                visible.append(info)
+            else:
+                if not raw_visible:
+                    reason = "visible=false"
+                elif op <= 0.01:
+                    reason = "opacity<=0.01"
+                elif not in_clip:
+                    reason = "clipped_out"
+                elif (preview.strip() == ""):
+                    reason = "empty_text"
+                else:
+                    reason = "unknown"
+                info["reason"] = reason
+                hidden.append(info)
+
+        next_clip = _next_clip_ir(n, clip)
+        for ch in n.get("children") or []:
+            rec(ch, next_clip)
+
+    rec(root, None)
+    return {
+        "counts": {
+            "total_texts": len(visible) + len(hidden),
+            "visible": len(visible),
+            "hidden": len(hidden),
+        },
+        "visible": visible,
+        "hidden": hidden,
+    }
+# --- END: DEBUG TEXT NODES ---------------------------------------------------
 
 # ─────────────────────────────────────────────────────────
 # Celery-task
@@ -1025,11 +1102,23 @@ def integrate_figma_node(
     ir = figma_to_ir(figma_json, node_id)
     _trace("ir_built", stats=_ir_stats(ir["root"]))
 
+    # 1.1) Debug dump av TEXT-noder (synliga/dolda)
+    text_dbg = _debug_text_nodes(ir["root"])
+    _trace(
+        "text_nodes_debug",
+        counts=text_dbg["counts"],
+        sample_visible=[x["preview"] for x in text_dbg["visible"][:8]],
+        sample_hidden=[f'{x.get("reason")}:{x.get("name")}' for x in text_dbg["hidden"][:8]],
+    )
+    if text_dbg["counts"]["visible"] == 0 and _ir_has_text(ir["root"]):
+        logger.warning("Node %s har TEXT men 0 synliga. Kontrollera variant/instans/visibility/opacity/clip.", node_id)
+
     # 1.25) Förkrav: required_texts (för fail-fast och loggning)
     req_texts = _required_texts(ir)
     _trace("required_texts", count=len(req_texts), sample=req_texts[:12])
+    # Tidigare fail-fast borttagen. Fortsätt även om inga synliga texter.
     if _ir_has_text(ir["root"]) and not req_texts:
-        raise HTTPException(500, "IR innehåller TEXT-noder men required_texts blev tom – troligen clip/opacity/bounds.")
+        logger.warning("IR har TEXT men 0 synliga required_texts – fortsätter utan texter.")
 
     # 1.5) Ikon-detektion + export
     icon_nodes = collect_icon_nodes(ir["root"])
@@ -1047,7 +1136,19 @@ def integrate_figma_node(
     tmp_root = Path(tmp_dir)
     logger.info("Repo klonat till %s", tmp_root)
 
-    # 2.1) Skriv SVG-ikoner
+    # 2.1) Skriv debugfil för textnoder
+    try:
+        if DEBUG_PIPE:
+            dbg_dir = tmp_root / "ai_debug"
+            dbg_dir.mkdir(parents=True, exist_ok=True)
+            (dbg_dir / "text_nodes.json").write_text(
+                json.dumps(text_dbg, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+    except Exception as _e:
+        logger.warning("Kunde inte skriva ai_debug/text_nodes.json: %s", _e)
+
+    # 2.2) Skriv SVG-ikoner
     for ic in icon_nodes:
         nid = ic["id"]
         svg = svg_by_id.get(nid)
@@ -1077,7 +1178,7 @@ def integrate_figma_node(
     if icon_nodes and len(icon_assets) != len(icon_nodes):
         raise HTTPException(500, f"Mismatch ikon-noder vs exporterade SVG: {len(icon_nodes)} vs {len(icon_assets)}")
 
-    # 2.2) TS-typer för SVG
+    # 2.3) TS-typer för SVG
     created_svg_types_rel = _ensure_svg_types(tmp_root)
 
     # 3) Beroenden
@@ -1092,19 +1193,23 @@ def integrate_figma_node(
     client = OpenAI(api_key=OPENAI_API_KEY)
 
     messages = _build_messages(ir, components, placement, icon_assets)
-    # Dumpa LLM-request (valfritt)
+   # Dumpa LLM-request (valfritt)
     dump_dir: Path | None = None
     if DUMP_LLM:
         dump_dir = tmp_root / "ai_debug"
         dump_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            user_payload = json.loads(messages[1].content) if isinstance(messages[1].content, str) else {}
-        except Exception:
-            user_payload = {"content": str(messages[1].content)}
+    # plocka system- och user-innehåll oavsett typ
+    sys_raw = messages[0]["content"] if isinstance(messages[0], dict) else getattr(messages[0], "content", "")
+    usr_raw = messages[1]["content"] if isinstance(messages[1], dict) else getattr(messages[1], "content", "")
+    try:
+        user_payload = json.loads(usr_raw) if isinstance(usr_raw, str) else usr_raw
+    except Exception:
+        user_payload = {"content": str(usr_raw)}
         (dump_dir / "llm_request.json").write_text(
-            json.dumps({"system": messages[0].content, "user": user_payload}, ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
+    json.dumps({"system": sys_raw, "user": user_payload}, ensure_ascii=False, indent=2),
+             encoding="utf-8"
+    )
+
 
     logger.info("Skickar prompt till OpenAI (%s) …", OPENAI_MODEL)
     resp = client.chat.completions.create(
