@@ -68,6 +68,10 @@ ENABLE_VISUAL_VALIDATE = (
     os.getenv("ENABLE_VISUAL_VALIDATE", "false").lower() in ("1", "true", "yes")
 )
 
+# Debugging/Tracing-flaggor
+DEBUG_PIPE = os.getenv("CODEGEN_TRACE", "0").lower() in ("1", "true", "yes")
+DUMP_LLM = os.getenv("CODEGEN_DUMP_LLM", "0").lower() in ("1", "true", "yes")
+
 # ─────────────────────────────────────────────────────────
 # Celery-app
 # ─────────────────────────────────────────────────────────
@@ -86,6 +90,13 @@ logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 logger.setLevel(logging.INFO)
+
+def _trace(evt: str, **kv):
+    if DEBUG_PIPE:
+        try:
+            logger.info("[codegen] %s %s", evt, json.dumps(kv, ensure_ascii=False, default=str))
+        except Exception:
+            logger.info("[codegen] %s %r", evt, kv)
 
 # ─────────────────────────────────────────────────────────
 # Hjälpfunktioner (shell, PM, git, IO)
@@ -367,11 +378,21 @@ def _next_clip_ir(n: Dict[str, Any], clip: Dict[str, float] | None) -> Dict[str,
     return clip
 
 def _collect_visible_texts(n: Dict[str, Any], out: List[str], clip: Dict[str, float] | None) -> None:
-    if not _effectively_visible_ir(n, clip):
+    # För TEXT tillåter vi insamling även om clipping råkar vara för strikt
+    is_text = (n.get("type") == "TEXT")
+    if not is_text and not _effectively_visible_ir(n, clip):
         return
     next_clip = _next_clip_ir(n, clip)
 
-    if n.get("type") == "TEXT":
+    if is_text:
+        # Endast synlighets-/opacity-koll för TEXT
+        if not n.get("visible", True):
+            return
+        try:
+            if float(n.get("opacity", 1) or 1) <= 0.01:
+                return
+        except Exception:
+            pass
         tnode = (n.get("text") or {})
         lines = tnode.get("lines") or []
         if lines:
@@ -721,9 +742,7 @@ def _extract_jsx_text(src: str) -> List[str]:
     for m in _TEXT_NODE.finditer(src):
         raw = m.group(1)
         parts.extend(_canon_text_lines(raw))  # radvis
-    # Filtrera bort “kodlika” tokens
-    parts = [p for p in parts if not re.fullmatch(r"[A-Za-z0-9@_./\-]+", p)]
-    # Normalisera ellipsis/nbsp i själva värdet som rapporteras vidare
+    # Viktigt: ta INTE bort “kodlika” tokens – de kan vara legitima texter som "Home"
     return [_canon_text(p).replace("\u2026", "...") for p in parts if 0 < len(p) <= 80]
 
 def _assert_no_extra_texts(ir: Dict[str, Any], file_code: str) -> None:
@@ -963,6 +982,24 @@ def _assert_icons_used(file_code: str, icon_assets: List[Dict[str, Any]]) -> Non
         logger.warning(msg)
 
 # ─────────────────────────────────────────────────────────
+# Små hjälpare för IR-insikter
+# ─────────────────────────────────────────────────────────
+
+def _ir_stats(n: Dict[str, Any]) -> Dict[str,int]:
+    c = {"nodes":0,"texts":0,"icons":0}
+    def rec(x):
+        c["nodes"] += 1
+        if x.get("type")=="TEXT": c["texts"] += 1
+        if (x.get("icon") or {}).get("is_icon"): c["icons"] += 1
+        for ch in x.get("children") or []: rec(ch)
+    rec(n)
+    return c
+
+def _ir_has_text(n: Dict[str, Any]) -> bool:
+    if n.get("type") == "TEXT": return True
+    return any(_ir_has_text(ch) for ch in (n.get("children") or []))
+
+# ─────────────────────────────────────────────────────────
 # Celery-task
 # ─────────────────────────────────────────────────────────
 
@@ -976,21 +1013,34 @@ def integrate_figma_node(
       "changes": [{"path": "<rel>", "content": "<utf8>"} , ...],
       "path": "<primär-fil>",
       "content": "<innehåll>",
-      "diff_summary": {...}  # valfri
+      "diff_summary": {...},          # valfri
+      "debug_report": "ai_debug/report.json"   # valfri
     }
     """
     logger.info("Integrationsstart: file_key=%s node_id=%s", file_key, node_id)
 
     # 1) Figma → IR
     figma_json = _fetch_figma_node(file_key, node_id)
+    _trace("figma_nodes_fetch_ok", file_key=file_key, node_id=node_id)
     ir = figma_to_ir(figma_json, node_id)
-    logger.info("IR byggd.")
+    _trace("ir_built", stats=_ir_stats(ir["root"]))
+
+    # 1.25) Förkrav: required_texts (för fail-fast och loggning)
+    req_texts = _required_texts(ir)
+    _trace("required_texts", count=len(req_texts), sample=req_texts[:12])
+    if _ir_has_text(ir["root"]) and not req_texts:
+        raise HTTPException(500, "IR innehåller TEXT-noder men required_texts blev tom – troligen clip/opacity/bounds.")
 
     # 1.5) Ikon-detektion + export
     icon_nodes = collect_icon_nodes(ir["root"])
+    _trace("icon_nodes_found", count=len(icon_nodes), ids=[x["id"] for x in icon_nodes])
     svg_by_id = _fetch_svgs(file_key, [x["id"] for x in icon_nodes])
+    missing_svgs = [x["id"] for x in icon_nodes if x["id"] not in svg_by_id]
+    _trace("svg_fetch_done", fetched=len(svg_by_id), missing=missing_svgs)
+    if icon_nodes and not svg_by_id:
+        raise HTTPException(500, "Ikon-noder hittades men inga SVG kunde hämtas via Figma Images API.")
+
     icon_assets: List[Dict[str, Any]] = []
-    logger.info("Ikoner: %d.", len(icon_nodes))
 
     # 2) Klona repo
     tmp_dir, repo = clone_repo()
@@ -1022,6 +1072,10 @@ def integrate_figma_node(
             "w": ic["bounds"]["w"],
             "h": ic["bounds"]["h"],
         })
+    _trace("icon_assets_built", count=len(icon_assets),
+           assets=[{"id":ia["id"],"path":ia["import_path"],"w":ia["w"],"h":ia["h"]} for ia in icon_assets])
+    if icon_nodes and len(icon_assets) != len(icon_nodes):
+        raise HTTPException(500, f"Mismatch ikon-noder vs exporterade SVG: {len(icon_nodes)} vs {len(icon_assets)}")
 
     # 2.2) TS-typer för SVG
     created_svg_types_rel = _ensure_svg_types(tmp_root)
@@ -1038,6 +1092,20 @@ def integrate_figma_node(
     client = OpenAI(api_key=OPENAI_API_KEY)
 
     messages = _build_messages(ir, components, placement, icon_assets)
+    # Dumpa LLM-request (valfritt)
+    dump_dir: Path | None = None
+    if DUMP_LLM:
+        dump_dir = tmp_root / "ai_debug"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            user_payload = json.loads(messages[1].content) if isinstance(messages[1].content, str) else {}
+        except Exception:
+            user_payload = {"content": str(messages[1].content)}
+        (dump_dir / "llm_request.json").write_text(
+            json.dumps({"system": messages[0].content, "user": user_payload}, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+
     logger.info("Skickar prompt till OpenAI (%s) …", OPENAI_MODEL)
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
@@ -1051,6 +1119,10 @@ def integrate_figma_node(
     )
 
     raw = resp.choices[0].message.content or "{}"
+    if DUMP_LLM and dump_dir is not None:
+        (dump_dir / "llm_response.json").write_text(raw, encoding="utf-8")
+    _trace("llm_done", bytes=len(raw))
+
     try:
         out = json.loads(raw)
     except Exception as e:
@@ -1133,13 +1205,17 @@ def integrate_figma_node(
         file_code = _strip_svg_meta(str(file_code))
         file_code = _purge_unexpected_text_nodes(str(file_code), _required_texts(ir))
 
-        # Hård validering
-        _assert_icons_used(str(file_code), icon_assets)
-        _assert_text_coverage(ir, str(file_code))
-        _assert_no_extra_texts(ir, str(file_code))
-        _assert_dims_positions(ir, str(file_code))
-        _assert_colors_shadows_and_gradients(ir, str(file_code))
-        _assert_typography(ir, str(file_code))
+        # Logga vad vi faktiskt extraherar som text
+        found_txt = _extract_jsx_text(str(file_code))
+        _trace("jsx_text_extracted", count=len(found_txt), sample=found_txt[:20])
+
+        # Hård validering (med tydliga steg i logg)
+        _trace("validate_start", step="icons_used"); _assert_icons_used(str(file_code), icon_assets)
+        _trace("validate_start", step="text_coverage"); _assert_text_coverage(ir, str(file_code))
+        _trace("validate_start", step="no_extra_texts"); _assert_no_extra_texts(ir, str(file_code))
+        _trace("validate_start", step="dims_positions"); _assert_dims_positions(ir, str(file_code))
+        _trace("validate_start", step="colors_shadows_gradients"); _assert_colors_shadows_and_gradients(ir, str(file_code))
+        _trace("validate_start", step="typography"); _assert_typography(ir, str(file_code))
 
         # Skriv
         target_path.write_text(_sanitize_tailwind_conflicts(file_code), encoding="utf-8")
@@ -1167,12 +1243,16 @@ def integrate_figma_node(
                 # Sanera före validering
                 code_now = _strip_svg_meta(code_now)
                 code_now = _purge_unexpected_text_nodes(code_now, _required_texts(ir))
-                _assert_icons_used(code_now, icon_assets)
-                _assert_text_coverage(ir, code_now)
-                _assert_no_extra_texts(ir, code_now)
-                _assert_dims_positions(ir, code_now)
-                _assert_colors_shadows_and_gradients(ir, code_now)
-                _assert_typography(ir, code_now)
+                # Logga textuttag
+                found_txt = _extract_jsx_text(str(code_now))
+                _trace("jsx_text_extracted", count=len(found_txt), sample=found_txt[:20])
+                # Validering
+                _trace("validate_start", step="icons_used"); _assert_icons_used(code_now, icon_assets)
+                _trace("validate_start", step="text_coverage"); _assert_text_coverage(ir, code_now)
+                _trace("validate_start", step="no_extra_texts"); _assert_no_extra_texts(ir, code_now)
+                _trace("validate_start", step="dims_positions"); _assert_dims_positions(ir, code_now)
+                _trace("validate_start", step="colors_shadows_gradients"); _assert_colors_shadows_and_gradients(ir, code_now)
+                _trace("validate_start", step="typography"); _assert_typography(ir, code_now)
     else:
         raise HTTPException(500, f"Okänt mode: {mode}")
 
@@ -1281,6 +1361,24 @@ def integrate_figma_node(
 
     primary = next((c for c in final_changes if c["path"] == returned_primary_path), final_changes[0])
 
+    # 14) Debug-rapport på disk
+    debug_report_rel: str | None = None
+    try:
+        dump_dir2 = tmp_root / "ai_debug"
+        dump_dir2.mkdir(parents=True, exist_ok=True)
+        report = {
+            "node_id": node_id,
+            "required_texts": req_texts,
+            "icon_nodes": icon_nodes,
+            "icon_assets": icon_assets,
+            "returned_primary_path": returned_primary_path,
+            "mount": mount,
+        }
+        (dump_dir2 / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        debug_report_rel = str((dump_dir2 / "report.json").relative_to(tmp_root))
+    except Exception as e:
+        logger.warning("Kunde inte skriva debug-rapport: %s", e)
+
     logger.info("Returning %d change(s): %s", len(final_changes), [c["path"] for c in final_changes])
     result: Dict[str, Any] = {
         "status": "SUCCESS",
@@ -1290,6 +1388,8 @@ def integrate_figma_node(
     }
     if diff_summary:
         result["diff_summary"] = diff_summary
+    if debug_report_rel:
+        result["debug_report"] = debug_report_rel
     return result
 
 

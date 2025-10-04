@@ -13,6 +13,27 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 import math
 import os
 import re
+import json
+import logging
+
+# ────────────────────────────────────────────────────────────────────────────
+# Loggning / spårning och miljöflaggor
+# ────────────────────────────────────────────────────────────────────────────
+
+logger = logging.getLogger(__name__)
+LOG_IR_TRACE = os.getenv("FIGMA_IR_TRACE", "0").lower() in ("1", "true", "yes")
+FIGMA_COLOR_GAMMA_FIX = os.getenv("FIGMA_COLOR_GAMMA_FIX", "0").lower() in ("1", "true", "yes")
+
+# Konfigurerbar ikon-storlek (default 12..48, men kan höjas t.ex. till 56)
+ICON_MIN = int(os.getenv("ICON_MIN", "12"))
+ICON_MAX = int(os.getenv("ICON_MAX", "48"))
+
+def _trace(evt: str, **kv):
+    if LOG_IR_TRACE:
+        try:
+            logger.info("[figma_ir] %s %s", evt, json.dumps(kv, ensure_ascii=False, default=str))
+        except Exception:
+            logger.info("[figma_ir] %s %r", evt, kv)
 
 # ────────────────────────────────────────────────────────────────────────────
 # Allmänna hjälpare
@@ -154,13 +175,20 @@ def _clamp01(x: float) -> float:
 def _srgb_to_255(c01: float) -> int:
     return int(round(_clamp01(c01) * 255))
 
+def _linear_to_srgb(c: float) -> float:
+    return (1.055 * (c ** (1/2.4)) - 0.055) if c > 0.0031308 else (12.92 * c)
+
 def _rgba_hex(c: Optional[Dict[str, Any]]) -> Tuple[str, float]:
     c = c or {}
-    r = _srgb_to_255(_to_float(_get(c, "r", 0.0)) or 0.0)
-    g = _srgb_to_255(_to_float(_get(c, "g", 0.0)) or 0.0)
-    b = _srgb_to_255(_to_float(_get(c, "b", 0.0)) or 0.0)
+    r01 = _to_float(_get(c, "r", 0.0)) or 0.0
+    g01 = _to_float(_get(c, "g", 0.0)) or 0.0
+    b01 = _to_float(_get(c, "b", 0.0)) or 0.0
+    if FIGMA_COLOR_GAMMA_FIX:
+        r01, g01, b01 = _linear_to_srgb(r01), _linear_to_srgb(g01), _linear_to_srgb(b01)
+    r = _srgb_to_255(r01); g = _srgb_to_255(g01); b = _srgb_to_255(b01)
     a = _to_float(_get(c, "a", 1.0)) or 1.0
     hex_ = "#{:02x}{:02x}{:02x}".format(r, g, b)
+    _trace("rgba_hex", hex=hex_, a=a, src=c, gamma_fix=FIGMA_COLOR_GAMMA_FIX)
     return hex_, _round(a, 4) or 1.0
 
 def _paint_to_fill(paint: Dict[str, Any]) -> Dict[str, Any]:
@@ -388,6 +416,12 @@ def _text_ir(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     r = int(hex_[1:3], 16); g = int(hex_[3:5], 16); b = int(hex_[5:7], 16)
                     color_val = f"rgba({r}, {g}, {b}, {a})"
                 break
+
+    _trace("text_ir", content=content, lines=lines, style={
+        "fontFamily": st.get("fontFamily") or (st.get("fontName") or {}).get("family"),
+        "fontSize": st.get("fontSize"), "fontWeight": weight,
+        "lineHeight": line_height, "letterSpacing": ls, "color": color_val
+    })
 
     return {
         "content": content,
@@ -755,7 +789,7 @@ def _icon_hint(node: Dict[str, Any]) -> Dict[str, Any]:
     w, h = b["w"] or 0.0, b["h"] or 0.0
 
     type_ok = t in _ICON_TYPES
-    size_typical = 12 <= int(round(w)) <= 48 and 12 <= int(round(h)) <= 48
+    size_typical = ICON_MIN <= int(round(w)) <= ICON_MAX and ICON_MIN <= int(round(h)) <= ICON_MAX
     name_ok = _is_iconish_name(name)
     child_ok = not has_children
 
@@ -769,6 +803,11 @@ def _icon_hint(node: Dict[str, Any]) -> Dict[str, Any]:
             hex_col, alpha = _rgba_hex(cast(Optional[Dict[str, Any]], (s0.get("color") or {})))
 
     tintable = is_icon and bool(hex_col)
+
+    _trace("icon_hint", name=name, type=t, w=w, h=h,
+           type_ok=type_ok, size_typical=size_typical, name_ok=name_ok,
+           child_ok=child_ok, is_icon=is_icon, tintable=tintable, hex=hex_col, alpha=alpha)
+
     return {
         "is_icon": is_icon,
         "name": name,
@@ -879,6 +918,7 @@ def figma_to_ir(figma_json: Dict[str, Any], node_id: str, *, viewport: Tuple[int
         "schemaVersion": 3,
         "producedBy": "figma_ir.py"
     }
+    _trace("figma_to_ir_done", node_id=node_id, viewport=meta["viewport"])
     return {"meta": meta, "root": root_ir}
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -947,7 +987,7 @@ def collect_icon_nodes(ir_node: Dict[str, Any]) -> List[Dict[str, Any]]:
       - Om noden är en ikon → lägg till och STOPPA rekursion under noden.
       - Om noden är GROUP/INSTANCE/COMPONENT/COMPONENT_SET och innehåller exakt EN synlig vektor-leaf
         → behandla den leafen som ikon och STOPPA rekursion (för att undvika dubbletter).
-      - NYTT: Om containern innehåller 2–4 synliga vektor-leaves och har typiska ikonmått
+      - Om containern innehåller 2–4 synliga vektor-leaves och har typiska ikonmått (ICON_MIN..ICON_MAX)
         → behandla containern som EN ikon och STOPPA rekursion.
     Varje element: { id, name, name_slug, bounds:{x,y,w,h}, tintable:bool, color:str|None, alpha:float }
     """
@@ -977,12 +1017,14 @@ def collect_icon_nodes(ir_node: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "color": ic.get("dominant_color"),
                         "alpha": ic.get("dominant_alpha", 1.0),
                     })
+                    _trace("icon_from_single_leaf", container=t, name=n.get("name"),
+                           leaf_id=ch.get("id"), w=b.get("w"), h=b.get("h"))
                     return  # stoppa här
             # liten samling vektor-leaves (2–4) i ikon-typiska mått → behandla som EN ikon
             if 1 < len(leafs) <= 4:
                 nb = (n.get("bounds") or {})
                 w = int(round(nb.get("w", 0) or 0)); h = int(round(nb.get("h", 0) or 0))
-                if 12 <= w <= 48 and 12 <= h <= 48 and (w*h) >= 4:
+                if ICON_MIN <= w <= ICON_MAX and ICON_MIN <= h <= ICON_MAX and (w*h) >= 4:
                     out.append({
                         "id": n.get("id"),
                         "name": n.get("name"),
@@ -992,12 +1034,14 @@ def collect_icon_nodes(ir_node: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "color": None,
                         "alpha": 1.0,
                     })
+                    _trace("icon_from_compound_leafs", container=t, name=n.get("name"),
+                           leaf_count=len(leafs), w=w, h=h, ICON_MIN=ICON_MIN, ICON_MAX=ICON_MAX)
                     return  # stoppa här
 
         ic = (n.get("icon") or {})
         if ic.get("is_icon"):
-            if next_clip is None or _rect_intersect(ic.get("bounds") or n.get("bounds"), next_clip):
-                b = ic.get("bounds") or n.get("bounds")
+            b = ic.get("bounds") or n.get("bounds")
+            if next_clip is None or _rect_intersect(b, next_clip):
                 if isinstance(b, dict) and (b.get("w",0)*b.get("h",0)) >= 4:
                     out.append({
                         "id": n.get("id"),
@@ -1008,13 +1052,14 @@ def collect_icon_nodes(ir_node: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "color": ic.get("dominant_color"),
                         "alpha": ic.get("dominant_alpha", 1.0),
                     })
+                    _trace("icon_from_node", id=n.get("id"), name=n.get("name"),
+                           w=(b or {}).get("w"), h=(b or {}).get("h"))
             return  # stoppa rekursion under ikon
 
         for ch in n.get("children", []):
             rec(ch, next_clip)
 
     rec(ir_node, None)
-
 
     # dedupe per id
     uniq: Dict[str, Dict[str, Any]] = {}
@@ -1028,15 +1073,15 @@ def collect_icon_nodes(ir_node: Dict[str, Any]) -> List[Dict[str, Any]]:
 # ────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":  # pragma: no cover
-    import json, sys
+    import json as _json, sys
     if len(sys.argv) < 3:
         print("Använd: python -m backend.tasks.figma_ir <nodes.json> <node_id>")
         sys.exit(1)
     with open(sys.argv[1], "r", encoding="utf-8") as f:
-        payload = json.load(f)
+        payload = _json.load(f)
     nid = sys.argv[2]
     ir = figma_to_ir(payload, nid)
-    print(json.dumps(ir, ensure_ascii=False, indent=2))
+    print(_json.dumps(ir, ensure_ascii=False, indent=2))
 
 __all__ = [
     "figma_to_ir",
