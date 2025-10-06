@@ -1,12 +1,23 @@
 # backend/tasks/figma_ir.py
 from __future__ import annotations
 """
-Figma → IR (Intermediate Representation) för deterministisk, synlighets-korrekt kodgenerering.
+Figma → IR (Intermediate Representation) med synlighets-flagg och pruning så att
+endast effektivt synliga noder (inkl. texter och ikoner) går vidare till codegen.
 
-Mål: bära ALL visuell information utan approximation och ge tydliga CSS/Tailwind-hints.
-- Synlighet: tar hänsyn till node.visible, opacity och uppifrån klippning.
-- Ikoner: endast rena vektorer i rimliga ikonmått eller namn; undvik dubletter.
-- Text/färg/layout/effekter/rotation/z-index bevaras. Tailwind-hints genereras med godtyckliga värden.
+Fokus:
+- Markera varje node med 'visible_effective' (visible, opacity, clip).
+- filter_visible_ir() tar bort dolda noder men behåller containers som har synliga barn.
+- Text-IR bevarar content + lines och färg/typografi.
+- Ikon-detektion robust för både leaf och små containers, och använder synlighet.
+
+Audit:
+  - FIGMA_IR_AUDIT=1 (default 1) för JSONL via FIGMA_IR_LOG_FILE
+Trace:
+  - FIGMA_IR_TRACE=1 för detaljerade loggar
+Färg:
+  - FIGMA_COLOR_GAMMA_FIX=1 för konvertering linear→sRGB vid hex/rgba
+Ikonstorlek:
+  - ICON_MIN (default 12), ICON_MAX (default 256)
 """
 
 from typing import Any, Dict, List, Optional, Tuple, cast
@@ -15,18 +26,36 @@ import os
 import re
 import json
 import logging
+from copy import deepcopy
+from datetime import datetime
 
 # ────────────────────────────────────────────────────────────────────────────
 # Loggning / spårning och miljöflaggor
 # ────────────────────────────────────────────────────────────────────────────
 
 logger = logging.getLogger(__name__)
+audit_logger = logging.getLogger("figma_ir.audit")
+
 LOG_IR_TRACE = os.getenv("FIGMA_IR_TRACE", "0").lower() in ("1", "true", "yes")
+AUDIT_ENABLED = os.getenv("FIGMA_IR_AUDIT", "1").lower() in ("1", "true", "yes")
 FIGMA_COLOR_GAMMA_FIX = os.getenv("FIGMA_COLOR_GAMMA_FIX", "0").lower() in ("1", "true", "yes")
 
-# Konfigurerbar ikon-storlek (default 12..48, men kan höjas t.ex. till 56)
 ICON_MIN = int(os.getenv("ICON_MIN", "12"))
-ICON_MAX = int(os.getenv("ICON_MAX", "48"))
+ICON_MAX = int(os.getenv("ICON_MAX", "256"))
+
+_LOG_FILE = os.getenv("FIGMA_IR_LOG_FILE")
+if _LOG_FILE:
+    try:
+        os.makedirs(os.path.dirname(_LOG_FILE) or ".", exist_ok=True)
+    except Exception:
+        pass
+    if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == os.path.abspath(_LOG_FILE)
+               for h in audit_logger.handlers):
+        fh = logging.FileHandler(_LOG_FILE, encoding="utf-8")
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(logging.Formatter("%(message)s"))
+        audit_logger.addHandler(fh)
+        audit_logger.setLevel(logging.INFO)
 
 def _trace(evt: str, **kv):
     if LOG_IR_TRACE:
@@ -34,6 +63,30 @@ def _trace(evt: str, **kv):
             logger.info("[figma_ir] %s %s", evt, json.dumps(kv, ensure_ascii=False, default=str))
         except Exception:
             logger.info("[figma_ir] %s %r", evt, kv)
+
+def _audit(evt: str, node: Optional[Dict[str, Any]] = None, **kv):
+    if not AUDIT_ENABLED:
+        return
+    payload: Dict[str, Any] = {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "event": evt,
+    }
+    if node:
+        b = node.get("bounds") or {}
+        payload["node"] = {
+            "id": node.get("id"),
+            "name": node.get("name"),
+            "type": node.get("type"),
+            "visible": node.get("visible"),
+            "opacity": node.get("opacity"),
+            "bounds": {"x": b.get("x"), "y": b.get("y"), "w": b.get("w"), "h": b.get("h")},
+            "visible_effective": node.get("visible_effective"),
+        }
+    payload.update(kv)
+    try:
+        audit_logger.info(json.dumps(payload, ensure_ascii=False, default=str))
+    except Exception:
+        logger.info("[figma_ir.audit] %s %r", evt, kv)
 
 # ────────────────────────────────────────────────────────────────────────────
 # Allmänna hjälpare
@@ -94,11 +147,9 @@ _WS = re.compile(r"\s+")
 def _canon_text(s: str | None) -> str:
     if not isinstance(s, str):
         return ""
-    # normalisera whitespace och NBSP-varianter
     s = s.replace("\u00A0", " ").replace("\u2007", " ").replace("\u202F", " ")
     return _WS.sub(" ", s).strip()
 
-# Radsäker normalisering: splitta på \n och typiska bullet-tecken
 _LINE_SPLIT = re.compile(r"(?:\r?\n|[\u2022\u00B7•]+)\s*")
 def _canon_text_lines(s: str | None) -> List[str]:
     if not isinstance(s, str):
@@ -112,26 +163,19 @@ def _canon_text_lines(s: str | None) -> List[str]:
 # ────────────────────────────────────────────────────────────────────────────
 
 def _bounds(node: Dict[str, Any]) -> Dict[str, float]:
-    # Möjlighet att använda render-bounds (inkl. skuggor) via env-flag
     use_render = (os.getenv("FIGMA_USE_RENDER_BOUNDS", "false").lower() in ("1", "true", "yes"))
     bb0 = node.get("absoluteBoundingBox") or {}
     rb0 = node.get("absoluteRenderBounds") or {}
     bb = (rb0 if use_render and rb0 else bb0) or {}
 
-    fx = _to_float(_get(bb, "x", node.get("x")))
-    fy = _to_float(_get(bb, "y", node.get("y")))
-    fw = _to_float(_get(bb, "width",  node.get("width")))
-    fh = _to_float(_get(bb, "height", node.get("height")))
+    fx = _to_float(_get(bb, "x", node.get("x"))); fy = _to_float(_get(bb, "y", node.get("y")))
+    fw = _to_float(_get(bb, "width",  node.get("width"))); fh = _to_float(_get(bb, "height", node.get("height")))
     x = fx if fx is not None else 0.0
     y = fy if fy is not None else 0.0
     w = fw if fw is not None else 0.0
     h = fh if fh is not None else 0.0
-    return {
-        "x": cast(float, _round(x, 3)),
-        "y": cast(float, _round(y, 3)),
-        "w": cast(float, _round(w, 3)),
-        "h": cast(float, _round(h, 3)),
-    }
+    return {"x": cast(float, _round(x, 3)), "y": cast(float, _round(y, 3)),
+            "w": cast(float, _round(w, 3)), "h": cast(float, _round(h, 3))}
 
 def _rect_intersect(a: Optional[Dict[str, float]],
                     b: Optional[Dict[str, float]]) -> Optional[Dict[str, float]]:
@@ -141,12 +185,8 @@ def _rect_intersect(a: Optional[Dict[str, float]],
     x2 = min(a["x"] + a["w"], b["x"] + b["w"]); y2 = min(a["y"] + a["h"], b["y"] + b["h"])
     if x2 <= x1 or y2 <= y1:
         return None
-    return {
-        "x": _round(x1, 3) or 0.0,
-        "y": _round(y1, 3) or 0.0,
-        "w": _round(x2 - x1, 3) or 0.0,
-        "h": _round(y2 - y1, 3) or 0.0,
-    }
+    return {"x": _round(x1, 3) or 0.0, "y": _round(y1, 3) or 0.0,
+            "w": _round(x2 - x1, 3) or 0.0, "h": _round(y2 - y1, 3) or 0.0}
 
 def _effectively_visible(n: Dict[str, Any],
                          inherited_clip: Optional[Dict[str, float]]) -> bool:
@@ -160,21 +200,21 @@ def _effectively_visible(n: Dict[str, Any],
         return True
     return _rect_intersect(b, inherited_clip) is not None
 
+def _clips_content(n: Dict[str, Any]) -> bool:
+    return _bool(n.get("clipsContent"), False) or _bool(n.get("clips_content"), False)
+
 def _next_clip(n: Dict[str, Any], parent_clip: Optional[Dict[str, float]]) -> Optional[Dict[str, float]]:
-    if _bool(n.get("clipsContent") or n.get("clips_content"), False):
-        return _rect_intersect(parent_clip, n.get("bounds"))
+    if _clips_content(n):
+        new_clip = _rect_intersect(parent_clip, n.get("bounds"))
+        return new_clip
     return parent_clip
 
 # ────────────────────────────────────────────────────────────────────────────
 # Färg och paints
 # ────────────────────────────────────────────────────────────────────────────
 
-def _clamp01(x: float) -> float:
-    return 0.0 if x < 0 else 1.0 if x > 1 else x
-
-def _srgb_to_255(c01: float) -> int:
-    return int(round(_clamp01(c01) * 255))
-
+def _clamp01(x: float) -> float: return 0.0 if x < 0 else 1.0 if x > 1 else x
+def _srgb_to_255(c01: float) -> int: return int(round(_clamp01(c01) * 255))
 def _linear_to_srgb(c: float) -> float:
     return (1.055 * (c ** (1/2.4)) - 0.055) if c > 0.0031308 else (12.92 * c)
 
@@ -195,13 +235,11 @@ def _paint_to_fill(paint: Dict[str, Any]) -> Dict[str, Any]:
     t = str(_get(paint, "type", "SOLID") or "SOLID")
     visible = _bool(_get(paint, "visible", True), True)
     o = _to_float(_get(paint, "opacity", 1.0)) or 1.0
-    out: Dict[str, Any] = {"type": t, "visible": visible, "opacity": _round(o, 4)}
-
+    out: Dict[str, Any] = {"type": t, "visible": visible, "alpha": _round(o, 4)}
     if t == "SOLID":
         color = cast(Optional[Dict[str, Any]], _get(paint, "color", {}))
         hex_, a = _rgba_hex(color)
         out.update({"color": hex_, "alpha": a})
-
     elif t.startswith("GRADIENT_"):
         stops: List[Dict[str, Any]] = []
         for st in cast(List[Dict[str, Any]], _get(paint, "gradientStops", []) or []):
@@ -219,16 +257,13 @@ def _paint_to_fill(paint: Dict[str, Any]) -> Dict[str, Any]:
             out["angle_deg"] = _round(ang, 2)
         else:
             out["angle_deg"] = 0.0
-
     elif t == "IMAGE":
         out["scaleMode"] = _get(paint, "scaleMode", "FILL")
         out["imageRef"]   = _get(paint, "imageRef") or _get(paint, "imageHash")
         out["filters"]    = _get(paint, "filters")
         out["transform"]  = _get(paint, "imageTransform")
-
     else:
         out["raw"] = paint
-
     return out
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -258,10 +293,8 @@ def _radius_to_ir(node: Dict[str, Any]) -> Dict[str, float]:
     rcr = _get(node, "rectangleCornerRadii")
     if isinstance(rcr, list) and len(rcr) >= 4:
         return {
-            "tl": _to_float(rcr[0]) or 0.0,
-            "tr": _to_float(rcr[1]) or 0.0,
-            "br": _to_float(rcr[2]) or 0.0,
-            "bl": _to_float(rcr[3]) or 0.0,
+            "tl": _to_float(rcr[0]) or 0.0, "tr": _to_float(rcr[1]) or 0.0,
+            "br": _to_float(rcr[2]) or 0.0, "bl": _to_float(rcr[3]) or 0.0,
         }
     return {
         "tl": _to_float(_get(node, "topLeftRadius", 0)) or 0.0,
@@ -286,8 +319,7 @@ def _effects_to_ir(node: Dict[str, Any]) -> List[Dict[str, Any]]:
                            "y": _round(_get(off, "y", 0.0), 3)},
                 "radius": _round(_get(ef, "radius", 0.0), 3),
                 "spread": _round(_get(ef, "spread", 0.0), 3),
-                "color": hex_,
-                "alpha": a,
+                "color": hex_, "alpha": a,
                 "blendMode": _get(ef, "blendMode")
             })
         elif t in ("LAYER_BLUR", "BACKGROUND_BLUR"):
@@ -301,19 +333,13 @@ def _effects_to_ir(node: Dict[str, Any]) -> List[Dict[str, Any]]:
 # ────────────────────────────────────────────────────────────────────────────
 
 def _align_map_primary(v: str) -> str:
-    return {
-        "MIN": "flex-start", "CENTER": "center", "MAX": "flex-end", "SPACE_BETWEEN": "space-between"
-    }.get(v or "MIN", "flex-start")
+    return {"MIN": "flex-start", "CENTER": "center", "MAX": "flex-end", "SPACE_BETWEEN": "space-between"}.get(v or "MIN", "flex-start")
 
 def _align_map_counter(v: str) -> str:
-    return {
-        "MIN": "flex-start", "CENTER": "center", "MAX": "flex-end", "BASELINE": "baseline", "STRETCH": "stretch"
-    }.get(v or "MIN", "flex-start")
+    return {"MIN": "flex-start", "CENTER": "center", "MAX": "flex-end", "BASELINE": "baseline", "STRETCH": "stretch"}.get(v or "MIN", "flex-start")
 
 def _overflow_from_node(node: Dict[str, Any]) -> str:
-    if _bool(_get(node, "clipsContent"), False):
-        return "hidden"
-    return "visible"
+    return "hidden" if _bool(_get(node, "clipsContent"), False) else "visible"
 
 def _layout_to_ir(node: Dict[str, Any]) -> Dict[str, Any]:
     mode = _get(node, "layoutMode", "NONE")
@@ -329,20 +355,14 @@ def _layout_to_ir(node: Dict[str, Any]) -> Dict[str, Any]:
     counter = str(_get(node, "counterAxisSizingMode", "FIXED") or "FIXED")
     align_primary = _align_map_primary(str(_get(node, "primaryAxisAlignItems", "MIN") or "MIN"))
     align_counter = _align_map_counter(str(_get(node, "counterAxisAlignItems", "MIN") or "MIN"))
-    return {
-        "mode": mode, "gap": gap, "padding": pad,
-        "wrap": wrap,
-        "sizing": {"primary": primary, "counter": counter},
-        "align_items": align_counter,
-        "justify_content": align_primary
-    }
+    return {"mode": mode, "gap": gap, "padding": pad, "wrap": wrap,
+            "sizing": {"primary": primary, "counter": counter},
+            "align_items": align_counter, "justify_content": align_primary}
 
 def _constraints(node: Dict[str, Any]) -> Dict[str, str]:
     c = _get(node, "constraints", {}) or {}
-    return {
-        "horizontal": str(_get(c, "horizontal", "LEFT") or "LEFT"),
-        "vertical": str(_get(c, "vertical", "TOP") or "TOP")
-    }
+    return {"horizontal": str(_get(c, "horizontal", "LEFT") or "LEFT"),
+            "vertical": str(_get(c, "vertical", "TOP") or "TOP")}
 
 def _is_absolute(node: Dict[str, Any]) -> bool:
     return _get(node, "layoutPositioning") == "ABSOLUTE"
@@ -374,9 +394,7 @@ def _text_ir(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     else:
         ls = None
 
-    align = {
-        "LEFT": "left", "CENTER": "center", "RIGHT": "right", "JUSTIFIED": "justify"
-    }.get(str(st.get("textAlignHorizontal") or ""), None)
+    align = {"LEFT": "left", "CENTER": "center", "RIGHT": "right", "JUSTIFIED": "justify"}.get(str(st.get("textAlignHorizontal") or ""), None)
 
     deco = st.get("textDecoration")
     if deco == "UNDERLINE":
@@ -387,23 +405,16 @@ def _text_ir(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         text_decoration = None
 
     tf = st.get("textCase")
-    text_transform = {
-        "UPPER": "uppercase", "LOWER": "lowercase", "TITLE": "capitalize"
-    }.get(str(tf), None)
+    text_transform = {"UPPER": "uppercase", "LOWER": "lowercase", "TITLE": "capitalize"}.get(str(tf), None)
 
     weight = st.get("fontWeight")
     if weight is None:
         style_name = (st.get("fontName") or {}).get("style", "").lower()
-        if "bold" in style_name:
-            weight = 700
-        elif "semi" in style_name:
-            weight = 600
-        elif "medium" in style_name:
-            weight = 500
-        else:
-            weight = 400
+        if "bold" in style_name: weight = 700
+        elif "semi" in style_name: weight = 600
+        elif "medium" in style_name: weight = 500
+        else: weight = 400
 
-    # Textfärg
     color_val: Optional[str] = None
     fills_any = node.get("fills") or []
     if isinstance(fills_any, list):
@@ -417,15 +428,26 @@ def _text_ir(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     color_val = f"rgba({r}, {g}, {b}, {a})"
                 break
 
-    _trace("text_ir", content=content, lines=lines, style={
-        "fontFamily": st.get("fontFamily") or (st.get("fontName") or {}).get("family"),
-        "fontSize": st.get("fontSize"), "fontWeight": weight,
-        "lineHeight": line_height, "letterSpacing": ls, "color": color_val
-    })
+    b = node.get("bounds") or {}
+    if content == "":
+        _audit("text.reject", node, reason="empty_content_after_normalization", raw_len=len(raw_chars or ""), bounds=b)
+    if (_to_float(b.get("w")) or 0) <= 0 or (_to_float(b.get("h")) or 0) <= 0:
+        _audit("text.warn", node, reason="zero_or_negative_dimensions", bounds=b)
+    if color_val is None:
+        _audit("text.warn", node, reason="no_solid_visible_fill_color")
+    if align is None and st.get("textAlignHorizontal") is not None:
+        _audit("text.warn", node, reason="unknown_text_align", raw=st.get("textAlignHorizontal"))
+    if ls is None and st.get("letterSpacing") is not None:
+        _audit("text.warn", node, reason="unparsed_letter_spacing", raw=st.get("letterSpacing"))
+
+    if content:
+        _audit("text.accept", node, lines=len(lines),
+               fontFamily=st.get("fontFamily") or (st.get("fontName") or {}).get("family"),
+               fontSize=st.get("fontSize"), fontWeight=weight, color=color_val)
 
     return {
         "content": content,
-        "lines": lines,  # radvis representation för deterministisk textvalidering
+        "lines": lines,
         "style": {
             "fontFamily": st.get("fontFamily") or (st.get("fontName") or {}).get("family"),
             "fontSize": st.get("fontSize"),
@@ -446,7 +468,6 @@ def _text_ir(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def _css_from_node_base(n: Dict[str, Any]) -> Dict[str, Any]:
     css: Dict[str, Any] = {}
 
-    # TEXT fill → color (hex eller rgba)
     if n.get("type") == "TEXT":
         tfills = n.get("fills") or []
         for f in tfills:
@@ -461,12 +482,10 @@ def _css_from_node_base(n: Dict[str, Any]) -> Dict[str, Any]:
                         css["color"] = f"rgba({r}, {g}, {b}, {a})"
                 break
 
-    # width/height
     b_bounds: Dict[str, Any] = cast(Dict[str, Any], _get(n, "bounds", {}) or {})
     if _is_num(b_bounds.get("w")): css["width"]  = _px(b_bounds.get("w"))
     if _is_num(b_bounds.get("h")): css["height"] = _px(b_bounds.get("h"))
 
-    # position
     if _bool(n.get("abs"), False):
         css["position"] = "absolute"
         if _is_num(b_bounds.get("x")): css["left"] = _px(b_bounds.get("x"))
@@ -474,11 +493,9 @@ def _css_from_node_base(n: Dict[str, Any]) -> Dict[str, Any]:
     else:
         css["position"] = "relative"
 
-    # overflow
     ov = _get(n, "overflow", "visible")
     if ov in ("hidden", "clip"): css["overflow"] = "hidden"
 
-    # fills (SOLID, GRADIENT, IMAGE)
     fills: List[Dict[str, Any]] = list(n.get("fills") or [])
     for f in fills:
         if not _bool(f.get("visible", True), True):
@@ -488,8 +505,7 @@ def _css_from_node_base(n: Dict[str, Any]) -> Dict[str, Any]:
             a = _to_float(f.get("alpha")) or 1.0
             col = f.get("color")
             if col:
-                if a >= 0.999:
-                    css["backgroundColor"] = col
+                if a >= 0.999: css["backgroundColor"] = col
                 else:
                     r = int(col[1:3], 16); g = int(col[3:5], 16); b = int(col[5:7], 16)
                     css["backgroundColor"] = f"rgba({r}, {g}, {b}, {a})"
@@ -515,7 +531,6 @@ def _css_from_node_base(n: Dict[str, Any]) -> Dict[str, Any]:
             css.setdefault("--bg-image-scaleMode", f.get("scaleMode") or "FILL")
             break
 
-    # strokes → border
     strokes = n.get("strokes", [])
     if strokes:
         s0 = strokes[0]
@@ -527,12 +542,10 @@ def _css_from_node_base(n: Dict[str, Any]) -> Dict[str, Any]:
                 css["border"] = f"{_px(bw)} solid rgba({int(col[1:3],16)}, {int(col[3:5],16)}, {int(col[5:7],16)}, {a})"
             else:
                 css["border"] = f"{_px(bw)} solid {col}"
-            # Stroke alignment approx
             align = n.get("stroke_alignment", "CENTER")
             if align == "OUTSIDE":
                 css.setdefault("outline", f"{_px(bw)} solid {col}")
 
-    # radius
     r = n.get("radius", {})
     if r:
         tl,tr,br,bl = r.get("tl",0), r.get("tr",0), r.get("br",0), r.get("bl",0)
@@ -544,7 +557,6 @@ def _css_from_node_base(n: Dict[str, Any]) -> Dict[str, Any]:
             css["borderBottomRightRadius"] = _px(br)
             css["borderBottomLeftRadius"]  = _px(bl)
 
-    # effects → box-shadow
     shadows: List[str] = []
     for ef in (n.get("effects") or []):
         if ef.get("type") in ("DROP_SHADOW", "INNER_SHADOW"):
@@ -560,16 +572,13 @@ def _css_from_node_base(n: Dict[str, Any]) -> Dict[str, Any]:
     if shadows:
         css["boxShadow"] = ", ".join(shadows)
 
-    # opacity
     if _is_num(n.get("opacity")) and (_to_float(n.get("opacity")) or 1.0) < 1:
         css["opacity"] = _to_float(n.get("opacity")) or 1.0
 
-    # transform/rotation
     rot = n.get("rotation")
     if _is_num(rot) and abs((_to_float(rot) or 0.0)) > 0.001:
         css["transform"] = f"rotate({_round(_to_float(rot) or 0.0,2)}deg)"
 
-    # flex layout
     lay = cast(Dict[str, Any], n.get("layout") or {})
     if lay.get("mode") in ("HORIZONTAL","VERTICAL"):
         css["display"] = "flex"
@@ -587,14 +596,13 @@ def _css_from_node_base(n: Dict[str, Any]) -> Dict[str, Any]:
         if _bool(lay.get("wrap"), False):
             css["flexWrap"] = "wrap"
 
-    # z-index (om satt)
     if _is_num(n.get("z")):
         css["zIndex"] = int(_to_float(n.get("z")) or 0)
 
     return css
 
 # ────────────────────────────────────────────────────────────────────────────
-# Tailwind-syntes med konflikt-skydd
+# Tailwind-hints
 # ────────────────────────────────────────────────────────────────────────────
 
 def _tailwind_hints(n: Dict[str, Any]) -> Dict[str, Any]:
@@ -612,16 +620,12 @@ def _tailwind_hints(n: Dict[str, Any]) -> Dict[str, Any]:
             t,r,b,l = pad.get("t",0), pad.get("r",0), pad.get("b",0), pad.get("l",0)
             tw.extend([f"pt-[{_px(t)}]", f"pr-[{_px(r)}]", f"pb-[{_px(b)}]", f"pl-[{_px(l)}]"])
         if lay.get("align_items"):
-            m = {
-                "flex-start":"items-start","center":"items-center",
-                "flex-end":"items-end","stretch":"items-stretch","baseline":"items-baseline"
-            }
+            m = {"flex-start":"items-start","center":"items-center",
+                 "flex-end":"items-end","stretch":"items-stretch","baseline":"items-baseline"}
             v = m.get(lay["align_items"])
             if v: tw.append(v)
         if lay.get("justify_content"):
-            m = {
-                "flex-start":"justify-start","center":"justify-center","flex-end":"justify-end","space-between":"justify-between"
-            }
+            m = {"flex-start":"justify-start","center":"justify-center","flex-end":"justify-end","space-between":"justify-between"}
             v = m.get(lay["justify_content"])
             if v: tw.append(v)
 
@@ -639,44 +643,34 @@ def _tailwind_hints(n: Dict[str, Any]) -> Dict[str, Any]:
     fills = n.get("fills") or []
     s0 = _first(fills, lambda f: f.get("type")=="SOLID" and _bool(f.get("visible",True),True))
     if s0 and s0.get("color"):
-        col = s0["color"]
-        a = _to_float(s0.get("alpha")) or 1.0
+        col = s0["color"]; a = _to_float(s0.get("alpha")) or 1.0
         if n.get("type") == "TEXT":
-            if a >= 0.999:
-                tw.append(f"text-[{col}]")
+            if a >= 0.999: tw.append(f"text-[{col}]")
             else:
                 r = int(col[1:3],16); g = int(col[3:5],16); b_ = int(col[5:7],16)
                 tw.append(f"text-[rgba({r}, {g}, {b_}, {a})]")
         else:
-            if a >= 0.999:
-                tw.append(f"bg-[{col}]")
+            if a >= 0.999: tw.append(f"bg-[{col}]")
             else:
                 r = int(col[1:3],16); g = int(col[3:5],16); b_ = int(col[5:7],16)
                 tw.append(f"bg-[rgba({r}, {g}, {b_}, {a})]")
 
-    # Gradient → bg-[linear-gradient(...)]
     g0 = _first(fills, lambda f: str(f.get("type","")).startswith("GRADIENT_") and _bool(f.get("visible",True),True))
     if g0 and g0.get("stops"):
         parts: List[str] = []
         for s in g0["stops"]:
-            c = str(s.get("color") or "#000000")
-            a = _to_float(s.get("alpha")) or 1.0
-            pos = _to_float(s.get("position")) or 0.0
-            stop = f"rgba({int(c[1:3],16)}, {int(c[3:5],16)}, {int(c[5:7],16)}, {a}) {int(pos*100)}%" if a < 1 else f"{c} {int(pos*100)}%"
-            parts.append(stop)
+            c = str(s.get("color") or "#000000"); a = _to_float(s.get("alpha")) or 1.0; pos = _to_float(s.get("position")) or 0.0
+            parts.append(f"rgba({int(c[1:3],16)}, {int(c[3:5],16)}, {int(c[5:7],16)}, {a}) {int(pos*100)}%" if a < 1 else f"{c} {int(pos*100)}%")
         ang = _to_float(g0.get("angle_deg")) or 0.0
         tw.append(f"bg-[linear-gradient({ang}deg,{','.join(parts)})]")
 
-    # Strokes
     strokes = n.get("strokes") or []
     if strokes:
         s = strokes[0]
         if s.get("type") == "SOLID" and s.get("color"):
             w = s.get("weight")
-            if _is_num(w):
-                tw.append(f"border-[{_px(w)}]")
-            else:
-                tw.append("border")
+            if _is_num(w): tw.append(f"border-[{_px(w)}]")
+            else: tw.append("border")
             tw.append(f"border-[{s['color']}]")
 
     r = n.get("radius") or {}
@@ -695,24 +689,19 @@ def _tailwind_hints(n: Dict[str, Any]) -> Dict[str, Any]:
     if _is_num(n.get("opacity")) and (_to_float(n.get("opacity")) or 1.0) < 1:
         tw.append(f"opacity-[{_to_float(n.get('opacity')) or 1.0}]")
 
-    # TEXT typografi
     if n.get("type") == "TEXT":
         st = (n.get("text") or {}).get("style") or {}
         lines = (n.get("text") or {}).get("lines") or []
         if isinstance(lines, list) and len(lines) >= 2:
-            # Hjälper modellen att bevara radbrytningar i en enda nod (utan extra wrappers)
             tw.append("whitespace-pre-wrap")
         if st.get("textAlign"):
             tw.append({"left":"text-left","center":"text-center","right":"text-right","justify":"text-justify"}[st["textAlign"]])
         if st.get("fontSize") is not None:
             px_fs = _px(st.get("fontSize"))
             if px_fs: tw.append(f"text-[{px_fs}]")
-        if st.get("fontWeight"):
-            tw.append(f"font-{st['fontWeight']}")
-        if st.get("lineHeight"):
-            tw.append(f"leading-[{st['lineHeight']}]")
-        if st.get("letterSpacing"):
-            tw.append(f"tracking-[{st['letterSpacing']}]")
+        if st.get("fontWeight"): tw.append(f"font-{st['fontWeight']}")
+        if st.get("lineHeight"): tw.append(f"leading-[{st['lineHeight']}]")
+        if st.get("letterSpacing"): tw.append(f"tracking-[{st['letterSpacing']}]")
         if st.get("textDecoration") == "underline": tw.append("underline")
         if st.get("textDecoration") == "line-through": tw.append("line-through")
         if st.get("textTransform") == "uppercase": tw.append("uppercase")
@@ -722,33 +711,25 @@ def _tailwind_hints(n: Dict[str, Any]) -> Dict[str, Any]:
             fam = str(st["fontFamily"]).replace(" ", "_")
             tw.append(f"font-['{fam}']")
 
-    # Box-shadow → shadow-[...]
     css = n.get("css") or {}
-    if css.get("boxShadow"):
-        tw.append(f"shadow-[{css['boxShadow']}]")
+    if css.get("boxShadow"): tw.append(f"shadow-[{css['boxShadow']}]")
 
-    # Rotation → rotate-[Xdeg]
     rot = n.get("rotation")
     if _is_num(rot) and abs((_to_float(rot) or 0.0)) > 0.001:
         tw.append(f"rotate-[{_round(_to_float(rot) or 0.0,2)}deg]")
 
-    # z-index
     if _is_num(n.get("z")):
         tw.append(f"z-[{int(_to_float(n.get('z')) or 0)}]")
 
-    # ——— Sanering: dedupe + konfliktregler ———
     seen: set[str] = set()
     clean: List[str] = []
     for t in tw:
         if t and t not in seen:
-            seen.add(t)
-            clean.append(t)
+            seen.add(t); clean.append(t)
 
-    # Konflikt: absolute vs relative → behåll absolute
     if "absolute" in clean and "relative" in clean:
         clean = [t for t in clean if t != "relative"]
 
-    # Konflikt: border + border-[...] → om explicit bredd finns, ta bort 'border'
     has_explicit_width = any(t.startswith("border-[") and t.endswith("px]") for t in clean)
     if has_explicit_width and "border" in clean:
         clean = [t for t in clean if t != "border"]
@@ -760,14 +741,10 @@ def _tailwind_hints(n: Dict[str, Any]) -> Dict[str, Any]:
 # ────────────────────────────────────────────────────────────────────────────
 
 _ICON_TYPES = {
-    "VECTOR",
-    "BOOLEAN_OPERATION",
-    "ELLIPSE",
-    "RECTANGLE",
-    "LINE",
-    "REGULAR_POLYGON",
-    "STAR",
+    "VECTOR", "BOOLEAN_OPERATION", "ELLIPSE", "RECTANGLE",
+    "LINE", "REGULAR_POLYGON", "STAR",
 }
+_CONTAINERS = {"GROUP","INSTANCE","COMPONENT","COMPONENT_SET","FRAME"}
 
 def _is_iconish_name(name: str) -> bool:
     s = (name or "").lower()
@@ -782,11 +759,11 @@ def _single_visible_solid_fill(node: Dict[str, Any]) -> Tuple[Optional[str], Opt
     return None, None
 
 def _icon_hint(node: Dict[str, Any]) -> Dict[str, Any]:
-    b = _bounds(node)
+    b = node.get("bounds") or {}
     name = _safe_name(node.get("name"))
     t = _safe_name(node.get("type"))
     has_children = bool(node.get("children"))
-    w, h = b["w"] or 0.0, b["h"] or 0.0
+    w, h = b.get("w") or 0.0, b.get("h") or 0.0
 
     type_ok = t in _ICON_TYPES
     size_typical = ICON_MIN <= int(round(w)) <= ICON_MAX and ICON_MIN <= int(round(h)) <= ICON_MAX
@@ -804,10 +781,6 @@ def _icon_hint(node: Dict[str, Any]) -> Dict[str, Any]:
 
     tintable = is_icon and bool(hex_col)
 
-    _trace("icon_hint", name=name, type=t, w=w, h=h,
-           type_ok=type_ok, size_typical=size_typical, name_ok=name_ok,
-           child_ok=child_ok, is_icon=is_icon, tintable=tintable, hex=hex_col, alpha=alpha)
-
     return {
         "is_icon": is_icon,
         "name": name,
@@ -821,31 +794,46 @@ def _icon_hint(node: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 # ────────────────────────────────────────────────────────────────────────────
-# Traversering och extraktion
+# Traversering och IR-byggnad med synlighetsflagga
 # ────────────────────────────────────────────────────────────────────────────
 
-def _node_to_ir(node: Dict[str, Any], *, _z: int = 0) -> Dict[str, Any]:
-    fills = [_paint_to_fill(p) for p in (node.get("fills") or []) if _bool(_get(p, "visible", True), True)]
-    strokes, stroke_align = _stroke_to_ir(node)
-    radius = _radius_to_ir(node)
-    effects = _effects_to_ir(node)
-    text = _text_ir(node)
-    abspos = _is_absolute(node)
-    l = _layout_to_ir(node)
-    cons = _constraints(node)
-    ov = _overflow_from_node(node)
-    op = _to_float(node.get("opacity")) or 1.0
-    rot = _round(_get(node, "rotation", 0.0), 3)
+def _node_to_ir(doc_node: Dict[str, Any], *,
+                _z: int = 0,
+                inherited_clip: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+    # Bounds tidigt för synlighetsberäkning
+    bounds = _bounds(doc_node)
 
-    icon = _icon_hint(node)
+    # Preliminära fält som behövs för effektiv synlighet
+    prelim = {
+        "visible": _bool(doc_node.get("visible"), True),
+        "opacity": _round(_get(doc_node, "opacity", 1.0), 4) or 1.0,
+        "bounds": bounds,
+        "clips_content": _bool(doc_node.get("clipsContent"), False),
+    }
+    eff_visible = _effectively_visible(prelim | {"type": doc_node.get("type")}, inherited_clip)
+
+    # Övriga attribut
+    fills = [_paint_to_fill(p) for p in (doc_node.get("fills") or []) if _bool(_get(p, "visible", True), True)]
+    strokes, stroke_align = _stroke_to_ir(doc_node)
+    radius = _radius_to_ir(doc_node)
+    effects = _effects_to_ir(doc_node)
+    text = _text_ir({"bounds": bounds, **doc_node})
+    abspos = _is_absolute(doc_node)
+    l = _layout_to_ir(doc_node)
+    cons = _constraints(doc_node)
+    ov = _overflow_from_node(doc_node)
+    op = _to_float(doc_node.get("opacity")) or 1.0
+    rot = _round(_get(doc_node, "rotation", 0.0), 3)
+    icon = _icon_hint({"bounds": bounds, **doc_node})
 
     ir: Dict[str, Any] = {
-        "id": _safe_name(node.get("id")),
-        "name": _safe_name(node.get("name")),
-        "type": _safe_name(node.get("type")),
-        "visible": _bool(node.get("visible"), True),
+        "id": _safe_name(doc_node.get("id")),
+        "name": _safe_name(doc_node.get("name")),
+        "type": _safe_name(doc_node.get("type")),
+        "visible": _bool(doc_node.get("visible"), True),
+        "visible_effective": bool(eff_visible),
         "abs": abspos,
-        "bounds": _bounds(node),
+        "bounds": bounds,
         "layout": l,
         "constraints": cons,
         "fills": fills,
@@ -854,8 +842,8 @@ def _node_to_ir(node: Dict[str, Any], *, _z: int = 0) -> Dict[str, Any]:
         "radius": radius,
         "effects": effects,
         "opacity": _round(op, 4),
-        "blend_mode": node.get("blendMode"),
-        "clips_content": _bool(node.get("clipsContent"), False),
+        "blend_mode": doc_node.get("blendMode"),
+        "clips_content": _bool(doc_node.get("clipsContent"), False),
         "overflow": ov,
         "text": text,
         "icon": icon,
@@ -864,7 +852,6 @@ def _node_to_ir(node: Dict[str, Any], *, _z: int = 0) -> Dict[str, Any]:
         "children": [],
     }
 
-    # Stabil ordning (för render-determinism): först visuellt (y,x), sedan deklarativt (_z)
     by = int(round((ir["bounds"].get("y") or 0)))
     bx = int(round((ir["bounds"].get("x") or 0)))
     ir["order"] = _z
@@ -875,22 +862,41 @@ def _node_to_ir(node: Dict[str, Any], *, _z: int = 0) -> Dict[str, Any]:
     ir["tw"]  = _tailwind_hints(ir)
 
     raw_grad_handles: List[Any] = []
-    for p in (node.get("fills") or []):
-        if isinstance(p, dict):
-            t = str(p.get("type") or "")
-            if t.startswith("GRADIENT_"):
-                raw_grad_handles.append(p.get("gradientHandlePositions"))
+    for p in (doc_node.get("fills") or []):
+        if isinstance(p, dict) and str(p.get("type") or "").startswith("GRADIENT_"):
+            raw_grad_handles.append(p.get("gradientHandlePositions"))
     ir["debug"] = {
-        "rawLayoutMode": node.get("layoutMode"),
-        "rawSizingPrimary": node.get("primaryAxisSizingMode"),
-        "rawSizingCounter": node.get("counterAxisSizingMode"),
-        "rawConstraints": node.get("constraints"),
-        "rawStrokeWeight": node.get("strokeWeight"),
+        "rawLayoutMode": doc_node.get("layoutMode"),
+        "rawSizingPrimary": doc_node.get("primaryAxisSizingMode"),
+        "rawSizingCounter": doc_node.get("counterAxisSizingMode"),
+        "rawConstraints": doc_node.get("constraints"),
+        "rawStrokeWeight": doc_node.get("strokeWeight"),
         "rawGradientHandles": raw_grad_handles or None
     }
 
-    for i, ch in enumerate(node.get("children") or []):
-        ir["children"].append(_node_to_ir(ch, _z=i))
+    # Audit text/ikon-status
+    if ir["type"] == "TEXT":
+        if not (text and (text.get("content") or "").strip()):
+            _audit("text.final_reject", ir, reason="no_content_or_whitespace_only", note="TEXT-node saknar genererbar text",
+                   style=(text or {}).get("style") if text else None)
+
+    if icon.get("is_icon"):
+        _audit("icon.final_accept", ir, name=icon.get("name"), tintable=icon.get("tintable"),
+               color=icon.get("dominant_color"), bounds=icon.get("bounds"))
+    else:
+        # logga varför inte ikon (hjälper tuning)
+        b = ir["bounds"]
+        _audit("icon.final_none", ir, reason="leaf_not_icon", hint_checks={
+            "type_in_ICON_TYPES": ir["type"] in _ICON_TYPES,
+            "has_children": bool(doc_node.get("children")),
+            "name_iconish": _is_iconish_name(ir["name"]),
+            "size_typical": ICON_MIN <= int(round(b["w"])) <= ICON_MAX and ICON_MIN <= int(round(b["h"])) <= ICON_MAX
+        })
+
+    # Rekursiv byggnad med clip-kedja
+    next_clip = _next_clip(ir, inherited_clip)
+    for i, ch in enumerate(doc_node.get("children") or []):
+        ir["children"].append(_node_to_ir(ch, _z=i, inherited_clip=next_clip))
 
     return ir
 
@@ -904,32 +910,69 @@ def _extract_document_from_nodes_payload(payload: Dict[str, Any], node_id: str) 
     raise ValueError("Kunde inte hitta 'document' i nodes-payloaden.")
 
 # ────────────────────────────────────────────────────────────────────────────
-# Publikt API
+# Publikt API: Figma → IR samt synlighets-pruning
 # ────────────────────────────────────────────────────────────────────────────
 
 def figma_to_ir(figma_json: Dict[str, Any], node_id: str, *, viewport: Tuple[int,int]=(1280,800)) -> Dict[str, Any]:
     doc = _extract_document_from_nodes_payload(figma_json, node_id)
-    root_ir = _node_to_ir(doc, _z=0)
+    root_ir = _node_to_ir(doc, _z=0, inherited_clip=None)
     root_ir["debug"]["isRoot"] = True
 
     meta = {
         "nodeId": node_id,
         "viewport": {"w": viewport[0], "h": viewport[1]},
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "producedBy": "figma_ir.py"
     }
     _trace("figma_to_ir_done", node_id=node_id, viewport=meta["viewport"])
+    _audit("pipeline.done", root_ir, viewport=meta["viewport"], schemaVersion=meta["schemaVersion"])
     return {"meta": meta, "root": root_ir}
 
+def _reindex_order(n: Dict[str, Any]) -> None:
+    for i, ch in enumerate(n.get("children") or []):
+        ch["z"] = i
+        by = int(round((ch.get("bounds", {}).get("y") or 0)))
+        bx = int(round((ch.get("bounds", {}).get("x") or 0)))
+        ch["order"] = i
+        ch["order_key"] = [by, bx, i]
+        _reindex_order(ch)
+
+def filter_visible_ir(ir_full: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Returnera ett nytt IR där endast effektivt synliga noder finns kvar.
+    Behåll containers som har minst ett synligt barn.
+    """
+    def prune(n: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        kids: List[Dict[str, Any]] = []
+        for ch in n.get("children") or []:
+            p = prune(ch)
+            if p is not None:
+                kids.append(p)
+
+        eff = bool(n.get("visible_effective", True))
+        keep = eff or len(kids) > 0 or n.get("type") in ("FRAME","GROUP","INSTANCE","COMPONENT","COMPONENT_SET")
+
+        if not keep:
+            _audit("prune.drop", n, reason="not_visible_and_no_visible_children")
+            return None
+
+        nn = deepcopy(n)
+        nn["children"] = kids
+        return nn
+
+    root_in = ir_full["root"]
+    root_out = prune(root_in) or deepcopy(root_in)
+    _reindex_order(root_out)
+    return {"meta": ir_full["meta"], "root": root_out}
+
 # ────────────────────────────────────────────────────────────────────────────
-# Hjälp: bildreferenser (endast från synliga noder)
+# Hjälp: bildreferenser, CSS/TW-map
 # ────────────────────────────────────────────────────────────────────────────
 
 def collect_image_refs(ir_node: Dict[str, Any]) -> List[str]:
     out: List[str] = []
-    def rec(n: Dict[str, Any], clip: Optional[Dict[str,float]]):
-        next_clip = _next_clip(n, clip)
-        if not _effectively_visible(n, next_clip):
+    def rec(n: Dict[str, Any], _clip_unused: Optional[Dict[str,float]]):
+        if not bool(n.get("visible_effective", True)):
             return
         for f in n.get("fills", []):
             if f.get("type")=="IMAGE":
@@ -937,19 +980,14 @@ def collect_image_refs(ir_node: Dict[str, Any]) -> List[str]:
                 if ref:
                     out.append(ref)
         for ch in n.get("children", []):
-            rec(ch, next_clip)
+            rec(ch, None)
     rec(ir_node, None)
     seen = set()
     uniq: List[str] = []
     for r in out:
         if r not in seen:
-            seen.add(r)
-            uniq.append(r)
+            seen.add(r); uniq.append(r)
     return uniq
-
-# ────────────────────────────────────────────────────────────────────────────
-# Hjälp: CSS-karta
-# ────────────────────────────────────────────────────────────────────────────
 
 def build_css_map(ir_node: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
     css_map: Dict[str, Dict[str, str]] = {}
@@ -962,10 +1000,6 @@ def build_css_map(ir_node: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
     rec(ir_node)
     return css_map
 
-# ────────────────────────────────────────────────────────────────────────────
-# Hjälp: Tailwind-karta
-# ────────────────────────────────────────────────────────────────────────────
-
 def build_tailwind_map(ir_node: Dict[str, Any]) -> Dict[str, str]:
     tw_map: Dict[str, str] = {}
     def rec(n: Dict[str, Any]):
@@ -977,95 +1011,122 @@ def build_tailwind_map(ir_node: Dict[str, Any]) -> Dict[str, str]:
     return tw_map
 
 # ────────────────────────────────────────────────────────────────────────────
-# Hjälp: Ikon-noder (för SVG-export i pipelinen)
+# Ikon-noder: synliga, dedup och containerstöd
 # ────────────────────────────────────────────────────────────────────────────
 
 def collect_icon_nodes(ir_node: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Returnerar lista över synliga ikon-noder i IR-trädet utan dubbletter.
-    Strategi:
-      - Om noden är en ikon → lägg till och STOPPA rekursion under noden.
-      - Om noden är GROUP/INSTANCE/COMPONENT/COMPONENT_SET och innehåller exakt EN synlig vektor-leaf
-        → behandla den leafen som ikon och STOPPA rekursion (för att undvika dubbletter).
-      - Om containern innehåller 2–4 synliga vektor-leaves och har typiska ikonmått (ICON_MIN..ICON_MAX)
-        → behandla containern som EN ikon och STOPPA rekursion.
-    Varje element: { id, name, name_slug, bounds:{x,y,w,h}, tintable:bool, color:str|None, alpha:float }
+    Returnera synliga ikon-noder i IR-trädet utan dubbletter.
+    Regler:
+      - Leaf-ikon: node.icon.is_icon == True och visible_effective == True.
+      - Container-ikon: container med 1–8 synliga vektor-leaves, inom ICON_MIN..ICON_MAX.
+      - INSTANCE-fallback: inga leaves men typiska ikonmått.
     """
     out: List[Dict[str, Any]] = []
 
-    def rec(n: Dict[str, Any], clip: Optional[Dict[str,float]]):
-        next_clip = _next_clip(n, clip)
-        if not _effectively_visible(n, next_clip):
-            return
+    def _visible(n: Dict[str, Any]) -> bool:
+        v = bool(n.get("visible_effective", True))
+        if not v:
+            _audit("icon.visibility_block", n, reason="not_visible_effective")
+        return v
 
+    def _gather_vector_leaves(n: Dict[str, Any], acc: List[Dict[str, Any]], depth: int = 0, max_depth: int = 5):
+        if depth > max_depth:
+            _audit("icon.reject", n, reason="max_depth_exceeded", max_depth=max_depth)
+            return
+        if not _visible(n):
+            return
+        t = n.get("type")
+        ch = n.get("children") or []
+        if t in _ICON_TYPES and not ch:
+            b = n.get("bounds") or {}
+            if isinstance(b, dict) and (b.get("w",0)*b.get("h",0)) >= 4:
+                acc.append(n)
+            else:
+                _audit("icon.leaf.reject", n, reason="too_small_area", area=(b.get("w",0)*b.get("h",0)))
+            return
+        for c in ch:
+            _gather_vector_leaves(c, acc, depth+1, max_depth)
+
+    def rec(n: Dict[str, Any]):
+        if not _visible(n):
+            return
         t = (n.get("type") or "")
-        # specialfall: container som håller exakt EN ikon-leaf
-        if t in ("GROUP","INSTANCE","COMPONENT","COMPONENT_SET"):
-            vis_children = [ch for ch in (n.get("children", []) or []) if _effectively_visible(ch, next_clip)]
-            leafs = [ch for ch in vis_children if (ch.get("type") in _ICON_TYPES) and not ch.get("children")]
-            if len(leafs) == 1:
-                ch = leafs[0]
-                b = ch.get("bounds") or {}
-                if isinstance(b, dict) and (b.get("w",0)*b.get("h",0)) >= 4:
-                    ic = (ch.get("icon") or {})
-                    out.append({
-                        "id": ch.get("id"),
-                        "name": ic.get("name") or ch.get("name") or n.get("name"),
-                        "name_slug": ic.get("name_slug") or _slug(ch.get("name") or n.get("name") or "icon"),
-                        "bounds": b,
-                        "tintable": bool(ic.get("tintable", True)),
-                        "color": ic.get("dominant_color"),
-                        "alpha": ic.get("dominant_alpha", 1.0),
-                    })
-                    _trace("icon_from_single_leaf", container=t, name=n.get("name"),
-                           leaf_id=ch.get("id"), w=b.get("w"), h=b.get("h"))
-                    return  # stoppa här
-            # liten samling vektor-leaves (2–4) i ikon-typiska mått → behandla som EN ikon
-            if 1 < len(leafs) <= 4:
-                nb = (n.get("bounds") or {})
-                w = int(round(nb.get("w", 0) or 0)); h = int(round(nb.get("h", 0) or 0))
-                if ICON_MIN <= w <= ICON_MAX and ICON_MIN <= h <= ICON_MAX and (w*h) >= 4:
-                    out.append({
-                        "id": n.get("id"),
-                        "name": n.get("name"),
-                        "name_slug": _slug(n.get("name") or "icon"),
-                        "bounds": nb,
-                        "tintable": True,
-                        "color": None,
-                        "alpha": 1.0,
-                    })
-                    _trace("icon_from_compound_leafs", container=t, name=n.get("name"),
-                           leaf_count=len(leafs), w=w, h=h, ICON_MIN=ICON_MIN, ICON_MAX=ICON_MAX)
-                    return  # stoppa här
 
         ic = (n.get("icon") or {})
         if ic.get("is_icon"):
             b = ic.get("bounds") or n.get("bounds")
-            if next_clip is None or _rect_intersect(b, next_clip):
-                if isinstance(b, dict) and (b.get("w",0)*b.get("h",0)) >= 4:
-                    out.append({
-                        "id": n.get("id"),
-                        "name": ic.get("name") or n.get("name"),
-                        "name_slug": ic.get("name_slug"),
-                        "bounds": b,
-                        "tintable": bool(ic.get("tintable")),
-                        "color": ic.get("dominant_color"),
-                        "alpha": ic.get("dominant_alpha", 1.0),
-                    })
-                    _trace("icon_from_node", id=n.get("id"), name=n.get("name"),
-                           w=(b or {}).get("w"), h=(b or {}).get("h"))
-            return  # stoppa rekursion under ikon
+            if isinstance(b, dict) and (b.get("w",0)*b.get("h",0)) >= 4:
+                out.append({
+                    "id": n.get("id"),
+                    "name": ic.get("name") or n.get("name"),
+                    "name_slug": ic.get("name_slug"),
+                    "bounds": b,
+                    "tintable": bool(ic.get("tintable")),
+                    "color": ic.get("dominant_color"),
+                    "alpha": ic.get("dominant_alpha", 1.0),
+                })
+                _trace("icon_from_node", id=n.get("id"), name=n.get("name"), w=(b or {}).get("w"), h=(b or {}).get("h"))
+                _audit("icon.accept.leaf", n, bounds=b, tintable=bool(ic.get("tintable")), color=ic.get("dominant_color"))
+            return
 
-        for ch in n.get("children", []):
-            rec(ch, next_clip)
+        if t in _CONTAINERS:
+            leaves: List[Dict[str, Any]] = []
+            _gather_vector_leaves(n, leaves)
+            nb = (n.get("bounds") or {})
+            w = int(round(nb.get("w", 0) or 0)); h = int(round(nb.get("h", 0) or 0))
+            if 1 <= len(leaves) <= 8 and ICON_MIN <= w <= ICON_MAX and ICON_MIN <= h <= ICON_MAX and (w*h) >= 4:
+                out.append({
+                    "id": n.get("id"),
+                    "name": n.get("name"),
+                    "name_slug": _slug(n.get("name") or "icon"),
+                    "bounds": nb,
+                    "tintable": True,
+                    "color": None,
+                    "alpha": 1.0,
+                })
+                _trace("icon_from_compound_container", container=t, name=n.get("name"), leaf_count=len(leaves), w=w, h=h,
+                       ICON_MIN=ICON_MIN, ICON_MAX=ICON_MAX)
+                _audit("icon.accept.container", n, leaf_count=len(leaves), bounds=nb)
+                return
+            else:
+                reason = None
+                if not (ICON_MIN <= w <= ICON_MAX and ICON_MIN <= h <= ICON_MAX):
+                    reason = "size_outside_icon_range"
+                elif len(leaves) == 0:
+                    reason = "no_vector_leaves"
+                elif len(leaves) > 8:
+                    reason = "too_many_leaves"
+                elif (w*h) < 4:
+                    reason = "too_small_area"
+                _audit("icon.container.reject", n, reason=reason, leaf_count=len(leaves), bounds=nb,
+                       ICON_MIN=ICON_MIN, ICON_MAX=ICON_MAX)
 
-    rec(ir_node, None)
+            if t == "INSTANCE" and len(leaves) == 0 and ICON_MIN <= w <= ICON_MAX and ICON_MIN <= h <= ICON_MAX and (w*h) >= 4:
+                out.append({
+                    "id": n.get("id"),
+                    "name": n.get("name"),
+                    "name_slug": _slug(n.get("name") or "icon"),
+                    "bounds": nb,
+                    "tintable": True,
+                    "color": None,
+                    "alpha": 1.0,
+                })
+                _trace("icon_from_instance_fallback", container=t, name=n.get("name"), w=w, h=h)
+                _audit("icon.accept.instance_fallback", n, bounds=nb)
+                return
 
-    # dedupe per id
+        for ch in n.get("children") or []:
+            rec(ch)
+
+    rec(ir_node)
+
     uniq: Dict[str, Dict[str, Any]] = {}
     for x in out:
         if x["id"] and x["id"] not in uniq:
             uniq[x["id"]] = x
+    if len(out) != len(uniq):
+        _audit("icon.dedupe", ir_node, input_count=len(out), output_count=len(uniq))
     return list(uniq.values())
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1080,11 +1141,13 @@ if __name__ == "__main__":  # pragma: no cover
     with open(sys.argv[1], "r", encoding="utf-8") as f:
         payload = _json.load(f)
     nid = sys.argv[2]
-    ir = figma_to_ir(payload, nid)
+    ir_full = figma_to_ir(payload, nid)
+    ir = filter_visible_ir(ir_full)
     print(_json.dumps(ir, ensure_ascii=False, indent=2))
 
 __all__ = [
     "figma_to_ir",
+    "filter_visible_ir",
     "collect_image_refs",
     "build_css_map",
     "build_tailwind_map",

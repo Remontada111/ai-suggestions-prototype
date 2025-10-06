@@ -12,8 +12,7 @@ function App() {
       </h2>
       {/* AI-INJECT-MOUNT:BEGIN */}
       <Menu />
-      {/* AI-INJECT-MOUNT:END */}{/* AI-INJECT-MOUNT:END */}{/* AI-INJECT-MOUNT:END */}{/* AI-INJECT-MOUNT:END */}
-    </div>
+      {/* AI-INJECT-MOUNT:END */}</div>
   );
 }
 
