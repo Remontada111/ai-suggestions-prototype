@@ -1,12 +1,9 @@
 # backend/tasks/figma_ir.py
 from __future__ import annotations
 """
-Figma → IR (Intermediate Representation) med synlighets-flagg och pruning så att
-endast effektivt synliga noder (inkl. texter och ikoner) går vidare till codegen.
-
-Fokus:
-- Markera varje node med 'visible_effective' (visible, opacity, clip).
-- filter_visible_ir() tar bort dolda noder men behåller containers som har synliga barn.
+Figma → IR (Intermediate Representation) med transitiv synlighet:
+- Varje node får 'visible_effective' som tar hänsyn till egen visible/opacity, föräldrars synlighet och clipping.
+- filter_visible_ir() tar bort dolda noder och behåller containers endast om de har synliga barn.
 - Text-IR bevarar content + lines och färg/typografi.
 - Ikon-detektion robust för både leaf och små containers, och använder synlighet.
 
@@ -123,10 +120,13 @@ def _safe_name(s: Optional[str]) -> str:
         return ""
     return str(s)
 
-def _bool(x: Any, default=False) -> bool:
+def _bool(x: Any, default: bool = False) -> bool:
+    # None → default
     if isinstance(x, bool):
         return x
-    if x in (0, "0", "false", "False", None):
+    if x is None:
+        return default
+    if x in (0, "0", "false", "False"):
         return False
     if x in (1, "1", "true", "True"):
         return True
@@ -189,7 +189,10 @@ def _rect_intersect(a: Optional[Dict[str, float]],
             "w": _round(x2 - x1, 3) or 0.0, "h": _round(y2 - y1, 3) or 0.0}
 
 def _effectively_visible(n: Dict[str, Any],
-                         inherited_clip: Optional[Dict[str, float]]) -> bool:
+                         inherited_clip: Optional[Dict[str, float]],
+                         inherited_visible: bool = True) -> bool:
+    if not inherited_visible:
+        return False
     if not _bool(n.get("visible"), True):
         return False
     op = _to_float(n.get("opacity"))
@@ -711,8 +714,11 @@ def _tailwind_hints(n: Dict[str, Any]) -> Dict[str, Any]:
             fam = str(st["fontFamily"]).replace(" ", "_")
             tw.append(f"font-['{fam}']")
 
-    css = n.get("css") or {}
-    if css.get("boxShadow"): tw.append(f"shadow-[{css['boxShadow']}]")
+    css = n.get("boxShadow") or (n.get("css") or {})
+    if isinstance(css, dict) and css.get("boxShadow"):
+        tw.append(f"shadow-[{css['boxShadow']}]")
+    elif isinstance(n.get("css"), dict) and n["css"].get("boxShadow"):
+        tw.append(f"shadow-[{n['css']['boxShadow']}]")
 
     rot = n.get("rotation")
     if _is_num(rot) and abs((_to_float(rot) or 0.0)) > 0.001:
@@ -794,25 +800,27 @@ def _icon_hint(node: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 # ────────────────────────────────────────────────────────────────────────────
-# Traversering och IR-byggnad med synlighetsflagga
+# Traversering och IR-byggnad med transitiv synlighet
 # ────────────────────────────────────────────────────────────────────────────
 
 def _node_to_ir(doc_node: Dict[str, Any], *,
                 _z: int = 0,
-                inherited_clip: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
-    # Bounds tidigt för synlighetsberäkning
+                inherited_clip: Optional[Dict[str, float]] = None,
+                inherited_visible: bool = True) -> Dict[str, Any]:
     bounds = _bounds(doc_node)
 
-    # Preliminära fält som behövs för effektiv synlighet
-    prelim = {
-        "visible": _bool(doc_node.get("visible"), True),
-        "opacity": _round(_get(doc_node, "opacity", 1.0), 4) or 1.0,
-        "bounds": bounds,
-        "clips_content": _bool(doc_node.get("clipsContent"), False),
-    }
-    eff_visible = _effectively_visible(prelim | {"type": doc_node.get("type")}, inherited_clip)
+    own_visible = _bool(doc_node.get("visible"), True)
+    opacity = _round(_get(doc_node, "opacity", 1.0), 4) or 1.0
+    clips_here = _bool(doc_node.get("clipsContent"), False)
+    next_clip = _rect_intersect(inherited_clip, bounds) if clips_here else inherited_clip
 
-    # Övriga attribut
+    prelim = {
+        "visible": own_visible,
+        "opacity": opacity,
+        "bounds": bounds,
+    }
+    eff_visible = _effectively_visible(prelim, inherited_clip, inherited_visible)
+
     fills = [_paint_to_fill(p) for p in (doc_node.get("fills") or []) if _bool(_get(p, "visible", True), True)]
     strokes, stroke_align = _stroke_to_ir(doc_node)
     radius = _radius_to_ir(doc_node)
@@ -822,7 +830,6 @@ def _node_to_ir(doc_node: Dict[str, Any], *,
     l = _layout_to_ir(doc_node)
     cons = _constraints(doc_node)
     ov = _overflow_from_node(doc_node)
-    op = _to_float(doc_node.get("opacity")) or 1.0
     rot = _round(_get(doc_node, "rotation", 0.0), 3)
     icon = _icon_hint({"bounds": bounds, **doc_node})
 
@@ -830,7 +837,7 @@ def _node_to_ir(doc_node: Dict[str, Any], *,
         "id": _safe_name(doc_node.get("id")),
         "name": _safe_name(doc_node.get("name")),
         "type": _safe_name(doc_node.get("type")),
-        "visible": _bool(doc_node.get("visible"), True),
+        "visible": own_visible,
         "visible_effective": bool(eff_visible),
         "abs": abspos,
         "bounds": bounds,
@@ -841,9 +848,9 @@ def _node_to_ir(doc_node: Dict[str, Any], *,
         "stroke_alignment": stroke_align if strokes else "NONE",
         "radius": radius,
         "effects": effects,
-        "opacity": _round(op, 4),
+        "opacity": opacity,
         "blend_mode": doc_node.get("blendMode"),
-        "clips_content": _bool(doc_node.get("clipsContent"), False),
+        "clips_content": clips_here,
         "overflow": ov,
         "text": text,
         "icon": icon,
@@ -874,7 +881,6 @@ def _node_to_ir(doc_node: Dict[str, Any], *,
         "rawGradientHandles": raw_grad_handles or None
     }
 
-    # Audit text/ikon-status
     if ir["type"] == "TEXT":
         if not (text and (text.get("content") or "").strip()):
             _audit("text.final_reject", ir, reason="no_content_or_whitespace_only", note="TEXT-node saknar genererbar text",
@@ -884,7 +890,6 @@ def _node_to_ir(doc_node: Dict[str, Any], *,
         _audit("icon.final_accept", ir, name=icon.get("name"), tintable=icon.get("tintable"),
                color=icon.get("dominant_color"), bounds=icon.get("bounds"))
     else:
-        # logga varför inte ikon (hjälper tuning)
         b = ir["bounds"]
         _audit("icon.final_none", ir, reason="leaf_not_icon", hint_checks={
             "type_in_ICON_TYPES": ir["type"] in _ICON_TYPES,
@@ -893,10 +898,8 @@ def _node_to_ir(doc_node: Dict[str, Any], *,
             "size_typical": ICON_MIN <= int(round(b["w"])) <= ICON_MAX and ICON_MIN <= int(round(b["h"])) <= ICON_MAX
         })
 
-    # Rekursiv byggnad med clip-kedja
-    next_clip = _next_clip(ir, inherited_clip)
     for i, ch in enumerate(doc_node.get("children") or []):
-        ir["children"].append(_node_to_ir(ch, _z=i, inherited_clip=next_clip))
+        ir["children"].append(_node_to_ir(ch, _z=i, inherited_clip=next_clip, inherited_visible=eff_visible))
 
     return ir
 
@@ -915,7 +918,7 @@ def _extract_document_from_nodes_payload(payload: Dict[str, Any], node_id: str) 
 
 def figma_to_ir(figma_json: Dict[str, Any], node_id: str, *, viewport: Tuple[int,int]=(1280,800)) -> Dict[str, Any]:
     doc = _extract_document_from_nodes_payload(figma_json, node_id)
-    root_ir = _node_to_ir(doc, _z=0, inherited_clip=None)
+    root_ir = _node_to_ir(doc, _z=0, inherited_clip=None, inherited_visible=True)
     root_ir["debug"]["isRoot"] = True
 
     meta = {
@@ -940,7 +943,7 @@ def _reindex_order(n: Dict[str, Any]) -> None:
 def filter_visible_ir(ir_full: Dict[str, Any]) -> Dict[str, Any]:
     """
     Returnera ett nytt IR där endast effektivt synliga noder finns kvar.
-    Behåll containers som har minst ett synligt barn.
+    Behåll containers ENDAST om de har minst ett synligt barn.
     """
     def prune(n: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         kids: List[Dict[str, Any]] = []
@@ -950,7 +953,7 @@ def filter_visible_ir(ir_full: Dict[str, Any]) -> Dict[str, Any]:
                 kids.append(p)
 
         eff = bool(n.get("visible_effective", True))
-        keep = eff or len(kids) > 0 or n.get("type") in ("FRAME","GROUP","INSTANCE","COMPONENT","COMPONENT_SET")
+        keep = eff or len(kids) > 0
 
         if not keep:
             _audit("prune.drop", n, reason="not_visible_and_no_visible_children")

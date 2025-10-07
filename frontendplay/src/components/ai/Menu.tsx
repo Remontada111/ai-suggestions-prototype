@@ -1,54 +1,14 @@
 import React from 'react';
+import ProfileIcon from '/src/assets/icons/profile-e3007d.svg?url';
+import SeachIcon from '/src/assets/icons/seach-d3e495.svg?url';
+import ListManuIcon1 from '/src/assets/icons/list-manu-431220.svg?url';
+import ListManuIcon2 from '/src/assets/icons/list-manu-7e6007.svg?url';
+import ListManuIcon3 from '/src/assets/icons/list-manu-e89a96.svg?url';
+import ListManuIcon4 from '/src/assets/icons/list-manu-39c94c.svg?url';
+import BottomIcon from '/src/assets/icons/bottom-e2d2e9.svg?url';
 
 export function Menu() {
   return (
-    <div className="flex flex-col gap-[32px] pt-[24px] pr-[24px] pb-[32px] pl-[24px] items-start justify-between w-[251px] h-[736px] relative bg-[#000000] overflow-hidden z-[0]">
-<div className="flex flex-col gap-[44px] items-start justify-start w-[203px] h-[496px] relative z-[0]">
-<div className="flex flex-row gap-[12px] items-center justify-start w-[218px] h-[56px] relative z-[0]">
-<div className="w-[56px] h-[56px] relative bg-[#14ae5c] rounded-[16px] z-[0]" />
-<div className="flex flex-col items-start justify-center w-[150px] h-[41px] relative z-[1]" />
-</div>
-<div className="flex flex-col gap-[10px] pt-[16px] pr-[16px] pb-[16px] pl-[16px] items-start justify-center w-[218px] h-[56px] relative bg-[#1f1f22] rounded-[16px] z-[1]">
-<div className="flex flex-row gap-[16px] items-center justify-start w-[186px] h-[24px] relative z-[0]">
-<div className="w-[24px] h-[24px] relative z-[0]" />
-</div>
-</div>
-<div className="flex flex-col gap-[24px] items-start justify-start w-[218px] h-[296px] relative z-[2]">
-<div className="flex flex-col gap-[10px] pt-[16px] pr-[16px] pb-[16px] pl-[16px] items-start justify-start w-[218px] h-[56px] relative rounded-[8px] z-[0]">
-<div className="flex flex-row gap-[16px] items-center justify-start w-[186px] h-[24px] relative z-[0]">
-<div className="w-[24px] h-[24px] relative z-[0]" />
-</div>
-</div>
-<div className="flex flex-col gap-[10px] pt-[16px] pr-[16px] pb-[16px] pl-[16px] items-start justify-start w-[218px] h-[56px] relative rounded-[8px] z-[1]">
-<div className="flex flex-row gap-[16px] items-center justify-start w-[186px] h-[24px] relative z-[0]">
-<div className="w-[24px] h-[24px] relative z-[0]" />
-</div>
-</div>
-<div className="flex flex-col gap-[10px] pt-[16px] pr-[16px] pb-[16px] pl-[16px] items-start justify-start w-[218px] h-[56px] relative rounded-[8px] z-[2]">
-<div className="flex flex-row gap-[16px] items-center justify-start w-[186px] h-[24px] relative z-[0]">
-<div className="w-[24px] h-[24px] relative z-[0]" />
-</div>
-</div>
-<div className="flex flex-col gap-[10px] pt-[16px] pr-[16px] pb-[16px] pl-[16px] items-start justify-start w-[218px] h-[56px] relative rounded-[8px] z-[3]">
-<div className="flex flex-row gap-[16px] items-center justify-start w-[186px] h-[24px] relative z-[0]">
-<div className="w-[24px] h-[24px] relative z-[0]" />
-</div>
-</div>
-</div>
-</div>
-<div className="flex flex-col gap-[8px] items-start justify-start w-[203px] h-[56px] relative z-[1]">
-<div className="flex flex-col gap-[10px] pt-[16px] pr-[16px] pb-[16px] pl-[16px] items-start justify-start w-[218px] h-[56px] relative rounded-[8px] z-[0]">
-<div className="flex flex-row gap-[16px] items-center justify-start w-[186px] h-[24px] relative z-[0]">
-<div className="w-[24px] h-[24px] relative z-[0]" />
-</div>
-</div>
-</div>
-<div className="flex flex-row gap-[8px] pt-[16px] pr-[84px] pb-[16px] pl-[20px] items-center justify-between w-[218px] h-[56px] relative rounded-[8px] z-[1]">
-<div className="flex flex-row gap-[16px] items-center justify-start w-[124px] h-[24px] relative z-[0]">
-<div className="w-[24px] h-[24px] relative z-[0]" />
-</div>
-<div className="w-[56px] h-[32px] relative z-[1]" />
-</div>
-</div>
+    <div className="flex flex-col gap-[32px] pt-[24px] pr-[24px] pb-[32px] pl-[24px] items-start justify-between w-[251px] h-[736px] relative bg-[#000000] overflow-hidden z-[0]"><div className="flex flex-col gap-[44px] items-start justify-start w-[203px] h-[496px] relative z-[0]"><div className="flex flex-row gap-[12px] items-center justify-start w-[218px] h-[56px] relative z-[0]"><div className="w-[56px] h-[56px] relative bg-[#14ae5c] rounded-[16px] z-[0]" /><div className="flex flex-col items-start justify-center w-[150px] h-[41px] relative z-[1]"><div className="w-[150px] h-[22px] relative text-[#efefef] text-left text-[16px] font-700 leading-[21.79px] tracking-[0.0px] font-['Open_Sans'] z-[0]">Duck UI</div><div className="w-[150px] h-[19px] relative text-[#c0bfbd] text-left text-[14px] font-400 leading-[19.07px] tracking-[0.0px] font-['Open_Sans'] z-[1]">Duckui@demo.com</div></div><img src={ProfileIcon} alt="" aria-hidden="true" width={218} height={56} className="inline-block align-middle" /></div><div className="flex flex-col gap-[10px] pt-[16px] pr-[16px] pb-[16px] pl-[16px] items-start justify-center w-[218px] h-[56px] relative bg-[#1f1f22] rounded-[16px] z-[1]"><div className="flex flex-row gap-[16px] items-center justify-start w-[186px] h-[24px] relative z-[0]"><div className="w-[24px] h-[24px] relative z-[0]"><div className="w-[14px] h-[14px] relative z-[0]" /><div className="w-[3.5px] h-[3.5px] relative rotate-[0.79deg] z-[1]" /></div><div className="w-[146px] h-[22px] relative text-[#efefef] text-left text-[16px] font-400 leading-[22.4px] tracking-[0.0px] font-['Open_Sans'] z-[1]">Search...</div></div><img src={SeachIcon} alt="" aria-hidden="true" width={218} height={56} className="inline-block align-middle" /></div><div className="flex flex-col gap-[24px] items-start justify-start w-[218px] h-[296px] relative z-[2]"><div className="flex flex-col gap-[10px] pt-[16px] pr-[16px] pb-[16px] pl-[16px] items-start justify-start w-[218px] h-[56px] relative rounded-[8px] z-[0]"><div className="flex flex-row gap-[16px] items-center justify-start w-[186px] h-[24px] relative z-[0]"><div className="w-[24px] h-[24px] relative z-[0]"><div className="w-[18px] h-[19px] relative z-[0]" /></div><div className="w-[83px] h-[22px] relative text-[#efefef] text-left text-[16px] font-400 leading-[22.4px] tracking-[0.0px] font-['Open_Sans'] z-[1]">Dashboard</div></div><img src={ListManuIcon1} alt="" aria-hidden="true" width={218} height={56} className="inline-block align-middle" /></div><div className="flex flex-col gap-[10px] pt-[16px] pr-[16px] pb-[16px] pl-[16px] items-start justify-start w-[218px] h-[56px] relative rounded-[8px] z-[1]"><div className="flex flex-row gap-[16px] items-center justify-start w-[186px] h-[24px] relative z-[0]"><div className="w-[24px] h-[24px] relative overflow-hidden z-[0]"><div className="w-[18px] h-[20px] relative z-[0]" /></div><div className="w-[98px] h-[22px] relative text-[#efefef] text-left text-[16px] font-400 leading-[22.4px] tracking-[0.0px] font-['Open_Sans'] z-[1]">Ad Optimizer</div></div><img src={ListManuIcon2} alt="" aria-hidden="true" width={218} height={56} className="inline-block align-middle" /></div><div className="flex flex-col gap-[10px] pt-[16px] pr-[16px] pb-[16px] pl-[16px] items-start justify-start w-[218px] h-[56px] relative rounded-[8px] z-[2]"><div className="flex flex-row gap-[16px] items-center justify-start w-[186px] h-[24px] relative z-[0]"><div className="w-[24px] h-[24px] relative z-[0] bg-[#aff4c6]" /><div className="w-[86px] h-[22px] relative text-[#efefef] text-left text-[16px] font-400 leading-[22.4px] tracking-[0.0px] font-['Open_Sans'] z-[1]">AI Assistant</div></div><img src={ListManuIcon3} alt="" aria-hidden="true" width={218} height={56} className="inline-block align-middle" /></div><div className="flex flex-col gap-[10px] pt-[16px] pr-[16px] pb-[16px] pl-[16px] items-start justify-start w-[218px] h-[56px] relative rounded-[8px] z-[3]"><div className="flex flex-row gap-[16px] items-center justify-start w-[186px] h-[24px] relative z-[0]"><div className="w-[24px] h-[24px] relative z-[0]"><div className="w-[20px] h-[20px] relative rounded-[0.5px] z-[1]" /><div className="w-[8px] h-[8px] relative rounded-[0.5px] z-[1]" /></div><div className="w-[66px] h-[22px] relative text-[#efefef] text-left text-[16px] font-400 leading-[22.4px] tracking-[0.0px] font-['Open_Sans'] z-[1]">Analytics</div></div><img src={ListManuIcon4} alt="" aria-hidden="true" width={218} height={56} className="inline-block align-middle" /></div></div></div><div className="flex flex-col gap-[8px] items-start justify-start w-[203px] h-[56px] relative z-[1]"><div className="flex flex-col gap-[10px] pt-[16px] pr-[16px] pb-[16px] pl-[16px] items-start justify-start w-[218px] h-[56px] relative rounded-[8px] z-[0]"><div className="flex flex-row gap-[16px] items-center justify-start w-[186px] h-[24px] relative z-[0]"><div className="w-[24px] h-[24px] relative z-[0]"><div className="w-[20.1px] h-[20px] relative bg-[#aff4c6] z-[0]" /></div><div className="w-[60px] h-[22px] relative text-[#efefef] text-left text-[16px] font-400 leading-[22.4px] tracking-[0.0px] font-['Open_Sans'] z-[1]">Settings</div></div><img src={BottomIcon} alt="" aria-hidden="true" width={203} height={56} className="inline-block align-middle" /></div></div></div>
   );
 }

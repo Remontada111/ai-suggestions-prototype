@@ -1,6 +1,12 @@
+# backend/tasks/codegen.py
 from __future__ import annotations
 """
 Celery-worker: Figma-node → IR → LLM-förslag → (AST-mount + file) → validering → commit → returnera ändringar
+
+Uppdateringar:
+- Textkrav byggs enbart från IR-noder där visible_effective=True.
+- Tailwind-hints (tw_map) inkluderas i payloaden till modellen.
+- Mått/position-validering är mer tolerant och visar tydlig nodinfo.
 """
 
 import hashlib
@@ -251,6 +257,9 @@ def _rect_intersect(a: Dict[str, float] | None, b: Dict[str, float] | None) -> D
         return None
     return {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1}
 
+def _next_clip_ir(n: Dict[str, Any], clip: Dict[str, float] | None) -> Dict[str, float] | None:
+    return _rect_intersect(clip, n.get("bounds")) if n.get("clips_content") else clip
+
 # ─────────────────────────────────────────────────────────
 # Ikon-export (SVG) via Figma Images API
 # ─────────────────────────────────────────────────────────
@@ -287,7 +296,7 @@ def _fetch_svgs(file_key: str, ids: List[str]) -> Dict[str, str]:
     return out
 
 # ─────────────────────────────────────────────────────────
-# Text-extraktion ur IR (synliga noder) + normalisering
+# Text-extraktion ur IR (ENBART visible_effective)
 # ─────────────────────────────────────────────────────────
 
 _WS = re.compile(r"\s+")
@@ -314,6 +323,10 @@ def _canon_text_lines(s: str | None) -> list[str]:
     return [p for p in parts if p]
 
 def _effectively_visible_ir(n: Dict[str, Any], clip: Dict[str, float] | None) -> bool:
+    # Primärt: använd IR-flaggan om den finns
+    if isinstance(n.get("visible_effective"), bool):
+        return bool(n["visible_effective"])
+    # Fallback om äldre IR saknar flaggan
     if not n.get("visible", True):
         return False
     try:
@@ -326,25 +339,10 @@ def _effectively_visible_ir(n: Dict[str, Any], clip: Dict[str, float] | None) ->
         return True
     return _rect_intersect(clip, b) is not None
 
-def _next_clip_ir(n: Dict[str, Any], clip: Dict[str, float] | None) -> Dict[str, float] | None:
-    if n.get("clips_content"):
-        b = n.get("bounds")
-        if isinstance(b, dict):
-            return _rect_intersect(clip, b) if clip else b
-    return clip
+# === A) Ersatt textinsamling enligt krav =================
 
-def _collect_visible_texts(n: Dict[str, Any], out: List[str], clip: Dict[str, float] | None) -> None:
-    next_clip = _next_clip_ir(n, clip)
-    if n.get("type") == "TEXT":
-        if not _effectively_visible_ir(n, clip):
-            return
-        if not n.get("visible", True):
-            return
-        try:
-            if float(n.get("opacity", 1) or 1) <= 0.01:
-                return
-        except Exception:
-            pass
+def _collect_visible_texts(n: Dict[str, Any], out: List[str]) -> None:
+    if n.get("type") == "TEXT" and bool(n.get("visible_effective", True)):
         tnode = (n.get("text") or {})
         lines = tnode.get("lines") or []
         if lines:
@@ -358,12 +356,11 @@ def _collect_visible_texts(n: Dict[str, Any], out: List[str], clip: Dict[str, fl
                 if nm:
                     out.append(nm)
     for ch in n.get("children", []) or []:
-        _collect_visible_texts(ch, out, next_clip)
+        _collect_visible_texts(ch, out)
 
 def _required_texts(ir: Dict[str, Any]) -> List[str]:
     acc: List[str] = []
-    root = ir["root"]
-    _collect_visible_texts(root, acc, None)
+    _collect_visible_texts(ir["root"], acc)
     seen: set[str] = set()
     out: List[str] = []
     for s in acc:
@@ -390,12 +387,16 @@ def _build_messages(
     except Exception:
         overview = {name: str(path) for name, path in components.items()}
 
+    # === B) Tailwind-hints till modellen ==================
+    tw_map = FIR.build_tailwind_map(ir["root"])
+
     user_payload = {
         "ir": ir,
         "components": overview,
         "placement": placement or {},
         "icon_assets": icon_assets,
         "required_texts": _required_texts(ir),
+        "tw_map": tw_map,  # nytt
         "constraints": {
             "framework": "react+vite",
             "mount_anchor": "AI-INJECT-MOUNT",
@@ -641,7 +642,13 @@ def _visual_validate(repo_root: Path) -> Dict[str, Any] | None:
 
 _TRIPLE_BACKTICKS = re.compile(r"```")
 _CLS_RE = re.compile(r'className\s*=\s*(?P<q>"|\')(?P<val>.*?)(?P=q)', re.DOTALL)
-_TEXT_NODE = re.compile(r">\s*([^<>{}][^<>{}]*)\s*<")
+
+# Fångar text mellan taggar ELLER strängar inuti braces: {"…"} | {'…'} | {`…`}
+_TEXT_NODE_ANY = re.compile(
+    r">\s*(?:\{\s*(?:`([^`]+)`|\"([^\"]+)\"|'([^']+)')\s*\}|([^<>{}][^<>{}]*))\s*<",
+    re.DOTALL,
+)
+_TEXT_NODE_ANY_BETWEEN = _TEXT_NODE_ANY
 
 def _px(x: Any | None) -> str | None:
     if x is None:
@@ -657,7 +664,9 @@ def _px(x: Any | None) -> str | None:
 def _bool(x: Any, default=False) -> bool:
     if isinstance(x, bool):
         return x
-    if x in (0, "0", "false", "False", None):
+    if x is None:
+        return default
+    if x in (0, "0", "false", "False"):
         return False
     if x in (1, "1", "true", "True"):
         return True
@@ -681,23 +690,57 @@ def _sanitize_tailwind_conflicts(src: str) -> str:
     return _CLS_RE.sub(fix, src)
 
 _SVG_META = re.compile(r"<\s*(title|desc)\b[^>]*>.*?<\s*/\s*\1\s*>", re.IGNORECASE | re.DOTALL)
-_TEXT_NODE_BETWEEN = re.compile(r">\s*([^<>{}][^<>{}]*)\s*<", re.DOTALL)
 
 def _strip_svg_meta(src: str) -> str:
     return _SVG_META.sub("", src)
 
+# Attribut (placeholder/aria-label/title/alt) – stöd för "…", '…' och {"…"}
+_ATTR_PATTERNS = [
+    r'placeholder\s*=\s*"([^"]+)"',
+    r"placeholder\s*=\s*'([^']+)'",
+    r'placeholder\s*=\s*\{\s*"([^"]+)"\s*\}',
+    r"placeholder\s*=\s*\{\s*'([^']+)'\s*\}",
+    r'aria-label\s*=\s*"([^"]+)"',
+    r"aria-label\s*=\s*'([^']+)'",
+    r'aria-label\s*=\s*\{\s*"([^"]+)"\s*\}',
+    r"aria-label\s*=\s*\{\s*'([^']+)'\s*\}",
+    r'title\s*=\s*"([^"]+)"',
+    r"title\s*=\s*'([^']+)'",
+    r'title\s*=\s*\{\s*"([^"]+)"\s*\}',
+    r"title\s*=\s*\{\s*'([^']+)'\s*\}",
+    r'alt\s*=\s*"([^"]+)"',
+    r"alt\s*=\s*'([^']+)'",
+    r'alt\s*=\s*\{\s*"([^"]+)"\s*\}',
+]
+
+def _extract_attr_texts(src: str) -> List[str]:
+    out: List[str] = []
+    for pat in _ATTR_PATTERNS:
+        for m in re.finditer(pat, src, flags=re.IGNORECASE | re.DOTALL):
+            val = m.group(1)
+            out.extend(_canon_text_lines(val))
+    return [_canon_text(p).replace("\u2026", "...") for p in out if 0 < len(p) <= 80]
+
 def _purge_unexpected_text_nodes(src: str, allowed: List[str]) -> str:
     allowed_norm = {_norm_key(a) for a in allowed}
     def repl(m: re.Match) -> str:
-        txt = _canon_text(m.group(1)).replace("\u2026","...")
-        return m.group(0) if _norm_key(txt) in allowed_norm else m.group(0).replace(m.group(1), "")
-    return _TEXT_NODE_BETWEEN.sub(repl, src)
+        txt = ""
+        for g in m.groups():
+            if g is not None:
+                txt = _canon_text(g).replace("\u2026","...")
+                break
+        if _norm_key(txt) in allowed_norm:
+            return m.group(0)
+        return "><"
+    return _TEXT_NODE_ANY_BETWEEN.sub(repl, src)
 
 def _extract_jsx_text(src: str) -> List[str]:
     parts: List[str] = []
-    for m in _TEXT_NODE.finditer(src):
-        raw = m.group(1)
-        parts.extend(_canon_text_lines(raw))
+    for m in _TEXT_NODE_ANY.finditer(src):
+        for g in m.groups():
+            if g is not None:
+                parts.extend(_canon_text_lines(g))
+                break
     return [_canon_text(p).replace("\u2026", "...") for p in parts if 0 < len(p) <= 80]
 
 def _assert_no_extra_texts(ir: Dict[str, Any], file_code: str) -> None:
@@ -710,7 +753,7 @@ def _assert_no_extra_texts(ir: Dict[str, Any], file_code: str) -> None:
 
 def _assert_text_coverage(ir: Dict[str, Any], file_code: str) -> None:
     exp_raw = _required_texts(ir)
-    found_raw = _extract_jsx_text(file_code)
+    found_raw = _extract_jsx_text(file_code) + _extract_attr_texts(file_code)
     found = {_norm_key(t) for t in found_raw}
     missing = [t for t in exp_raw if _norm_key(t) not in found]
     if missing:
@@ -719,30 +762,83 @@ def _assert_text_coverage(ir: Dict[str, Any], file_code: str) -> None:
 def _gather_classes(file_code: str) -> str:
     return " ".join(m.group("val") for m in _CLS_RE.finditer(file_code))
 
+# === C) Ny tolerant dimensions/positions-validering ======
+
 def _assert_dims_positions(ir: Dict[str, Any], file_code: str) -> None:
     classes = _gather_classes(file_code)
 
-    def need(px, key):
-        s = _px(px)
-        return f"{key}-[{s}]" if s else None
+    def _px_s(x: Any | None) -> str | None:
+        if x is None: return None
+        try:
+            fx = float(x)
+            return f"{int(round(fx))}px" if abs(fx - round(fx)) < 1e-6 else f"{round(fx,2)}px"
+        except Exception:
+            return None
+
+    def _any(tokens: List[str]) -> bool:
+        return any(tok in classes for tok in tokens if tok)
+
+    def _need_w(px: Any | None) -> List[str]:
+        s = _px_s(px)
+        return [] if not s else [f"w-[{s}]", f"min-w-[{s}]", f"max-w-[{s}]", f"basis-[{s}]"]
+
+    def _need_h(px: Any | None) -> List[str]:
+        s = _px_s(px)
+        return [] if not s else [f"h-[{s}]", f"min-h-[{s}]", f"max-h-[{s}]"]
+
+    def _need_left(px: Any | None) -> List[str]:
+        s = _px_s(px)
+        return [] if not s else [f"left-[{s}]"]
+
+    def _need_top(px: Any | None) -> List[str]:
+        s = _px_s(px)
+        return [] if not s else [f"top-[{s}]"]
 
     def rec(n: Dict[str,Any], clip: Dict[str, float] | None):
-        if not _effectively_visible_ir(n, clip):
+        if not bool(n.get("visible_effective", True)):
             return
+
         b = n.get("bounds") or {}
-        if b:
-            for tok in filter(None, [need(b.get("w"), "w"), need(b.get("h"), "h")]):
-                if tok and tok not in classes:
-                    raise HTTPException(500, f"Saknar klass {tok}")
+        nid = n.get("id"); nname = n.get("name"); ntype = n.get("type")
+
+        w_tokens = _need_w(b.get("w"))
+        if w_tokens and not _any(w_tokens):
+            raise HTTPException(
+                500,
+                f"Saknar breddklass {w_tokens[0]} (alternativ: {', '.join(w_tokens)}) "
+                f"för node id={nid} name={nname} type={ntype} bounds={b}"
+            )
+        h_tokens = _need_h(b.get("h"))
+        if h_tokens and not _any(h_tokens):
+            raise HTTPException(
+                500,
+                f"Saknar höjdklass {h_tokens[0]} (alternativ: {', '.join(h_tokens)}) "
+                f"för node id={nid} name={nname} type={ntype} bounds={b}"
+            )
+
         if n.get("abs"):
-            for tok in filter(None, [need(b.get("x"), "left"), need(b.get("y"), "top")]):
-                if tok and tok not in classes:
-                    raise HTTPException(500, f"Saknar klass {tok}")
+            l_tokens = _need_left(b.get("x"))
+            if l_tokens and not _any(l_tokens):
+                raise HTTPException(
+                    500,
+                    f"Saknar positionsklass {l_tokens[0]} för node id={nid} name={nname} type={ntype} bounds={b}"
+                )
+            t_tokens = _need_top(b.get("y"))
+            if t_tokens and not _any(t_tokens):
+                raise HTTPException(
+                    500,
+                    f"Saknar positionsklass {t_tokens[0]} för node id={nid} name={nname} type={ntype} bounds={b}"
+                )
+
         next_clip = _next_clip_ir(n, clip)
         for ch in n.get("children") or []:
             rec(ch, next_clip)
 
     rec(ir["root"], None)
+
+# ─────────────────────────────────────────────────────────
+# Färger, skuggor, gradients
+# ─────────────────────────────────────────────────────────
 
 def _hex_to_rgba_str(hex_col: str, a: float) -> str:
     r = int(hex_col[1:3],16); g = int(hex_col[3:5],16); b = int(hex_col[5:7],16)
@@ -784,6 +880,10 @@ def _assert_colors_shadows_and_gradients(ir: Dict[str, Any], file_code: str) -> 
             rec(ch, next_clip)
 
     rec(ir["root"], None)
+
+# ─────────────────────────────────────────────────────────
+# Typografi
+# ─────────────────────────────────────────────────────────
 
 def _assert_typography(ir: Dict[str, Any], file_code: str) -> None:
     classes = _gather_classes(file_code)
