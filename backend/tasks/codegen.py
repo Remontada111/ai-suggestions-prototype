@@ -4,9 +4,17 @@ from __future__ import annotations
 Celery-worker: Figma-node → IR → LLM-förslag → (AST-mount + file) → validering → commit → returnera ändringar
 
 Uppdateringar:
-- Textkrav byggs enbart från IR-noder där visible_effective=True.
-- Tailwind-hints (tw_map) inkluderas i payloaden till modellen.
-- Mått/position-validering är mer tolerant och visar tydlig nodinfo.
+- Endast synlig text (visible_effective=True) byggs till textkrav.
+- Tailwind-hints (tw_map) skickas till modellen.
+- Tolerant men informativ validering för mått/position.
+- Ikonexporten filtrerar bort containers och SVG:er som innehåller <text>/<tspan> eller orimliga mått/aspekt.
+- Dims/pos-validering körs mot klippkedja och respekterar effektiv synlighet.
+- Validering kräver font-family-klass i JSX enligt Figma (arbitrary value), inkl. korrekt escaping.
+
+Nytt i denna version:
+- Ikonprompten kräver import av varje ikon och exakt en <img> per ikon, utan absoluta left/top.
+- Ikonvalideringen accepterar både absoluta (/src/...) och relativa imports, validerar storlek och exakt en användning, men ignorerar position.
+- Sanering tar bort felaktiga left-/top-/absolute-klasser på <img> så ikoner inte hamnar utanför vyn.
 """
 
 import hashlib
@@ -58,6 +66,8 @@ STRICT_ICONS = os.getenv("STRICT_ICONS", "true").lower() in ("1", "true", "yes")
 
 ICON_MIN = int(os.getenv("ICON_MIN", "12"))
 ICON_MAX = int(os.getenv("ICON_MAX", "256"))
+ICON_AR_MIN = float(os.getenv("ICON_AR_MIN", "0.75"))
+ICON_AR_MAX = float(os.getenv("ICON_AR_MAX", "1.33"))
 
 FIGMA_TOKEN: str | None = os.getenv("FIGMA_TOKEN")
 if not FIGMA_TOKEN:
@@ -323,10 +333,8 @@ def _canon_text_lines(s: str | None) -> list[str]:
     return [p for p in parts if p]
 
 def _effectively_visible_ir(n: Dict[str, Any], clip: Dict[str, float] | None) -> bool:
-    # Primärt: använd IR-flaggan om den finns
     if isinstance(n.get("visible_effective"), bool):
         return bool(n["visible_effective"])
-    # Fallback om äldre IR saknar flaggan
     if not n.get("visible", True):
         return False
     try:
@@ -339,7 +347,7 @@ def _effectively_visible_ir(n: Dict[str, Any], clip: Dict[str, float] | None) ->
         return True
     return _rect_intersect(clip, b) is not None
 
-# === A) Ersatt textinsamling enligt krav =================
+# === A) Textinsamling enligt krav ========================
 
 def _collect_visible_texts(n: Dict[str, Any], out: List[str]) -> None:
     if n.get("type") == "TEXT" and bool(n.get("visible_effective", True)):
@@ -373,6 +381,32 @@ def _required_texts(ir: Dict[str, Any]) -> List[str]:
     return out
 
 # ─────────────────────────────────────────────────────────
+# SVG-säkerhet / ikonfiltrering
+# ─────────────────────────────────────────────────────────
+
+_SVG_HAS_TEXT_RE = re.compile(r"<\s*(?:text|tspan|textPath)\b", re.IGNORECASE)
+_SVG_FONT_RE = re.compile(r"\bfont-(?:family|size|weight)\s*:", re.IGNORECASE)
+
+def _svg_has_text(svg: str) -> bool:
+    if not isinstance(svg, str):
+        return False
+    if _SVG_HAS_TEXT_RE.search(svg):
+        return True
+    if _SVG_FONT_RE.search(svg):
+        return True
+    return False
+
+def _aspect_ok(w: float, h: float) -> bool:
+    if w <= 0 or h <= 0:
+        return False
+    r = float(w) / float(h)
+    return ICON_AR_MIN <= r <= ICON_AR_MAX
+
+def _icon_size_ok(w: float, h: float) -> bool:
+    iw, ih = int(round(w or 0)), int(round(h or 0))
+    return (ICON_MIN <= iw <= ICON_MAX) and (ICON_MIN <= ih <= ICON_MAX) and _aspect_ok(iw, ih)
+
+# ─────────────────────────────────────────────────────────
 # LLM-prompt
 # ─────────────────────────────────────────────────────────
 
@@ -387,7 +421,7 @@ def _build_messages(
     except Exception:
         overview = {name: str(path) for name, path in components.items()}
 
-    # === B) Tailwind-hints till modellen ==================
+    # Tailwind-hints till modellen
     tw_map = FIR.build_tailwind_map(ir["root"])
 
     user_payload = {
@@ -396,7 +430,7 @@ def _build_messages(
         "placement": placement or {},
         "icon_assets": icon_assets,
         "required_texts": _required_texts(ir),
-        "tw_map": tw_map,  # nytt
+        "tw_map": tw_map,
         "constraints": {
             "framework": "react+vite",
             "mount_anchor": "AI-INJECT-MOUNT",
@@ -412,15 +446,14 @@ def _build_messages(
         "Inga extra texter, inga extra ikoner, inga wrappers utöver vad som krävs för exakt layout. "
         "Inga inline-styles, ingen farlig HTML, inga design-tokens; använd Tailwind med godtyckliga värden. "
         "ALLA visuella värden ska uttryckas explicit som Tailwind arbitrary utilities: "
-        "bredd/height/left/top/gap/padding som w-[NNpx]/h-[NNpx]/left-[NNpx]/top-[NNpx]/gap-[NNpx]/pt-[..] osv, "
-        "fontstorlek text-[NNpx], line-height leading-[NNpx], letter-spacing tracking-[NNpx] eller procent, "
-        "färger text-[#RRGGBB] eller text-[rgba(...)] och bg-[#RRGGBB]/bg-[rgba(...)] eller bg-[linear-gradient(...)], "
-        "skuggor shadow-[offsets blur spread rgba], hörn rounded-[NNpx] eller per-hörn, border border-[NNpx] och border-[#RRGGBB]. "
-        "Ikoner: importera EXAKT de givna 'icon_assets' som URL med '?url' och rendera <img src={...} alt='' aria-hidden='true' "
-        "width={w} height={h} className='inline-block align-middle'/> exakt en gång per ikon. Ändra aldrig SVG-innehåll. "
-        "Teman: lägg inte till tema-switchar eller text som 'Light mode'. "
+        "w-[NNpx]/h-[NNpx]/gap-[NNpx]/pt-[..], text-[NNpx], leading-[NNpx], tracking-[..], "
+        "färger text-[#RRGGBB]/bg-[#RRGGBB] eller rgba, skuggor shadow-[...], hörn rounded-[..], border-[..]. "
+        "IKONER: För VARJE post i 'icon_assets' måste du importera exakt import_path med suffix '?url' "
+        "och rendera exakt EN <img> per ikon med: src={ImportVar} alt='' aria-hidden='true' "
+        "width={w} height={h} className='inline-block align-middle w-[{w}px] h-[{h}px]'. "
+        "Använd inte absoluta left/top för ikoner i flex-rader; ikonen placeras i rätt rad enligt IR-strukturen. "
         "JSX får endast innehålla texterna i 'required_texts' ordagrant. "
-        "För TEXT-noder: om 'text.lines' finns ska varje rad renderas separat; slå aldrig ihop rader. "
+        "För TEXT-noder: om 'text.lines' finns ska varje rad renderas separat. "
         "Rendera barn i stigande 'z' (barnens index). "
         "Skapa/uppdatera alltid en komponentfil (mode='file') i target_component_dir och montera via 'mount'; patch är förbjudet. "
         "Skriv aldrig ``` i något fält."
@@ -643,7 +676,6 @@ def _visual_validate(repo_root: Path) -> Dict[str, Any] | None:
 _TRIPLE_BACKTICKS = re.compile(r"```")
 _CLS_RE = re.compile(r'className\s*=\s*(?P<q>"|\')(?P<val>.*?)(?P=q)', re.DOTALL)
 
-# Fångar text mellan taggar ELLER strängar inuti braces: {"…"} | {'…'} | {`…`}
 _TEXT_NODE_ANY = re.compile(
     r">\s*(?:\{\s*(?:`([^`]+)`|\"([^\"]+)\"|'([^']+)')\s*\}|([^<>{}][^<>{}]*))\s*<",
     re.DOTALL,
@@ -677,24 +709,46 @@ def _sanitize_tailwind_conflicts(src: str) -> str:
         q = m.group("q")
         cls = m.group("val")
 
+        # Om border-[..] finns, ta bort generisk 'border'
         if re.search(r'\bborder-\[[0-9.]+px\]', cls):
             cls = re.sub(r'(?<!-)\bborder\b', '', cls)
 
+        # Om absolute finns, ta bort 'relative'
         if re.search(r'\babsolute\b', cls):
             cls = re.sub(r'\brelative\b', '', cls)
 
+        # Ta bort ogiltiga negativa arbitrary util-klasser
         cls = re.sub(r'(^|\s)-\[[^\]]+\]', ' ', cls)
+
         cls = re.sub(r'\s+', ' ', cls).strip()
         return f'className={q}{cls}{q}'
 
     return _CLS_RE.sub(fix, src)
+
+# Endast för <img>: ta bort left-/top-/absolute så ikoner inte placeras utanför vyn
+_IMG_WITH_CLASS = re.compile(
+    r'(<img\b[^>]*\bclassName\s*=\s*)(?P<q>"|\')(?P<cls>.*?)(?P=q)(?P<tail>[^>]*>)',
+    re.IGNORECASE | re.DOTALL,
+)
+
+def _sanitize_img_positions(src: str) -> str:
+    def repl(m: re.Match) -> str:
+        q = m.group("q")
+        cls = m.group("cls") or ""
+        cls = re.sub(r'\bleft-\[[^\]]+\]', '', cls)
+        cls = re.sub(r'\btop-\[[^\]]+\]', '', cls)
+        cls = re.sub(r'\babsolute\b', '', cls)
+        cls = re.sub(r'\brelative\b', '', cls)
+        cls = re.sub(r'\s+', ' ', cls).strip()
+        return f"{m.group(1)}{q}{cls}{q}{m.group('tail')}"
+    return _IMG_WITH_CLASS.sub(repl, src)
+
 
 _SVG_META = re.compile(r"<\s*(title|desc)\b[^>]*>.*?<\s*/\s*\1\s*>", re.IGNORECASE | re.DOTALL)
 
 def _strip_svg_meta(src: str) -> str:
     return _SVG_META.sub("", src)
 
-# Attribut (placeholder/aria-label/title/alt) – stöd för "…", '…' och {"…"}
 _ATTR_PATTERNS = [
     r'placeholder\s*=\s*"([^"]+)"',
     r"placeholder\s*=\s*'([^']+)'",
@@ -703,11 +757,11 @@ _ATTR_PATTERNS = [
     r'aria-label\s*=\s*"([^"]+)"',
     r"aria-label\s*=\s*'([^']+)'",
     r'aria-label\s*=\s*\{\s*"([^"]+)"\s*\}',
-    r"aria-label\s*=\s*\{\s*'([^']+)'\s*\}",
+    r"aria-label\s*=\s*\{\s*'([^']+)" r"'\s*\}",
     r'title\s*=\s*"([^"]+)"',
     r"title\s*=\s*'([^']+)'",
     r'title\s*=\s*\{\s*"([^"]+)"\s*\}',
-    r"title\s*=\s*\{\s*'([^']+)'\s*\}",
+    r"title\s*=\s*\{\s*'([^']+)" r"'\s*\}",
     r'alt\s*=\s*"([^"]+)"',
     r"alt\s*=\s*'([^']+)'",
     r'alt\s*=\s*\{\s*"([^"]+)"\s*\}',
@@ -762,7 +816,7 @@ def _assert_text_coverage(ir: Dict[str, Any], file_code: str) -> None:
 def _gather_classes(file_code: str) -> str:
     return " ".join(m.group("val") for m in _CLS_RE.finditer(file_code))
 
-# === C) Ny tolerant dimensions/positions-validering ======
+# === C) Dimensions/positions-validering ==================
 
 def _assert_dims_positions(ir: Dict[str, Any], file_code: str) -> None:
     classes = _gather_classes(file_code)
@@ -795,7 +849,10 @@ def _assert_dims_positions(ir: Dict[str, Any], file_code: str) -> None:
         return [] if not s else [f"top-[{s}]"]
 
     def rec(n: Dict[str,Any], clip: Dict[str, float] | None):
+        # NYTT: respektera effektiv synlighet och viewport-clip
         if not bool(n.get("visible_effective", True)):
+            return
+        if not _effectively_visible_ir(n, clip):
             return
 
         b = n.get("bounds") or {}
@@ -834,7 +891,10 @@ def _assert_dims_positions(ir: Dict[str, Any], file_code: str) -> None:
         for ch in n.get("children") or []:
             rec(ch, next_clip)
 
-    rec(ir["root"], None)
+    # NYTT: använd viewport-clip från IR debug om tillgängligt
+    root = cast(Dict[str, Any], ir.get("root") or {})
+    root_clip = cast(Dict[str, float] | None, (root.get("debug") or {}).get("rootClip") or root.get("bounds"))
+    rec(root, root_clip)
 
 # ─────────────────────────────────────────────────────────
 # Färger, skuggor, gradients
@@ -882,7 +942,7 @@ def _assert_colors_shadows_and_gradients(ir: Dict[str, Any], file_code: str) -> 
     rec(ir["root"], None)
 
 # ─────────────────────────────────────────────────────────
-# Typografi
+# Typografi (inkl. krav på font-family)
 # ─────────────────────────────────────────────────────────
 
 def _assert_typography(ir: Dict[str, Any], file_code: str) -> None:
@@ -896,30 +956,55 @@ def _assert_typography(ir: Dict[str, Any], file_code: str) -> None:
         cand = [map_std.get(weight,""), f"font-[{weight}]", f"font-{weight}"]
         return [c for c in cand if c]
 
+    def _escape_font_name(s: str) -> str:
+        return s.replace("\\","\\\\").replace("'","\\'").replace("]","\\]")
+
+    def _have_any(candidates: List[str]) -> bool:
+        return any(c in classes for c in candidates if c)
+
     def rec(n: Dict[str,Any], clip: Dict[str, float] | None):
         if not _effectively_visible_ir(n, clip):
             return
         if n.get("type") == "TEXT":
             st = (n.get("text") or {}).get("style") or {}
+
             fs = st.get("fontSize")
             if isinstance(fs, (int, float)):
                 want = f"text-[{_px(fs)}]"
                 if want not in classes:
                     raise HTTPException(500, f"Saknar fontstorleksklass {want}")
+
             lh = st.get("lineHeight")
             if isinstance(lh, str) and lh.endswith("px"):
                 want = f"leading-[{lh}]"
                 if want not in classes:
                     raise HTTPException(500, f"Saknar line-height klass {want}")
+
             ls = st.get("letterSpacing")
             if isinstance(ls, str) and len(ls) > 0:
                 want = f"tracking-[{ls}]"
                 if want not in classes:
                     raise HTTPException(500, f"Saknar letter-spacing klass {want}")
+
             fw = st.get("fontWeight")
             if isinstance(fw, int) and fw in range(100, 1000, 100):
-                if not any(w in classes for w in weight_ok(fw)):
+                if not _have_any(weight_ok(fw)):
                     raise HTTPException(500, f"Saknar font-weight klass för {fw}")
+
+            fam = st.get("fontFamily")
+            if isinstance(fam, str) and fam.strip():
+                fam_trim = fam.strip()
+                fam_space = _escape_font_name(fam_trim)
+                fam_us = _escape_font_name(fam_trim.replace(" ", "_"))
+                want_candidates = [
+                    f"font-['{fam_space}']",
+                    f'font-["{fam_space}"]',
+                    f"font-['{fam_us}']",
+                    f'font-["{fam_us}"]',
+                ]
+                if not _have_any(want_candidates):
+                    raise HTTPException(500, f"Saknar font-family klass för '{fam_trim}'")
+
         next_clip = _next_clip_ir(n, clip)
         for ch in n.get("children") or []:
             rec(ch, next_clip)
@@ -955,10 +1040,20 @@ _NUM_IN_ATTR = re.compile(
     r"(width|height)\s*=\s*(?:\{\s*([0-9]+)\s*\}|['\"]\s*([0-9]+)\s*['\"])",
     re.IGNORECASE | re.DOTALL,
 )
+_CLS_IN_TAG = re.compile(
+    r'className\s*=\s*(?:"([^"]+)"|\'([^\']+)\')',
+    re.IGNORECASE | re.DOTALL,
+)
 
 def _assert_icons_used(file_code: str, icon_assets: List[Dict[str, Any]]) -> None:
     if not icon_assets:
         return
+
+    def _same_path(u: str, exp: str) -> bool:
+        u0 = u.split("?")[0].replace("\\", "/")
+        e0 = exp.split("?")[0].replace("\\", "/")
+        tail = e0.split("/src/", 1)[-1]
+        return u0.endswith(e0) or u0.endswith(tail) or u0.endswith("./" + tail) or u0.endswith("/" + tail)
 
     imports = {m.group(1): m.group(2) for m in _IMG_IMPORT.finditer(file_code)}
     used_vars: set[str] = set()
@@ -989,7 +1084,7 @@ def _assert_icons_used(file_code: str, icon_assets: List[Dict[str, Any]]) -> Non
     expected = {ia["import_path"] for ia in icon_assets}
 
     for p in all_svg_import_paths:
-        if not any(p.endswith(e) or p.endswith(e + "?url") for e in expected):
+        if not any(_same_path(p, e) for e in expected):
             unexpected_paths.append(p)
 
     for ia in icon_assets:
@@ -998,24 +1093,20 @@ def _assert_icons_used(file_code: str, icon_assets: List[Dict[str, Any]]) -> Non
             continue
         seen_expected.add(p)
 
-        ok = any(s.endswith(p) or s.endswith(p + "?url") for s in used_paths)
+        ok = any(_same_path(s, p) for s in used_paths)
         if not ok:
             missing.append(p)
             continue
 
-        count = sum(1 for s in used_paths if s.endswith(p) or s.endswith(p + "?url"))
+        count = sum(1 for s in used_paths if _same_path(s, p))
         if count != 1:
             duplicates.append(f"{p} användningar: {count}")
 
         w_target = int(round(float(ia.get("w") or 0)))
         h_target = int(round(float(ia.get("h") or 0)))
-        vars_for_path = [v for v, path in imports.items() if path.endswith(p) or path.endswith(p + "?url")]
-        good = False
-        for v in vars_for_path:
-            w, h = size_by_var.get(v, (None, None))
-            if w == w_target and h == h_target:
-                good = True
-                break
+        vars_for_path = [v for v, path in imports.items() if _same_path(path, p)]
+
+        good = any(size_by_var.get(v, (None, None)) == (w_target, h_target) for v in vars_for_path)
         if not good:
             size_issues.append(f"{p} ska vara {w_target}x{h_target}px")
 
@@ -1043,28 +1134,38 @@ def integrate_figma_node(
 ) -> Dict[str, Any]:
     figma_json = _fetch_figma_node(file_key, node_id)
 
-    # Figma → IR (filtrera osynligt om funktionen finns)
     ir_full = FIR.figma_to_ir(figma_json, node_id)
     ir = FIR.filter_visible_ir(ir_full) if hasattr(FIR, "filter_visible_ir") else ir_full
 
-    # Ikon-detektion + export
-    icon_nodes = FIR.collect_icon_nodes(ir["root"])
+    raw_icon_nodes = FIR.collect_icon_nodes(ir["root"])
+
+    icon_nodes: List[Dict[str, Any]] = []
+    for ic in raw_icon_nodes:
+        b = ic.get("bounds") or {}
+        w = float(b.get("w") or 0)
+        h = float(b.get("h") or 0)
+        if _icon_size_ok(w, h):
+            icon_nodes.append(ic)
+
     svg_by_id = _fetch_svgs(file_key, [x["id"] for x in icon_nodes])
-    if icon_nodes and not svg_by_id:
-        raise HTTPException(500, "Ikon-noder hittades men inga SVG kunde hämtas via Figma Images API.")
+    svg_by_id = {nid: svg for nid, svg in svg_by_id.items() if svg and not _svg_has_text(svg)}
 
     icon_assets: List[Dict[str, Any]] = []
 
-    # Klona repo
     tmp_dir, repo = clone_repo()
     tmp_root = Path(tmp_dir)
 
-    # Skriv SVG-ikoner
     for ic in icon_nodes:
         nid = ic["id"]
         svg = svg_by_id.get(nid)
         if not svg:
             continue
+        b = ic.get("bounds") or {}
+        w = float(b.get("w") or 0)
+        h = float(b.get("h") or 0)
+        if not _icon_size_ok(w, h):
+            continue
+
         fname = _icon_filename(ic["name_slug"], nid)
         disk_rel = f"{ICON_DIR}/{fname}".replace("\\", "/")
         abs_path = _safe_join(tmp_root, disk_rel)
@@ -1081,23 +1182,16 @@ def integrate_figma_node(
             "name": ic.get("name") or ic["name_slug"],
             "import_path": vite_spec,
             "fs_path": disk_rel,
-            "w": ic["bounds"]["w"],
-            "h": ic["bounds"]["h"],
+            "w": int(round(w)),
+            "h": int(round(h)),
         })
 
-    if icon_nodes and len(icon_assets) != len(icon_nodes):
-        raise HTTPException(500, f"Mismatch ikon-noder vs exporterade SVG: {len(icon_nodes)} vs {len(icon_assets)}")
-
-    # TS-typer för SVG
     created_svg_types_rel = _ensure_svg_types(tmp_root)
 
-    # Beroenden
     _ensure_node_modules(tmp_root)
 
-    # Komponentöversikt
     components = list_components(str(tmp_root))
 
-    # OpenAI: strikt JSON enligt schema
     schema = build_codegen_schema(TARGET_COMPONENT_DIR, ALLOW_PATCH)
     client = OpenAI(api_key=OPENAI_API_KEY)
     messages = _build_messages(ir, components, placement, icon_assets)
@@ -1170,11 +1264,9 @@ def integrate_figma_node(
     if not target_rel:
         raise HTTPException(500, "Saknar 'target_path' i modelsvaret.")
 
-    # Git branch
     branch = unique_branch(node_id)
     repo.git.checkout("-b", branch)
 
-    # Skriv komponentfil och validera
     name = Path(target_rel).name or f"{mount['import_name']}.tsx"
     target_rel = (Path(TARGET_COMPONENT_DIR) / name).as_posix()
 
@@ -1184,8 +1276,9 @@ def integrate_figma_node(
     if not isinstance(file_code, str) or not file_code.strip():
         raise HTTPException(500, "file_code saknas för mode='file'.")
 
-    file_code = _strip_svg_meta(str(file_code))
+    # Rensa otillåten text, och sanera ikonpositioner innan validering
     file_code = _purge_unexpected_text_nodes(str(file_code), _required_texts(ir))
+    file_code = _sanitize_img_positions(file_code)
 
     # Valideringar
     _assert_icons_used(str(file_code), icon_assets)
@@ -1198,7 +1291,6 @@ def integrate_figma_node(
     target_path.write_text(_sanitize_tailwind_conflicts(file_code), encoding="utf-8")
     returned_primary_path = target_rel
 
-    # Sätt alltid relativ import-path från main till target
     main_candidates = [p for p in ALLOW_PATCH if p.endswith("main.tsx")]
     main_rel = main_candidates[0] if main_candidates else "frontendplay/src/main.tsx"
     main_abs = _safe_join(tmp_root, main_rel)
@@ -1206,13 +1298,10 @@ def integrate_figma_node(
     if not mount.get("jsx"):
         mount["jsx"] = f"<{mount['import_name']} />"
 
-    # AST-injektion
     _ast_inject_mount(tmp_root, mount)
 
-    # Typecheck + lint
     _typecheck_and_lint(tmp_root)
 
-    # (Valfritt) visuell validering
     try:
         _ = _visual_validate(tmp_root)
     except HTTPException:
@@ -1220,12 +1309,10 @@ def integrate_figma_node(
     except Exception:
         pass
 
-    # Git add + commit
     repo.git.add("--all")
     commit_msg = f"feat(ai): add {returned_primary_path}"
     repo.index.commit(commit_msg)
 
-    # Läs ut relevanta filer
     changed_paths: List[str] = []
     changed_paths.append(returned_primary_path)
     if main_abs.exists():

@@ -1,7 +1,8 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
-import './index.css';
-import { Menu } from './components/ai/Menu';
+import "./index.css";
+
+const VP = { w: 1280, h: 800 };
 
 function App() {
   return (
@@ -10,9 +11,21 @@ function App() {
       <h2 style={{ margin: "0 0 12px 0", fontSize: 14, color: "#666" }}>
         A playground for frontend experiments
       </h2>
-      {/* AI-INJECT-MOUNT:BEGIN */}
-      <Menu />
-      {/* AI-INJECT-MOUNT:END */}</div>
+
+      <div
+        id="preview-root"
+        style={{
+          position: "relative",
+          width: VP.w,
+          height: VP.h,
+          overflow: "hidden",
+        }}
+      >
+        {/* Lägg din iframe/devUrl-overlay här om du vill */}
+        {/* AI-INJECT-MOUNT:BEGIN */}
+        {/* AI-INJECT-MOUNT:END */}
+      </div>
+    </div>
   );
 }
 

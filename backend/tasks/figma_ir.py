@@ -1,11 +1,18 @@
 # backend/tasks/figma_ir.py
 from __future__ import annotations
 """
-Figma → IR (Intermediate Representation) med transitiv synlighet:
+Figma → IR (Intermediate Representation) med transitiv synlighet och root-klipp:
 - Varje node får 'visible_effective' som tar hänsyn till egen visible/opacity, föräldrars synlighet och clipping.
+- Root-klipp styrs av STRICT_VIEWPORT_CLIP:
+  * STRICT_VIEWPORT_CLIP=1 → clip = viewport (x=root_x, y=root_y, w=viewport_w, h=viewport_h)
+  * STRICT_VIEWPORT_CLIP=0 → clip = rootens egna bounds
 - filter_visible_ir() tar bort dolda noder och behåller containers endast om de har synliga barn.
 - Text-IR bevarar content + lines och färg/typografi.
 - Ikon-detektion robust för både leaf och små containers, och använder synlighet.
+- Förhindrar att stora container-rader exporteras som “ikoner”:
+  * Storleksgränser via ICON_MIN/ICON_MAX
+  * Aspektkvot-filter via ICON_AR_MIN/ICON_AR_MAX
+  * Containers som innehåller text i någon descendant nekas
 
 Audit:
   - FIGMA_IR_AUDIT=1 (default 1) för JSONL via FIGMA_IR_LOG_FILE
@@ -15,6 +22,12 @@ Färg:
   - FIGMA_COLOR_GAMMA_FIX=1 för konvertering linear→sRGB vid hex/rgba
 Ikonstorlek:
   - ICON_MIN (default 12), ICON_MAX (default 256)
+Aspektkvot:
+  - ICON_AR_MIN (default 0.75), ICON_AR_MAX (default 1.33)
+
+Uppdatering:
+  - Tailwind-hints för font-family använder korrekt escaping (\\, ', ]) och undersc0re-form för mellanslag: font-['Open_Sans'].
+  - Font-weight i hints skrivs som arbitrary value: font-[700].
 """
 
 from typing import Any, Dict, List, Optional, Tuple, cast
@@ -37,8 +50,15 @@ LOG_IR_TRACE = os.getenv("FIGMA_IR_TRACE", "0").lower() in ("1", "true", "yes")
 AUDIT_ENABLED = os.getenv("FIGMA_IR_AUDIT", "1").lower() in ("1", "true", "yes")
 FIGMA_COLOR_GAMMA_FIX = os.getenv("FIGMA_COLOR_GAMMA_FIX", "0").lower() in ("1", "true", "yes")
 
+# Klipp-policy: 1 = klipp till viewport, 0 = klipp till root-bounds
+STRICT_VIEWPORT_CLIP = os.getenv("STRICT_VIEWPORT_CLIP", "1").lower() in ("1", "true", "yes")
+
 ICON_MIN = int(os.getenv("ICON_MIN", "12"))
 ICON_MAX = int(os.getenv("ICON_MAX", "256"))
+
+# Nya aspektspärrar för ikoner
+ICON_AR_MIN = float(os.getenv("ICON_AR_MIN", "0.75"))
+ICON_AR_MAX = float(os.getenv("ICON_AR_MAX", "1.33"))
 
 _LOG_FILE = os.getenv("FIGMA_IR_LOG_FILE")
 if _LOG_FILE:
@@ -699,26 +719,43 @@ def _tailwind_hints(n: Dict[str, Any]) -> Dict[str, Any]:
             tw.append("whitespace-pre-wrap")
         if st.get("textAlign"):
             tw.append({"left":"text-left","center":"text-center","right":"text-right","justify":"text-justify"}[st["textAlign"]])
+
+        # font-size
         if st.get("fontSize") is not None:
             px_fs = _px(st.get("fontSize"))
             if px_fs: tw.append(f"text-[{px_fs}]")
-        if st.get("fontWeight"): tw.append(f"font-{st['fontWeight']}")
+
+        # font-weight som arbitrary value
+        w = st.get("fontWeight")
+        if isinstance(w, int):
+            tw.append(f"font-[{w}]")
+
+        # line-height / letter-spacing
         if st.get("lineHeight"): tw.append(f"leading-[{st['lineHeight']}]")
         if st.get("letterSpacing"): tw.append(f"tracking-[{st['letterSpacing']}]")
+
+        # deco / transform
         if st.get("textDecoration") == "underline": tw.append("underline")
         if st.get("textDecoration") == "line-through": tw.append("line-through")
         if st.get("textTransform") == "uppercase": tw.append("uppercase")
         if st.get("textTransform") == "lowercase": tw.append("lowercase")
         if st.get("textTransform") == "capitalize": tw.append("capitalize")
-        if st.get("fontFamily"):
-            fam = str(st["fontFamily"]).replace(" ", "_")
-            tw.append(f"font-['{fam}']")
+
+        # font-family med escaping och underscore för mellanslag
+        fam_raw = str(st.get("fontFamily", "")).strip()
+        if fam_raw:
+            safe = (fam_raw
+                .replace("\\", "\\\\")
+                .replace("'", "\\'")
+                .replace("]", "\\]"))
+            safe_us = safe.replace(" ", "_")
+            tw.append(f"font-['{safe_us}']")
 
     css = n.get("boxShadow") or (n.get("css") or {})
     if isinstance(css, dict) and css.get("boxShadow"):
         tw.append(f"shadow-[{css['boxShadow']}]")
     elif isinstance(n.get("css"), dict) and n["css"].get("boxShadow"):
-        tw.append(f"shadow-[{n['css']['boxShadow']}]")
+        tw.append(f"shadow-[{n['boxShadow']}]")  # fallback om key ligger direkt på n
 
     rot = n.get("rotation")
     if _is_num(rot) and abs((_to_float(rot) or 0.0)) > 0.001:
@@ -764,6 +801,20 @@ def _single_visible_solid_fill(node: Dict[str, Any]) -> Tuple[Optional[str], Opt
         return hex_, a
     return None, None
 
+def _aspect_ok(w: float, h: float) -> bool:
+    if w <= 0 or h <= 0:
+        return False
+    r = w / h
+    return ICON_AR_MIN <= r <= ICON_AR_MAX
+
+def _has_text_desc(n: Dict[str, Any]) -> bool:
+    if (n.get("type") == "TEXT") and bool(n.get("visible_effective", True)):
+        return True
+    for ch in n.get("children") or []:
+        if _has_text_desc(ch):
+            return True
+    return False
+
 def _icon_hint(node: Dict[str, Any]) -> Dict[str, Any]:
     b = node.get("bounds") or {}
     name = _safe_name(node.get("name"))
@@ -772,11 +823,12 @@ def _icon_hint(node: Dict[str, Any]) -> Dict[str, Any]:
     w, h = b.get("w") or 0.0, b.get("h") or 0.0
 
     type_ok = t in _ICON_TYPES
-    size_typical = ICON_MIN <= int(round(w)) <= ICON_MAX and ICON_MIN <= int(round(h)) <= ICON_MAX
-    name_ok = _is_iconish_name(name)
+    size_typical = (ICON_MIN <= int(round(w)) <= ICON_MAX and
+                    ICON_MIN <= int(round(h)) <= ICON_MAX and
+                    _aspect_ok(w, h))
     child_ok = not has_children
 
-    is_icon = bool(type_ok and child_ok and (name_ok or size_typical) and w > 0 and h > 0)
+    is_icon = bool(type_ok and child_ok and size_typical and w > 0 and h > 0)
 
     hex_col, alpha = _single_visible_solid_fill(node)
     if not hex_col:
@@ -917,9 +969,22 @@ def _extract_document_from_nodes_payload(payload: Dict[str, Any], node_id: str) 
 # ────────────────────────────────────────────────────────────────────────────
 
 def figma_to_ir(figma_json: Dict[str, Any], node_id: str, *, viewport: Tuple[int,int]=(1280,800)) -> Dict[str, Any]:
+    """
+    Bygger IR med root-klippning. När STRICT_VIEWPORT_CLIP=1 används viewport
+    med origo i rootens x/y. Annars används rootens egna bounds som klipp.
+    """
     doc = _extract_document_from_nodes_payload(figma_json, node_id)
-    root_ir = _node_to_ir(doc, _z=0, inherited_clip=None, inherited_visible=True)
+    root_bounds = _bounds(doc)
+
+    if STRICT_VIEWPORT_CLIP:
+        clip = {"x": root_bounds["x"], "y": root_bounds["y"], "w": float(viewport[0]), "h": float(viewport[1])}
+    else:
+        clip = root_bounds
+
+    root_ir = _node_to_ir(doc, _z=0, inherited_clip=clip, inherited_visible=True)
     root_ir["debug"]["isRoot"] = True
+    root_ir["debug"]["rootClip"] = clip
+    root_ir["debug"]["STRICT_VIEWPORT_CLIP"] = STRICT_VIEWPORT_CLIP
 
     meta = {
         "nodeId": node_id,
@@ -927,8 +992,8 @@ def figma_to_ir(figma_json: Dict[str, Any], node_id: str, *, viewport: Tuple[int
         "schemaVersion": 4,
         "producedBy": "figma_ir.py"
     }
-    _trace("figma_to_ir_done", node_id=node_id, viewport=meta["viewport"])
-    _audit("pipeline.done", root_ir, viewport=meta["viewport"], schemaVersion=meta["schemaVersion"])
+    _trace("figma_to_ir_done", node_id=node_id, viewport=meta["viewport"], clip=clip)
+    _audit("pipeline.done", root_ir, viewport=meta["viewport"], schemaVersion=meta["schemaVersion"], clip=clip)
     return {"meta": meta, "root": root_ir}
 
 def _reindex_order(n: Dict[str, Any]) -> None:
@@ -1014,7 +1079,7 @@ def build_tailwind_map(ir_node: Dict[str, Any]) -> Dict[str, str]:
     return tw_map
 
 # ────────────────────────────────────────────────────────────────────────────
-# Ikon-noder: synliga, dedup och containerstöd
+# Ikon-noder: synliga, dedup och containerstöd (med text- och aspektfilter)
 # ────────────────────────────────────────────────────────────────────────────
 
 def collect_icon_nodes(ir_node: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1022,8 +1087,9 @@ def collect_icon_nodes(ir_node: Dict[str, Any]) -> List[Dict[str, Any]]:
     Returnera synliga ikon-noder i IR-trädet utan dubbletter.
     Regler:
       - Leaf-ikon: node.icon.is_icon == True och visible_effective == True.
-      - Container-ikon: container med 1–8 synliga vektor-leaves, inom ICON_MIN..ICON_MAX.
-      - INSTANCE-fallback: inga leaves men typiska ikonmått.
+      - Container-ikon: container med 1–8 synliga vektor-leaves, inom ICON_MIN..ICON_MAX,
+                        aspektkvot inom [ICON_AR_MIN..ICON_AR_MAX], och INGEN text-descendant.
+      - INSTANCE-fallback: inga leaves men typiska ikonmått + aspektkvot + ingen text.
     """
     out: List[Dict[str, Any]] = []
 
@@ -1078,7 +1144,11 @@ def collect_icon_nodes(ir_node: Dict[str, Any]) -> List[Dict[str, Any]]:
             _gather_vector_leaves(n, leaves)
             nb = (n.get("bounds") or {})
             w = int(round(nb.get("w", 0) or 0)); h = int(round(nb.get("h", 0) or 0))
-            if 1 <= len(leaves) <= 8 and ICON_MIN <= w <= ICON_MAX and ICON_MIN <= h <= ICON_MAX and (w*h) >= 4:
+            if (1 <= len(leaves) <= 8 and
+                ICON_MIN <= w <= ICON_MAX and ICON_MIN <= h <= ICON_MAX and
+                _aspect_ok(w, h) and
+                not _has_text_desc(n) and
+                (w*h) >= 4):
                 out.append({
                     "id": n.get("id"),
                     "name": n.get("name"),
@@ -1096,6 +1166,10 @@ def collect_icon_nodes(ir_node: Dict[str, Any]) -> List[Dict[str, Any]]:
                 reason = None
                 if not (ICON_MIN <= w <= ICON_MAX and ICON_MIN <= h <= ICON_MAX):
                     reason = "size_outside_icon_range"
+                elif not _aspect_ok(w, h):
+                    reason = "aspect_outside_icon_range"
+                elif _has_text_desc(n):
+                    reason = "has_text_descendant"
                 elif len(leaves) == 0:
                     reason = "no_vector_leaves"
                 elif len(leaves) > 8:
@@ -1103,9 +1177,13 @@ def collect_icon_nodes(ir_node: Dict[str, Any]) -> List[Dict[str, Any]]:
                 elif (w*h) < 4:
                     reason = "too_small_area"
                 _audit("icon.container.reject", n, reason=reason, leaf_count=len(leaves), bounds=nb,
-                       ICON_MIN=ICON_MIN, ICON_MAX=ICON_MAX)
+                       ICON_MIN=ICON_MIN, ICON_MAX=ICON_MAX, ICON_AR_MIN=ICON_AR_MIN, ICON_AR_MAX=ICON_AR_MAX)
 
-            if t == "INSTANCE" and len(leaves) == 0 and ICON_MIN <= w <= ICON_MAX and ICON_MIN <= h <= ICON_MAX and (w*h) >= 4:
+            if (t == "INSTANCE" and len(leaves) == 0 and
+                ICON_MIN <= w <= ICON_MAX and ICON_MIN <= h <= ICON_MAX and
+                _aspect_ok(w, h) and
+                not _has_text_desc(n) and
+                (w*h) >= 4):
                 out.append({
                     "id": n.get("id"),
                     "name": n.get("name"),
