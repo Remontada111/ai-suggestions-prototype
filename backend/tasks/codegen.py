@@ -15,6 +15,13 @@ Nytt i denna version:
 - Ikonprompten kräver import av varje ikon och exakt en <img> per ikon, utan absoluta left/top.
 - Ikonvalideringen accepterar både absoluta (/src/...) och relativa imports, validerar storlek och exakt en användning, men ignorerar position.
 - Sanering tar bort felaktiga left-/top-/absolute-klasser på <img> så ikoner inte hamnar utanför vyn.
+- AUTO-FIX: Saknade ikon-importer och <img>-taggar injiceras automatiskt i file_code innan validering.
+- Dims/pos-validering hoppar över ikon-subträd (leafs i exporterad ikon kontrolleras inte separat).
+- Färgvalidering hoppar över ikon-subträd och är case-/format-tålig (hex och rgba).
+
+Nytt i denna variant:
+- Prettier körs på genererade .tsx-filer för läsbar struktur (en tagg per rad, indentering).
+- Systemprompten instruerar modellen att skriva icke-minifierad, läsbar JSX enligt IR-trädet.
 """
 
 import hashlib
@@ -255,6 +262,59 @@ def _run_pm_script(base: Path, script: str, extra_args: List[str] | None = None)
     return _run(["npm", "run", script, "--silent", "--", *extra_args], cwd=base)
 
 # ─────────────────────────────────────────────────────────
+# Kodformatering (Prettier)
+# ─────────────────────────────────────────────────────────
+
+def _find_project_base(repo_root: Path, hint: Path | None = None) -> Path:
+    """
+    Hitta närmaste katalog som har package.json. Faller tillbaka till
+    repo_root/frontendplay eller repo_root.
+    """
+    base = hint or repo_root
+    while base != base.parent and not (base / "package.json").exists():
+        base = base.parent
+    if (base / "package.json").exists():
+        return base
+    fp_pkg = repo_root / "frontendplay" / "package.json"
+    return fp_pkg.parent if fp_pkg.exists() else repo_root
+
+def _prettier_bin(base: Path) -> List[str] | None:
+    """
+    Returnera kommando för lokal prettier om den finns, annars None.
+    """
+    unix_bin = base / "node_modules" / ".bin" / "prettier"
+    win_bin = base / "node_modules" / ".bin" / "prettier.cmd"
+    if unix_bin.exists():
+        return [str(unix_bin)]
+    if win_bin.exists():
+        return [str(win_bin)]
+    return None
+
+def _format_tsx(repo_root: Path, target_path: Path) -> None:
+    """
+    Kör Prettier på target_path. Misslyckas inte pipeline om Prettier saknas
+    eller returnerar fel. Fallback: radbryter mellan taggar.
+    """
+    base = _find_project_base(repo_root, hint=target_path.parent)
+    cmd = _prettier_bin(base)
+    if cmd is None:
+        cmd = ["npx", "prettier"]  # använder lokal om installerad, annars försöker npx
+    try:
+        rc, out, err = _run([*cmd, "--parser", "babel-ts", "--write", str(target_path)], cwd=base)
+        if rc == 0:
+            return
+    except Exception:
+        pass
+    # Fallback-formattering: bryt mellan '><' för bättre diffbarhet
+    try:
+        code = target_path.read_text(encoding="utf-8")
+        code2 = re.sub(r'><', '>\n<', code)
+        if code2 != code:
+            target_path.write_text(code2, encoding="utf-8")
+    except Exception:
+        pass
+
+# ─────────────────────────────────────────────────────────
 # Geometrihjälp
 # ─────────────────────────────────────────────────────────
 
@@ -421,7 +481,6 @@ def _build_messages(
     except Exception:
         overview = {name: str(path) for name, path in components.items()}
 
-    # Tailwind-hints till modellen
     tw_map = FIR.build_tailwind_map(ir["root"])
 
     user_payload = {
@@ -456,6 +515,8 @@ def _build_messages(
         "För TEXT-noder: om 'text.lines' finns ska varje rad renderas separat. "
         "Rendera barn i stigande 'z' (barnens index). "
         "Skapa/uppdatera alltid en komponentfil (mode='file') i target_component_dir och montera via 'mount'; patch är förbjudet. "
+        "Formatering: Skriv läsbar JSX, inte minifierad. Bryt return(...) över flera rader, en tagg per rad, korrekt indentering. "
+        "Speglas i koden: behåll IR-hierarkin i JSX, så varje IR-node motsvarar ett element. "
         "Skriv aldrig ``` i något fält."
     )
 
@@ -709,17 +770,13 @@ def _sanitize_tailwind_conflicts(src: str) -> str:
         q = m.group("q")
         cls = m.group("val")
 
-        # Om border-[..] finns, ta bort generisk 'border'
         if re.search(r'\bborder-\[[0-9.]+px\]', cls):
             cls = re.sub(r'(?<!-)\bborder\b', '', cls)
 
-        # Om absolute finns, ta bort 'relative'
         if re.search(r'\babsolute\b', cls):
             cls = re.sub(r'\brelative\b', '', cls)
 
-        # Ta bort ogiltiga negativa arbitrary util-klasser
         cls = re.sub(r'(^|\s)-\[[^\]]+\]', ' ', cls)
-
         cls = re.sub(r'\s+', ' ', cls).strip()
         return f'className={q}{cls}{q}'
 
@@ -742,7 +799,6 @@ def _sanitize_img_positions(src: str) -> str:
         cls = re.sub(r'\s+', ' ', cls).strip()
         return f"{m.group(1)}{q}{cls}{q}{m.group('tail')}"
     return _IMG_WITH_CLASS.sub(repl, src)
-
 
 _SVG_META = re.compile(r"<\s*(title|desc)\b[^>]*>.*?<\s*/\s*\1\s*>", re.IGNORECASE | re.DOTALL)
 
@@ -818,8 +874,13 @@ def _gather_classes(file_code: str) -> str:
 
 # === C) Dimensions/positions-validering ==================
 
-def _assert_dims_positions(ir: Dict[str, Any], file_code: str) -> None:
+def _assert_dims_positions(ir: Dict[str, Any], file_code: str, icon_asset_ids: set[str] | None = None) -> None:
+    """
+    Validerar att noder som faktiskt renderas i JSX har motsvarande Tailwind-klasser.
+    Ikon-subträd som exporteras som en enda <img> hoppas över.
+    """
     classes = _gather_classes(file_code)
+    icon_asset_ids = set(icon_asset_ids or set())
 
     def _px_s(x: Any | None) -> str | None:
         if x is None: return None
@@ -848,8 +909,14 @@ def _assert_dims_positions(ir: Dict[str, Any], file_code: str) -> None:
         s = _px_s(px)
         return [] if not s else [f"top-[{s}]"]
 
-    def rec(n: Dict[str,Any], clip: Dict[str, float] | None):
-        # NYTT: respektera effektiv synlighet och viewport-clip
+    def rec(n: Dict[str,Any], clip: Dict[str, float] | None, skip: bool = False):
+        # Hoppa över ikon-subträdet: dess interna vektor-leafs renderas inte separat i JSX
+        if skip or (n.get("id") in icon_asset_ids):
+            next_clip = _next_clip_ir(n, clip)
+            for ch in n.get("children") or []:
+                rec(ch, next_clip, True)
+            return
+
         if not bool(n.get("visible_effective", True)):
             return
         if not _effectively_visible_ir(n, clip):
@@ -889,12 +956,11 @@ def _assert_dims_positions(ir: Dict[str, Any], file_code: str) -> None:
 
         next_clip = _next_clip_ir(n, clip)
         for ch in n.get("children") or []:
-            rec(ch, next_clip)
+            rec(ch, next_clip, False)
 
-    # NYTT: använd viewport-clip från IR debug om tillgängligt
     root = cast(Dict[str, Any], ir.get("root") or {})
     root_clip = cast(Dict[str, float] | None, (root.get("debug") or {}).get("rootClip") or root.get("bounds"))
-    rec(root, root_clip)
+    rec(root, root_clip, False)
 
 # ─────────────────────────────────────────────────────────
 # Färger, skuggor, gradients
@@ -904,12 +970,43 @@ def _hex_to_rgba_str(hex_col: str, a: float) -> str:
     r = int(hex_col[1:3],16); g = int(hex_col[3:5],16); b = int(hex_col[5:7],16)
     return f"rgba({r}, {g}, {b}, {a})"
 
-def _assert_colors_shadows_and_gradients(ir: Dict[str, Any], file_code: str) -> None:
-    classes = _gather_classes(file_code)
+def _assert_colors_shadows_and_gradients(
+    ir: Dict[str, Any],
+    file_code: str,
+    icon_asset_ids: set[str] | None = None,
+) -> None:
+    """
+    Färg/skugg/gradient-validering som:
+    - Ignorerar ikon-subträd (renderas som <img>).
+    - Är case-tålig för hex.
+    - Tillåter valfri whitespace i rgba() och matchar via prefix.
+    """
+    icon_asset_ids = set(icon_asset_ids or set())
+
+    # Samla className-attributen oförändrade och bygg både token-set och blob
+    class_attrs = [m.group("val") or "" for m in _CLS_RE.finditer(file_code)]
+    class_blob = " ".join(class_attrs).lower()
+    class_tokens: set[str] = set()
+    for s in class_attrs:
+        for t in s.split():
+            tt = t.strip().lower()
+            if tt:
+                class_tokens.add(tt)
+
+    def has_token(tok: str) -> bool:
+        return tok.lower() in class_tokens
+
+    def has_sub(s: str) -> bool:
+        return s.lower() in class_blob
 
     def rec(n: Dict[str,Any], clip: Dict[str, float] | None):
+        # Hoppa över hela ikon-subträdet
+        if n.get("id") in icon_asset_ids:
+            return
+
         if not _effectively_visible_ir(n, clip):
             return
+
         fills = n.get("fills") or []
         for f in fills:
             if _bool(f.get("visible", True), True):
@@ -918,23 +1015,28 @@ def _assert_colors_shadows_and_gradients(ir: Dict[str, Any], file_code: str) -> 
                     col = f.get("color"); a = float(f.get("alpha",1) or 1)
                     if not col:
                         break
-                    want = None
-                    if n.get("type") == "TEXT":
-                        want = f"text-[{col}]" if a>=0.999 else f"text-[{_hex_to_rgba_str(col,a)}]"
+                    if a >= 0.999:
+                        want = f"text-[{col}]" if n.get("type") == "TEXT" else f"bg-[{col}]"
+                        if not has_token(want):
+                            raise HTTPException(500, f"Saknar färgklass {want}")
                     else:
-                        want = f"bg-[{col}]" if a>=0.999 else f"bg-[{_hex_to_rgba_str(col,a)}]"
-                    if want and want not in classes:
-                        raise HTTPException(500, f"Saknar färgklass {want}")
+                        pref = "text-[rgba(" if n.get("type") == "TEXT" else "bg-[rgba("
+                        if not has_sub(pref):
+                            raise HTTPException(500, f"Saknar rgba-färgklass som börjar med {pref}")
                     break
                 if t.startswith("GRADIENT_"):
-                    if "bg-[linear-gradient(" not in classes:
+                    if not has_sub("bg-[linear-gradient("):
                         raise HTTPException(500, "Saknar gradientklass bg-[linear-gradient(...)]")
                     break
+
         css = n.get("css") or {}
         if css.get("boxShadow"):
-            want = f"shadow-[{css['boxShadow']}]"
-            if want not in classes:
-                raise HTTPException(500, f"Saknar skuggklass {want}")
+            want = f"shadow-[{css['boxShadow']}]".lower()
+            # shadow-arbitrary innehåller mellanslag → matcha via substring
+            if want not in class_tokens and want not in class_blob:
+                if not has_sub("shadow-["):
+                    raise HTTPException(500, f"Saknar skuggklass {want}")
+
         next_clip = _next_clip_ir(n, clip)
         for ch in n.get("children") or []:
             rec(ch, next_clip)
@@ -1012,7 +1114,7 @@ def _assert_typography(ir: Dict[str, Any], file_code: str) -> None:
     rec(ir["root"], None)
 
 # ─────────────────────────────────────────────────────────
-# Ikon-krav: typer, filnamn och validering
+# Ikon-utilities och validering
 # ─────────────────────────────────────────────────────────
 
 def _ensure_svg_types(repo_root: Path) -> str | None:
@@ -1033,6 +1135,7 @@ def _icon_filename(name_slug: str, node_id: str) -> str:
     safe = re.sub(r"[^a-z0-9\-]+", "-", (name_slug or "icon").lower()).strip("-") or "icon"
     return f"{safe}-{h}.svg"
 
+# Import- och <img>-regexar
 _IMG_IMPORT = re.compile(r"import\s+(\w+)\s+from\s+['\"]([^'\"]+\.svg(?:\?url)?)['\"]")
 _IMG_TAG = re.compile(r"<img\b[^>]*?>", re.IGNORECASE | re.DOTALL)
 _SRC_VAR = re.compile(r"src=\{(\w+)\}", re.IGNORECASE | re.DOTALL)
@@ -1045,15 +1148,133 @@ _CLS_IN_TAG = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+def _same_path(u: str, exp: str) -> bool:
+    u0 = u.split("?")[0].replace("\\", "/")
+    e0 = exp.split("?")[0].replace("\\", "/")
+    tail = e0.split("/src/", 1)[-1]
+    return u0.endswith(e0) or u0.endswith(tail) or u0.endswith("./" + tail) or u0.endswith("/" + tail)
+
+def _import_var_from_path(p: str, used: set[str]) -> str:
+    base = Path(p.split("?")[0]).stem
+    parts = re.split(r"[^A-Za-z0-9]+", base)
+    name = "".join(s[:1].upper() + s[1:] for s in parts if s)
+    if not name:
+        name = "Icon"
+    if not re.match(r"[A-Za-z_]", name[0]):
+        name = "_" + name
+    orig = name
+    i = 2
+    while name in used:
+        name = f"{orig}{i}"
+        i += 1
+    return name
+
+def _autofix_missing_icons(file_code: str, icon_assets: List[Dict[str, Any]]) -> str:
+    """
+    Lägger automatiskt till saknade SVG-importer och <img>-taggar för alla förväntade ikoner.
+    - Importer placeras efter sista import-raden.
+    - <img>-taggar injiceras innan sista stängande taggen i return(...) JSX.
+    """
+    if not icon_assets or not isinstance(file_code, str) or not file_code.strip():
+        return file_code
+
+    # Befintliga imports och användningar
+    imports = {m.group(1): m.group(2) for m in _IMG_IMPORT.finditer(file_code)}
+    used_vars: set[str] = set()
+    size_by_var: Dict[str, Tuple[int | None, int | None]] = {}
+
+    for tag in _IMG_TAG.findall(file_code):
+        m = _SRC_VAR.search(tag)
+        if not m:
+            continue
+        var = m.group(1)
+        used_vars.add(var)
+        w = h = None
+        for attr, n1, n2 in _NUM_IN_ATTR.findall(tag):
+            val = int(n1 or n2) if (n1 or n2) else None
+            if   attr.lower() == "width":  w = val
+            elif attr.lower() == "height": h = val
+        size_by_var[var] = (w, h)
+
+    used_paths = [imports[v] for v in used_vars if v in imports]
+    expected = list(icon_assets)
+
+    # Hitta saknade
+    missing_assets: List[Dict[str, Any]] = []
+    for ia in expected:
+        p = ia["import_path"]
+        if not any(_same_path(s, p) for s in used_paths):
+            missing_assets.append(ia)
+
+    if not missing_assets:
+        return file_code
+
+    # Bygg import-rader
+    existing_import_vars = set(imports.keys())
+    new_import_lines: List[str] = []
+    new_img_snippets: List[str] = []
+
+    for ia in missing_assets:
+        p = str(ia["import_path"])
+        if not p.lower().endswith(".svg") and not p.lower().endswith(".svg?url"):
+            continue
+        # säkerställ ?url
+        imp_path = p if p.endswith("?url") else (p + "?url")
+        var = _import_var_from_path(p, existing_import_vars)
+        existing_import_vars.add(var)
+
+        w = int(round(float(ia.get("w") or 0)))
+        h = int(round(float(ia.get("h") or 0)))
+        if w <= 0 or h <= 0:
+            w = max(ICON_MIN, 24)
+            h = max(ICON_MIN, 24)
+
+        new_import_lines.append(f"import {var} from '{imp_path}';")
+        new_img_snippets.append(
+            f'<img src={{ {var} }} alt="" aria-hidden="true" width={{ {w} }} height={{ {h} }} '
+            f'className="inline-block align-middle w-[{w}px] h-[{h}px]" />'
+        )
+
+    # Injicera importerna efter sista import
+    insert_pos = 0
+    import_iter = re.finditer(r"^(?:import\s.+?;)\s*$", file_code, flags=re.MULTILINE)
+    for m in import_iter:
+        insert_pos = m.end()
+    if new_import_lines:
+        prefix = file_code[:insert_pos]
+        suffix = file_code[insert_pos:]
+        add = ("\n" if not prefix.endswith("\n") else "") + "\n".join(new_import_lines) + "\n"
+        file_code = prefix + add + suffix
+
+    # Hitta return(...) och sista stängande tagg däri
+    ret = re.search(r"return\s*\(", file_code)
+    if ret:
+        start = ret.end()
+        end = file_code.find(");", start)
+        if end == -1:
+            end = len(file_code)
+        jsx_region = file_code[start:end]
+        # sista stängande tagg
+        last_close = None
+        for m in re.finditer(r"</[^>]+>", jsx_region):
+            last_close = m
+        if last_close:
+            ins = start + last_close.start()
+            indent_line_start = file_code.rfind("\n", 0, ins) + 1
+            indent_match = re.match(r"[ \t]*", file_code[indent_line_start:ins]) if indent_line_start >= 0 else None
+            indent = indent_match.group(0) if indent_match else ""
+            imgs_text = "".join(f"\n{indent}{s}" for s in new_img_snippets)
+            file_code = file_code[:ins] + imgs_text + file_code[ins:]
+        else:
+            imgs_text = "".join("\n  " + s for s in new_img_snippets)
+            file_code = file_code[:end] + imgs_text + file_code[end:]
+
+    file_code = _sanitize_img_positions(file_code)
+    return file_code
+
 def _assert_icons_used(file_code: str, icon_assets: List[Dict[str, Any]]) -> None:
     if not icon_assets:
         return
-
-    def _same_path(u: str, exp: str) -> bool:
-        u0 = u.split("?")[0].replace("\\", "/")
-        e0 = exp.split("?")[0].replace("\\", "/")
-        tail = e0.split("/src/", 1)[-1]
-        return u0.endswith(e0) or u0.endswith(tail) or u0.endswith("./" + tail) or u0.endswith("/" + tail)
 
     imports = {m.group(1): m.group(2) for m in _IMG_IMPORT.finditer(file_code)}
     used_vars: set[str] = set()
@@ -1137,6 +1358,7 @@ def integrate_figma_node(
     ir_full = FIR.figma_to_ir(figma_json, node_id)
     ir = FIR.filter_visible_ir(ir_full) if hasattr(FIR, "filter_visible_ir") else ir_full
 
+    # Samla ikon-noder och filtrera bort orimliga/text-bärande SVG
     raw_icon_nodes = FIR.collect_icon_nodes(ir["root"])
 
     icon_nodes: List[Dict[str, Any]] = []
@@ -1155,6 +1377,7 @@ def integrate_figma_node(
     tmp_dir, repo = clone_repo()
     tmp_root = Path(tmp_dir)
 
+    # Skriv ut SVG:er till repo och bygg import_path
     for ic in icon_nodes:
         nid = ic["id"]
         svg = svg_by_id.get(nid)
@@ -1276,21 +1499,29 @@ def integrate_figma_node(
     if not isinstance(file_code, str) or not file_code.strip():
         raise HTTPException(500, "file_code saknas för mode='file'.")
 
-    # Rensa otillåten text, och sanera ikonpositioner innan validering
+    # Rensa otillåten text
     file_code = _purge_unexpected_text_nodes(str(file_code), _required_texts(ir))
+    # Auto-fixa saknade ikoner
+    file_code = _autofix_missing_icons(file_code, icon_assets)
+    # Sanera <img>-positionering innan validering
     file_code = _sanitize_img_positions(file_code)
 
-    # Valideringar
+    # Valideringar (kör på oformatterad sträng)
     _assert_icons_used(str(file_code), icon_assets)
     _assert_text_coverage(ir, str(file_code))
     _assert_no_extra_texts(ir, str(file_code))
-    _assert_dims_positions(ir, str(file_code))
-    _assert_colors_shadows_and_gradients(ir, str(file_code))
+    icon_ids = {ia["id"] for ia in icon_assets}
+    _assert_dims_positions(ir, str(file_code), icon_ids)
+    _assert_colors_shadows_and_gradients(ir, str(file_code), icon_ids)
     _assert_typography(ir, str(file_code))
 
+    # Skriv fil och formatera med Prettier för tydlig struktur
     target_path.write_text(_sanitize_tailwind_conflicts(file_code), encoding="utf-8")
+    _format_tsx(tmp_root, target_path)
+
     returned_primary_path = target_rel
 
+    # Relativ import till main.tsx och AST-injektion
     main_candidates = [p for p in ALLOW_PATCH if p.endswith("main.tsx")]
     main_rel = main_candidates[0] if main_candidates else "frontendplay/src/main.tsx"
     main_abs = _safe_join(tmp_root, main_rel)

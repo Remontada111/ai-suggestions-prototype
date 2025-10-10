@@ -1,6 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
+import { Menu } from './components/ai/Menu';
 
 const VP = { w: 1280, h: 800 };
 
@@ -23,8 +24,8 @@ function App() {
       >
         {/* Lägg din iframe/devUrl-overlay här om du vill */}
         {/* AI-INJECT-MOUNT:BEGIN */}
-        {/* AI-INJECT-MOUNT:END */}
-      </div>
+        <Menu />
+        {/* AI-INJECT-MOUNT:END */}</div>
     </div>
   );
 }

@@ -7,6 +7,8 @@ __pycache__/
 *.py[cod]
 .Python
 .python-version
+/.ai-cache/
+
 
 # --- Bygg- & paket-artefakter ---
 dist/
