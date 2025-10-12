@@ -20,8 +20,24 @@ Nytt i denna version:
 - Färgvalidering hoppar över ikon-subträd och är case-/format-tålig (hex och rgba).
 
 Nytt i denna variant:
-- Prettier körs på genererade .tsx-filer för läsbar struktur (en tagg per rad, indentering).
-- Systemprompten instruerar modellen att skriva icke-minifierad, läsbar JSX enligt IR-trädet.
+- Prettier kör endast lokal bin om den finns, annars lätt fallback-formattering (ingen npx).
+- AST-injektion använder endast lokala metoder (node + tsx eller lokal .bin/tsx), ingen npx.
+- Figma SVG-hämtning parallelliseras med kortare timeouts.
+- GPT-5: hoppa direkt till strikt=False schema, därefter json_object.
+- Systemprompten ber modellen att lämna mount.import_path tomt.
+
+Felsäkringar för 1:1:
+- Kompaktar ALLA Tailwind arbitrary values (bg-[rgba(0,0,0,0.2)] etc.) så blanks aldrig bryter klasser.
+- Förbjuder bakgrunder som inte finns i IR. Stoppar spök-`bg-[#000]` på wrapper-noder.
+- Tillåter semitransparent färg via rgba, #rrggbbaa eller slash-opacity.
+- Skipper dims/pos-krav för layout-only wrappers (ingen fill/stroke/effects/text).
+- Hindrar oönskat `justify-between` om IR inte kräver det.
+- Monterar med root-offset-wrapper så komponenten inte “krokar” i appens kant.
+
+GPT-5-kompatibilitet:
+- Skicka aldrig 'temperature' till GPT-5-modeller. De accepterar endast default. Robust fallback-kedja:
+  gpt-5 → json_schema strict=False → json_object
+  övriga → strict=True → strict=False → json_object
 """
 
 import hashlib
@@ -32,6 +48,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, cast
+
+import functools
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from celery import Celery
@@ -57,7 +77,9 @@ BROKER_URL = (os.getenv("CELERY_BROKER_URL") or "redis://redis:6379/0").strip()
 RESULT_BACKEND = (os.getenv("CELERY_RESULT_BACKEND") or BROKER_URL).strip()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ""
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5").strip()
+# OBS: GPT-5 accepterar endast default-temperatur. Vi skickar aldrig 'temperature' för gpt-5*.
+OPENAI_TEMPERATURE = os.getenv("OPENAI_TEMPERATURE", "").strip()  # används endast för icke-gpt-5
 
 TARGET_COMPONENT_DIR = (
     os.getenv("TARGET_COMPONENT_DIR", "frontendplay/src/components/ai").strip().rstrip("/")
@@ -76,6 +98,9 @@ ICON_MAX = int(os.getenv("ICON_MAX", "256"))
 ICON_AR_MIN = float(os.getenv("ICON_AR_MIN", "0.75"))
 ICON_AR_MAX = float(os.getenv("ICON_AR_MAX", "1.33"))
 
+# NYTT: respektera IGNORE_ROOT_FILL även i valideringen
+IGNORE_ROOT_FILL = os.getenv("IGNORE_ROOT_FILL", "0").lower() in ("1", "true", "yes")
+
 FIGMA_TOKEN: str | None = os.getenv("FIGMA_TOKEN")
 if not FIGMA_TOKEN:
     raise RuntimeError("FIGMA_TOKEN saknas i miljön (.env).")
@@ -83,6 +108,8 @@ if not FIGMA_TOKEN:
 ENABLE_VISUAL_VALIDATE = (
     os.getenv("ENABLE_VISUAL_VALIDATE", "false").lower() in ("1", "true", "yes")
 )
+
+CODEGEN_TIMING = os.getenv("CODEGEN_TIMING", "0").lower() in ("1", "true", "yes")
 
 # ─────────────────────────────────────────────────────────
 # Celery-app
@@ -292,19 +319,18 @@ def _prettier_bin(base: Path) -> List[str] | None:
 
 def _format_tsx(repo_root: Path, target_path: Path) -> None:
     """
-    Kör Prettier på target_path. Misslyckas inte pipeline om Prettier saknas
+    Kör Prettier på target_path om lokal bin finns. Misslyckas inte pipeline om Prettier saknas
     eller returnerar fel. Fallback: radbryter mellan taggar.
     """
     base = _find_project_base(repo_root, hint=target_path.parent)
     cmd = _prettier_bin(base)
-    if cmd is None:
-        cmd = ["npx", "prettier"]  # använder lokal om installerad, annars försöker npx
-    try:
-        rc, out, err = _run([*cmd, "--parser", "babel-ts", "--write", str(target_path)], cwd=base)
-        if rc == 0:
-            return
-    except Exception:
-        pass
+    if cmd is not None:
+        try:
+            rc, out, err = _run([*cmd, "--parser", "babel-ts", "--write", str(target_path)], cwd=base)
+            if rc == 0:
+                return
+        except Exception:
+            pass
     # Fallback-formattering: bryt mellan '><' för bättre diffbarhet
     try:
         code = target_path.read_text(encoding="utf-8")
@@ -353,16 +379,25 @@ def _fetch_svgs(file_key: str, ids: List[str]) -> Dict[str, str]:
     except requests.RequestException as e:
         raise HTTPException(502, f"Figma Images API error: {e}")
 
-    for nid, presigned in images.items():
-        if not presigned:
-            continue
-        try:
-            svg_resp = requests.get(presigned, timeout=20)
-            svg_resp.raise_for_status()
-            svg_text = svg_resp.text
-            out[str(nid)] = svg_text
-        except requests.RequestException:
-            pass
+    def _fetch_one(session: requests.Session, nid: str, presigned_url: str) -> Tuple[str, str]:
+        resp = session.get(presigned_url, timeout=5)
+        resp.raise_for_status()
+        return nid, resp.text
+
+    with requests.Session() as s, ThreadPoolExecutor(max_workers=8) as ex:
+        futs = []
+        for nid, presigned in images.items():
+            if presigned:
+                futs.append(ex.submit(functools.partial(_fetch_one, s, str(nid), presigned)))
+        for f in as_completed(futs):
+            try:
+                nid, svg_text = f.result()
+                if svg_text:
+                    out[nid] = svg_text
+            except Exception:
+                # Ignorera enskilda fel
+                pass
+
     return out
 
 # ─────────────────────────────────────────────────────────
@@ -515,6 +550,7 @@ def _build_messages(
         "För TEXT-noder: om 'text.lines' finns ska varje rad renderas separat. "
         "Rendera barn i stigande 'z' (barnens index). "
         "Skapa/uppdatera alltid en komponentfil (mode='file') i target_component_dir och montera via 'mount'; patch är förbjudet. "
+        "Sätt inte 'mount.import_path' i svaret; lämna den tom. Sätt endast 'mount.import_name' vid behov. "
         "Formatering: Skriv läsbar JSX, inte minifierad. Bryt return(...) över flera rader, en tagg per rad, korrekt indentering. "
         "Speglas i koden: behåll IR-hierarkin i JSX, så varje IR-node motsvarar ett element. "
         "Skriv aldrig ``` i något fält."
@@ -650,6 +686,7 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
         if not script_path.exists():
             raise HTTPException(500, f"Saknar scripts/ai_inject_mount.ts: {script_path}")
 
+        # Först: Node med tsx ESM-import
         cmd1 = [
             "node", "--import", "tsx",
             str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path),
@@ -662,6 +699,7 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
                 main_tsx.write_text(ns, encoding="utf-8")
             return
 
+        # Andra: Node med --loader tsx
         cmd1b = [
             "node", "--loader", "tsx",
             str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path),
@@ -674,22 +712,33 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
                 main_tsx.write_text(ns, encoding="utf-8")
             return
 
-        cmd2 = ["npx", "tsx", str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path)]
-        rc2, out2, err2 = _run(cmd2, cwd=base)
-
-        if rc2 != 0:
+        # Tredje: Lokal .bin/tsx om den finns (ingen npx)
+        local_tsx = base / "node_modules" / ".bin" / ("tsx.cmd" if os.name == "nt" else "tsx")
+        if local_tsx.exists():
+            cmd2 = [str(local_tsx), str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path)]
+            rc2, out2, err2 = _run(cmd2, cwd=base)
+            if rc2 == 0:
+                s = main_tsx.read_text(encoding="utf-8")
+                ns = _normalize_mount_markers(s)
+                if ns != s:
+                    main_tsx.write_text(ns, encoding="utf-8")
+                return
+            else:
+                raise HTTPException(
+                    500,
+                    "AST-injektion misslyckades:\n"
+                    f"{' '.join(cmd1)}\n{err or out}\n\n"
+                    f"{' '.join(cmd1b)}\n{err1b or out1b}\n\n"
+                    f"{' '.join(cmd2)}\n{err2 or out2}"
+                )
+        else:
             raise HTTPException(
                 500,
-                "AST-injektion misslyckades:\n"
+                "AST-injektion misslyckades och lokal tsx saknas:\n"
                 f"{' '.join(cmd1)}\n{err or out}\n\n"
-                f"{' '.join(cmd1b)}\n{err1b or out1b}\n\n"
-                f"{' '.join(cmd2)}\n{err2 or out2}"
+                f"{' '.join(cmd1b)}\n{err1b or out1b}\n"
+                "Installera 'tsx' i devDependencies eller lägg till script."
             )
-        else:
-            s = main_tsx.read_text(encoding="utf-8")
-            ns = _normalize_mount_markers(s)
-            if ns != s:
-                main_tsx.write_text(ns, encoding="utf-8")
     finally:
         try:
             os.unlink(jsx_file_path)
@@ -781,6 +830,16 @@ def _sanitize_tailwind_conflicts(src: str) -> str:
         return f'className={q}{cls}{q}'
 
     return _CLS_RE.sub(fix, src)
+
+# Kompaktar alla Tailwind arbitrary values: bg-[rgba(0,0,0,0.2)] etc.
+_ARBITRARY = re.compile(r'(\-[[])([^]]+)([]])')
+def _compact_arbitrary_values(src: str) -> str:
+    def repl(m: re.Match) -> str:
+        inner = m.group(2)
+        inner = re.sub(r'\s+', '', inner)
+        inner = inner.replace('% ', '%')
+        return m.group(1) + inner + m.group(3)
+    return _ARBITRARY.sub(repl, src)
 
 # Endast för <img>: ta bort left-/top-/absolute så ikoner inte placeras utanför vyn
 _IMG_WITH_CLASS = re.compile(
@@ -874,21 +933,49 @@ def _gather_classes(file_code: str) -> str:
 
 # === C) Dimensions/positions-validering ==================
 
+def _px_s(x: Any | None) -> str | None:
+    if x is None: return None
+    try:
+        fx = float(x)
+        return f"{int(round(fx))}px" if abs(fx - round(fx)) < 1e-6 else f"{round(fx,2)}px"
+    except Exception:
+        return None
+
+def _is_layout_only(n: Dict[str, Any]) -> bool:
+    """
+    True om noden inte bidrar visuellt: ingen fill/stroke/effect/text och ingen clipping.
+    Används för att undvika krav på w/h/pos som skapar “tomma block” i DOM.
+    """
+    if n.get("type") == "TEXT":
+        return False
+    if n.get("clips_content"):
+        return False
+    if (n.get("text") or {}).get("content") or (n.get("text") or {}).get("lines"):
+        return False
+    if any(_ for _ in (n.get("effects") or [])):
+        return False
+    fills = n.get("fills") or []
+    def _has_visual_fill(f: Dict[str,Any]) -> bool:
+        t = str(f.get("type") or "")
+        if t == "SOLID":
+            return bool(f.get("color")) and float(f.get("alpha",1) or 1) > 0.001
+        if t.startswith("GRADIENT_"):
+            return bool(f.get("stops"))
+        if t == "IMAGE":
+            return bool(f.get("imageRef"))
+        return False
+    has_visual_fill = any(_has_visual_fill(f) for f in fills)
+    has_stroke = bool(n.get("strokes"))
+    return not has_visual_fill and not has_stroke
+
 def _assert_dims_positions(ir: Dict[str, Any], file_code: str, icon_asset_ids: set[str] | None = None) -> None:
     """
     Validerar att noder som faktiskt renderas i JSX har motsvarande Tailwind-klasser.
     Ikon-subträd som exporteras som en enda <img> hoppas över.
+    Skipper även layout-only wrappers.
     """
     classes = _gather_classes(file_code)
     icon_asset_ids = set(icon_asset_ids or set())
-
-    def _px_s(x: Any | None) -> str | None:
-        if x is None: return None
-        try:
-            fx = float(x)
-            return f"{int(round(fx))}px" if abs(fx - round(fx)) < 1e-6 else f"{round(fx,2)}px"
-        except Exception:
-            return None
 
     def _any(tokens: List[str]) -> bool:
         return any(tok in classes for tok in tokens if tok)
@@ -910,7 +997,7 @@ def _assert_dims_positions(ir: Dict[str, Any], file_code: str, icon_asset_ids: s
         return [] if not s else [f"top-[{s}]"]
 
     def rec(n: Dict[str,Any], clip: Dict[str, float] | None, skip: bool = False):
-        # Hoppa över ikon-subträdet: dess interna vektor-leafs renderas inte separat i JSX
+        # Hoppa över ikon-subträdet
         if skip or (n.get("id") in icon_asset_ids):
             next_clip = _next_clip_ir(n, clip)
             for ch in n.get("children") or []:
@@ -920,6 +1007,13 @@ def _assert_dims_positions(ir: Dict[str, Any], file_code: str, icon_asset_ids: s
         if not bool(n.get("visible_effective", True)):
             return
         if not _effectively_visible_ir(n, clip):
+            return
+
+        # Layout-only wrapper → ingen dims/pos-tvingning
+        if _is_layout_only(n):
+            next_clip = _next_clip_ir(n, clip)
+            for ch in n.get("children") or []:
+                rec(ch, next_clip, False)
             return
 
         b = n.get("bounds") or {}
@@ -980,10 +1074,11 @@ def _assert_colors_shadows_and_gradients(
     - Ignorerar ikon-subträd (renderas som <img>).
     - Är case-tålig för hex.
     - Tillåter valfri whitespace i rgba() och matchar via prefix.
+    - NYTT: ignorerar fill på root när IGNORE_ROOT_FILL=1.
+    - NYTT: accepterar #rrggbbaa samt slash-opacity (bg-[#000]/20) i arbitrary.
     """
     icon_asset_ids = set(icon_asset_ids or set())
 
-    # Samla className-attributen oförändrade och bygg både token-set och blob
     class_attrs = [m.group("val") or "" for m in _CLS_RE.finditer(file_code)]
     class_blob = " ".join(class_attrs).lower()
     class_tokens: set[str] = set()
@@ -999,40 +1094,57 @@ def _assert_colors_shadows_and_gradients(
     def has_sub(s: str) -> bool:
         return s.lower() in class_blob
 
+    def _rgba_triplet(c_hex: str) -> Tuple[int,int,int]:
+        c = c_hex.lstrip("#")
+        return int(c[0:2],16), int(c[2:4],16), int(c[4:6],16)
+
+    def _has_alpha_variants(col_hex: str, a: float, is_text: bool) -> bool:
+        r,g,b = _rgba_triplet(col_hex)
+        pref = "text-[" if is_text else "bg-["
+        # rgba variant
+        if has_sub(f"{pref}rgba({r},{g},{b},"):
+            return True
+        # hex8 variant
+        aa = f"{int(round(a*255)):02x}"
+        if has_sub(f"{pref}#{col_hex.lower().lstrip('#')}{aa}]"):
+            return True
+        # slash opacity variant
+        if has_sub(f"{pref}#{col_hex.lower().lstrip('#')}/"):
+            return True
+        return False
+
     def rec(n: Dict[str,Any], clip: Dict[str, float] | None):
-        # Hoppa över hela ikon-subträdet
         if n.get("id") in icon_asset_ids:
             return
-
         if not _effectively_visible_ir(n, clip):
             return
 
-        fills = n.get("fills") or []
-        for f in fills:
-            if _bool(f.get("visible", True), True):
-                t = str(f.get("type") or "")
-                if t == "SOLID":
-                    col = f.get("color"); a = float(f.get("alpha",1) or 1)
-                    if not col:
+        # Ignorera root-fill om flaggad
+        if not (IGNORE_ROOT_FILL and n.get("is_root")):
+            for f in (n.get("fills") or []):
+                if _bool(f.get("visible", True), True):
+                    t = str(f.get("type") or "")
+                    if t == "SOLID":
+                        col = f.get("color"); a = float(f.get("alpha",1) or 1)
+                        if not col:
+                            break
+                        if a >= 0.999:
+                            want = f"text-[{col}]" if n.get("type") == "TEXT" else f"bg-[{col}]"
+                            if not has_token(want):
+                                raise HTTPException(500, f"Saknar färgklass {want}")
+                        else:
+                            is_text = (n.get("type") == "TEXT")
+                            if not _has_alpha_variants(col, a, is_text):
+                                raise HTTPException(500, "Saknar semitransparent färgklass (rgba, #rrggbbaa eller /opacity)")
                         break
-                    if a >= 0.999:
-                        want = f"text-[{col}]" if n.get("type") == "TEXT" else f"bg-[{col}]"
-                        if not has_token(want):
-                            raise HTTPException(500, f"Saknar färgklass {want}")
-                    else:
-                        pref = "text-[rgba(" if n.get("type") == "TEXT" else "bg-[rgba("
-                        if not has_sub(pref):
-                            raise HTTPException(500, f"Saknar rgba-färgklass som börjar med {pref}")
-                    break
-                if t.startswith("GRADIENT_"):
-                    if not has_sub("bg-[linear-gradient("):
-                        raise HTTPException(500, "Saknar gradientklass bg-[linear-gradient(...)]")
-                    break
+                    if t.startswith("GRADIENT_"):
+                        if not has_sub("bg-[linear-gradient("):
+                            raise HTTPException(500, "Saknar gradientklass bg-[linear-gradient(...)]")
+                        break
 
         css = n.get("css") or {}
         if css.get("boxShadow"):
             want = f"shadow-[{css['boxShadow']}]".lower()
-            # shadow-arbitrary innehåller mellanslag → matcha via substring
             if want not in class_tokens and want not in class_blob:
                 if not has_sub("shadow-["):
                     raise HTTPException(500, f"Saknar skuggklass {want}")
@@ -1042,6 +1154,46 @@ def _assert_colors_shadows_and_gradients(
             rec(ch, next_clip)
 
     rec(ir["root"], None)
+
+# Förbjud bakgrunder som inte finns i IR
+_BG_TOKEN = re.compile(r'\bbg-\[([^\]]+)\]')
+
+def _expected_bg_set(ir: Dict[str,Any]) -> set[str]:
+    exp: set[str] = set()
+    def rec(n: Dict[str,Any]):
+        if n.get("type") != "TEXT":
+            for f in n.get("fills") or []:
+                if not _bool(f.get("visible",True), True):
+                    continue
+                t = str(f.get("type") or "")
+                if t == "SOLID" and f.get("color") and (float(f.get("alpha",1) or 1) > 0.001):
+                    col = str(f["color"]).lower().lstrip("#")
+                    a = float(f.get("alpha",1) or 1)
+                    if a >= 0.999:
+                        exp.add(f"#{col}")
+                    else:
+                        r,g,b = int(col[0:2],16), int(col[2:4],16), int(col[4:6],16)
+                        exp.add(f"rgba({r},{g},{b},")  # prefixmatch
+                        aa = f"{int(round(a*255)):02x}"
+                        exp.add(f"#{col}{aa}")        # hex8
+                        exp.add(f"#{col}/")            # slash-opacity prefix
+                elif t.startswith("GRADIENT_"):
+                    exp.add("linear-gradient(")        # prefix
+        for ch in n.get("children") or []:
+            rec(ch)
+    rec(ir["root"])
+    return exp
+
+def _assert_only_expected_backgrounds(ir: Dict[str,Any], file_code: str) -> None:
+    allowed = _expected_bg_set(ir)
+    bad: list[str] = []
+    for m in _BG_TOKEN.finditer(file_code):
+        raw = m.group(1).strip().lower().replace(" ", "")
+        ok = any(raw.startswith(a.replace(" ", "")) for a in allowed)
+        if not ok:
+            bad.append(raw)
+    if bad:
+        raise HTTPException(500, "Otillåtna bakgrunder i JSX: " + ", ".join(sorted(set(bad))[:12]))
 
 # ─────────────────────────────────────────────────────────
 # Typografi (inkl. krav på font-family)
@@ -1346,6 +1498,116 @@ def _assert_icons_used(file_code: str, icon_assets: List[Dict[str, Any]]) -> Non
             raise HTTPException(500, msg)
 
 # ─────────────────────────────────────────────────────────
+# Extra layout-guard
+# ─────────────────────────────────────────────────────────
+
+def _assert_layout_justify(ir: Dict[str,Any], file_code: str) -> None:
+    want = (ir["root"].get("layout") or {}).get("justify_content")
+    blob = _gather_classes(file_code)
+    if want != "space-between" and "justify-between" in blob:
+        raise HTTPException(500, "Modellen använde justify-between trots att IR inte kräver det.")
+
+# ─────────────────────────────────────────────────────────
+# GPT-5-säker anropare med fallback
+# ─────────────────────────────────────────────────────────
+
+def _supports_temperature(model: str) -> bool:
+    # GPT-5-modeller accepterar inte explicit temperatur ≠ default
+    return not model.lower().startswith("gpt-5")
+
+def _parse_temperature(s: str) -> float | None:
+    try:
+        v = float(s)
+        return v
+    except Exception:
+        return None
+
+def _is_invalid_content_err(e: Exception) -> bool:
+    t = str(e).lower()
+    return ("invalid content" in t) or ("model produced invalid" in t)
+
+def _is_temp_unsupported_err(e: Exception) -> bool:
+    t = str(e).lower()
+    return ("temperature" in t) and ("unsupported" in t or "only the default" in t)
+
+def _call_codegen(client: OpenAI, model: str, messages: list[Any], schema: dict) -> Any:
+    """
+    Robust kedja:
+      gpt-5: JSON Schema strict=False → json_object
+      övriga: strict=True → strict=False → json_object
+    Tar hänsyn till GPT-5:s temperaturbegränsning.
+    """
+    base_kwargs: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+    }
+
+    # Lägg endast temperatur för icke-gpt-5 och om användaren faktiskt satt ett värde != 1
+    if _supports_temperature(model):
+        t = _parse_temperature(OPENAI_TEMPERATURE)
+        if t is not None and t != 1.0:
+            base_kwargs["temperature"] = t
+
+    # Hjälpare som kan prova en create med automatisk retry om temps är ogiltig
+    def _try_create(**kw):
+        try:
+            return client.chat.completions.create(**kw)
+        except Exception as e:
+            if _is_temp_unsupported_err(e) and "temperature" in kw:
+                kw2 = dict(kw)
+                kw2.pop("temperature", None)
+                return client.chat.completions.create(**kw2)
+            raise
+
+    ml = model.lower()
+    if ml.startswith("gpt-5"):
+        # 1) strict=False
+        try:
+            return _try_create(
+                **base_kwargs,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": "Codegen", "schema": schema, "strict": False},
+                },
+            )
+        except Exception:
+            # 2) json_object
+            return _try_create(
+                **base_kwargs,
+                response_format={"type": "json_object"},
+            )
+
+    # Icke gpt-5: full kedja
+    try:
+        return _try_create(
+            **base_kwargs,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "Codegen", "schema": schema, "strict": True},
+            },
+        )
+    except Exception as e:
+        if not _is_invalid_content_err(e):
+            raise
+
+    try:
+        return _try_create(
+            **base_kwargs,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "Codegen", "schema": schema, "strict": False},
+            },
+        )
+    except Exception as e:
+        if not _is_invalid_content_err(e):
+            raise
+
+    return _try_create(
+        **base_kwargs,
+        response_format={"type": "json_object"},
+    )
+
+# ─────────────────────────────────────────────────────────
 # Celery-task
 # ─────────────────────────────────────────────────────────
 
@@ -1353,10 +1615,13 @@ def _assert_icons_used(file_code: str, icon_assets: List[Dict[str, Any]]) -> Non
 def integrate_figma_node(
     *, file_key: str, node_id: str, placement: Dict[str, Any] | None = None
 ) -> Dict[str, Any]:
+    t0 = time.time()
     figma_json = _fetch_figma_node(file_key, node_id)
+    t1 = time.time()
 
     ir_full = FIR.figma_to_ir(figma_json, node_id)
     ir = FIR.filter_visible_ir(ir_full) if hasattr(FIR, "filter_visible_ir") else ir_full
+    t2 = time.time()
 
     # Samla ikon-noder och filtrera bort orimliga/text-bärande SVG
     raw_icon_nodes = FIR.collect_icon_nodes(ir["root"])
@@ -1371,6 +1636,7 @@ def integrate_figma_node(
 
     svg_by_id = _fetch_svgs(file_key, [x["id"] for x in icon_nodes])
     svg_by_id = {nid: svg for nid, svg in svg_by_id.items() if svg and not _svg_has_text(svg)}
+    t3 = time.time()
 
     icon_assets: List[Dict[str, Any]] = []
 
@@ -1419,16 +1685,9 @@ def integrate_figma_node(
     client = OpenAI(api_key=OPENAI_API_KEY)
     messages = _build_messages(ir, components, placement, icon_assets)
 
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=messages,
-        response_format={
-            "type": "json_schema",
-            "json_schema": {"name": "Codegen", "schema": schema, "strict": True},
-        },
-        temperature=0,
-        top_p=1,
-    )
+    # GPT-5-säkert anrop med snabbare fallback
+    resp = _call_codegen(client, OPENAI_MODEL, messages, schema)
+    t4 = time.time()
 
     raw = resp.choices[0].message.content or "{}"
     try:
@@ -1446,6 +1705,8 @@ def integrate_figma_node(
 
     mount = out.get("mount") or {}
     mount.setdefault("anchor", _ANCHOR_SINGLE)
+    # Ignorera modellens import_path, pipeline härleder en säker relativ
+    mount.pop("import_path", None)
 
     def _derive_import_name(source: str | None) -> str:
         base = (source or "GeneratedComponent")
@@ -1463,7 +1724,7 @@ def integrate_figma_node(
         return name
 
     if not mount.get("import_name"):
-        cand = mount.get("import_path") or out.get("target_path") or "GeneratedComponent"
+        cand = out.get("target_path") or "GeneratedComponent"
         mount["import_name"] = _derive_import_name(str(cand))
 
     imp_raw = (mount.get("import_path") or "").strip().replace("\\", "/")
@@ -1505,6 +1766,8 @@ def integrate_figma_node(
     file_code = _autofix_missing_icons(file_code, icon_assets)
     # Sanera <img>-positionering innan validering
     file_code = _sanitize_img_positions(file_code)
+    # Kompaktar arbitrary (tar bort blanks i bg-[rgba(...)] etc.)
+    file_code = _compact_arbitrary_values(file_code)
 
     # Valideringar (kör på oformatterad sträng)
     _assert_icons_used(str(file_code), icon_assets)
@@ -1513,10 +1776,13 @@ def integrate_figma_node(
     icon_ids = {ia["id"] for ia in icon_assets}
     _assert_dims_positions(ir, str(file_code), icon_ids)
     _assert_colors_shadows_and_gradients(ir, str(file_code), icon_ids)
+    _assert_only_expected_backgrounds(ir, str(file_code))
+    _assert_layout_justify(ir, str(file_code))
     _assert_typography(ir, str(file_code))
 
     # Skriv fil och formatera med Prettier för tydlig struktur
-    target_path.write_text(_sanitize_tailwind_conflicts(file_code), encoding="utf-8")
+    cleaned = _sanitize_tailwind_conflicts(_compact_arbitrary_values(file_code))
+    target_path.write_text(cleaned, encoding="utf-8")
     _format_tsx(tmp_root, target_path)
 
     returned_primary_path = target_rel
@@ -1526,8 +1792,27 @@ def integrate_figma_node(
     main_rel = main_candidates[0] if main_candidates else "frontendplay/src/main.tsx"
     main_abs = _safe_join(tmp_root, main_rel)
     mount["import_path"] = _rel_import_from_main(main_abs, target_path)
-    if not mount.get("jsx"):
-        mount["jsx"] = f"<{mount['import_name']} />"
+
+    # Root-offset wrapper för korrekt placering i viewport
+    try:
+        # Använd rootClip för origo och invertera tecknet så renderingen hamnar i (0,0)
+        USE_CLIP = os.getenv("MOUNT_USE_ROOTCLIP", "1").lower() in ("1", "true", "yes")
+        vw = int(ir["meta"]["viewport"]["w"])
+        vh = int(ir["meta"]["viewport"]["h"])
+        base_rect = ((ir.get("root", {}).get("debug") or {}).get("rootClip") if USE_CLIP else ir["root"].get("bounds")) or {}
+        cx = int(round(float(base_rect.get("x") or 0)))
+        cy = int(round(float(base_rect.get("y") or 0)))
+        dx, dy = -cx, -cy
+
+        mount["jsx"] = (
+            f"<div className='relative w-[{vw}px] h-[{vh}px] overflow-hidden'>"
+            f"<div className='absolute left-[{dx}px] top-[{dy}px]'>"
+            f"<{mount['import_name']} />"
+            f"</div></div>"
+        )
+    except Exception:
+        if not mount.get("jsx"):
+            mount["jsx"] = f"<{mount['import_name']} />"
 
     _ast_inject_mount(tmp_root, mount)
 
@@ -1579,6 +1864,16 @@ def integrate_figma_node(
         final_changes.append(_read_rel(tmp_root, returned_primary_path))
 
     primary = next((c for c in final_changes if c["path"] == returned_primary_path), final_changes[0])
+
+    if CODEGEN_TIMING:
+        t5 = time.time()
+        print("[codegen_timing]", {
+            "figma": round(t1 - t0, 3),
+            "ir": round(t2 - t1, 3),
+            "svg": round(t3 - t2, 3),
+            "model": round(t4 - t3, 3),
+            "post": round(t5 - t4, 3),
+        })
 
     result: Dict[str, Any] = {
         "status": "SUCCESS",
