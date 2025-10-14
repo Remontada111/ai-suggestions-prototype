@@ -1,32 +1,34 @@
-# backend/tasks/codegen.py
 from __future__ import annotations
 """
 Celery-worker: Figma-node → IR → LLM-förslag → (AST-mount + file) → validering → commit → returnera ändringar
 
 Uppdateringar:
+- ENDAST IR-fält används för bakgrund: läs n.bg, aldrig n.fills för bakgrund.
+- Validatorn kräver bg-* endast om n.bg finns. Skipper layout-only wrappers.
+- Slash-opacity bg-[#hex]/NN stöds i både purge och validering.
+- Spärr för palettklasser: alla bg- som inte är bg-[…] blockeras.
+- Pre-purge: oönskade bg-* som inte finns i IR strippas innan validering.
+- Gradients valideras enbart mot IR (n.bg.css), inte mot Figma-fills.
+
+Övrigt (oförändrat från tidigare variant):
 - Endast synlig text (visible_effective=True) byggs till textkrav.
 - Tailwind-hints (tw_map) skickas till modellen.
 - Tolerant men informativ validering för mått/position.
 - Ikonexporten filtrerar bort containers och SVG:er som innehåller <text>/<tspan> eller orimliga mått/aspekt.
 - Dims/pos-validering körs mot klippkedja och respekterar effektiv synlighet.
 - Validering kräver font-family-klass i JSX enligt Figma (arbitrary value), inkl. korrekt escaping.
-
-Nytt i denna version:
 - Ikonprompten kräver import av varje ikon och exakt en <img> per ikon, utan absoluta left/top.
 - Ikonvalideringen accepterar både absoluta (/src/...) och relativa imports, validerar storlek och exakt en användning, men ignorerar position.
 - Sanering tar bort felaktiga left-/top-/absolute-klasser på <img> så ikoner inte hamnar utanför vyn.
 - AUTO-FIX: Saknade ikon-importer och <img>-taggar injiceras automatiskt i file_code innan validering.
 - Dims/pos-validering hoppar över ikon-subträd (leafs i exporterad ikon kontrolleras inte separat).
 - Färgvalidering hoppar över ikon-subträd och är case-/format-tålig (hex och rgba).
-
-Nytt i denna variant:
 - Prettier kör endast lokal bin om den finns, annars lätt fallback-formattering (ingen npx).
 - AST-injektion använder endast lokala metoder (node + tsx eller lokal .bin/tsx), ingen npx.
 - Figma SVG-hämtning parallelliseras med kortare timeouts.
 - GPT-5: hoppa direkt till strikt=False schema, därefter json_object.
 - Systemprompten ber modellen att lämna mount.import_path tomt.
-
-Felsäkringar för 1:1:
+- AUTO-FIX: injicera font-['Open_Sans'] på första JSX-wrappern när IR har exakt en fontfamilj.
 - Kompaktar ALLA Tailwind arbitrary values (bg-[rgba(0,0,0,0.2)] etc.) så blanks aldrig bryter klasser.
 - Förbjuder bakgrunder som inte finns i IR. Stoppar spök-`bg-[#000]` på wrapper-noder.
 - Tillåter semitransparent färg via rgba, #rrggbbaa eller slash-opacity.
@@ -98,7 +100,7 @@ ICON_MAX = int(os.getenv("ICON_MAX", "256"))
 ICON_AR_MIN = float(os.getenv("ICON_AR_MIN", "0.75"))
 ICON_AR_MAX = float(os.getenv("ICON_AR_MAX", "1.33"))
 
-# NYTT: respektera IGNORE_ROOT_FILL även i valideringen
+# Respektera IGNORE_ROOT_FILL även i bg-logiken (bakåtkompat)
 IGNORE_ROOT_FILL = os.getenv("IGNORE_ROOT_FILL", "0").lower() in ("1", "true", "yes")
 
 FIGMA_TOKEN: str | None = os.getenv("FIGMA_TOKEN")
@@ -110,6 +112,16 @@ ENABLE_VISUAL_VALIDATE = (
 )
 
 CODEGEN_TIMING = os.getenv("CODEGEN_TIMING", "0").lower() in ("1", "true", "yes")
+
+# Endast önskade loggar
+LOG_FIGMA_JSON = os.getenv("LOG_FIGMA_JSON", "0").lower() in ("1", "true", "yes")
+LOG_FIGMA_IR = os.getenv("LOG_FIGMA_IR", "0").lower() in ("1", "true", "yes")
+
+# NYTT: IR/Prompt jämförelseloggar
+LOG_PROMPT_IR = os.getenv("LOG_PROMPT_IR", "0").lower() in ("1", "true", "yes")
+LOG_IR_FULL = os.getenv("LOG_IR_FULL", "0").lower() in ("1", "true", "yes")
+LOG_IR_COMPARE = os.getenv("LOG_IR_COMPARE", "0").lower() in ("1", "true", "yes")
+IR_COMPARE_LIMIT = int(os.getenv("IR_COMPARE_LIMIT", "200") or "200")
 
 # ─────────────────────────────────────────────────────────
 # Celery-app
@@ -206,6 +218,17 @@ def _git_apply(repo_root: Path, diff_text: str) -> None:
             pass
 
 
+def _safe_print(tag: str, payload: Any) -> None:
+    # Begränsad och säker print
+    try:
+        print(f"[{tag}]", json.dumps(payload, ensure_ascii=False, default=str), flush=True)
+    except Exception:
+        try:
+            print(f"[{tag}]", str(payload), flush=True)
+        except Exception:
+            pass
+
+
 def _fetch_figma_node(file_key: str, node_id: str) -> Dict[str, Any]:
     url = f"https://api.figma.com/v1/files/{file_key}/nodes"
     headers = {"X-Figma-Token": FIGMA_TOKEN}
@@ -220,6 +243,16 @@ def _fetch_figma_node(file_key: str, node_id: str) -> Dict[str, Any]:
         data = resp.json()
     except Exception as e:
         raise HTTPException(502, f"Ogiltigt JSON-svar från Figma: {e}") from e
+
+    # Endast önskad logg: Figma JSON för efterfrågad nod
+    if LOG_FIGMA_JSON:
+        try:
+            node_doc = ((data or {}).get("nodes", {}).get(node_id, {}) or {}).get("document") or {}
+            _safe_print("figma.json", {"node_id": node_id, "document": node_doc})
+            _dump_json_file("figma-doc", node_id, node_doc)
+        except Exception:
+            pass
+
     return cast(Dict[str, Any], data)
 
 
@@ -505,6 +538,34 @@ def _icon_size_ok(w: float, h: float) -> bool:
 # LLM-prompt
 # ─────────────────────────────────────────────────────────
 
+def _abs_pos_hints(ir_root: dict) -> Dict[str, Dict[str, str]]:
+    """
+    Bygger explicita left-/top-klasshintar från ABSOLUTA root-koordinater (n.bounds.x/y).
+    Används för att styra modellen bort från ev. relativa pos-värden i tw_map.
+    """
+    out: Dict[str, Dict[str, str]] = {}
+
+    def _px(v: Any) -> str:
+        try:
+            f = float(v or 0)
+            return f"{int(round(f))}px" if abs(f - round(f)) < 1e-6 else f"{round(f,2)}px"
+        except Exception:
+            return "0px"
+
+    def rec(n: Dict[str, Any]):
+        if n.get("abs"):
+            b = n.get("bounds") or {}
+            lid = str(n.get("id") or "")
+            out[lid] = {
+                "left": f"left-[{_px(b.get('x', 0))}]",
+                "top":  f"top-[{_px(b.get('y', 0))}]",
+            }
+        for c in n.get("children") or []:
+            rec(c)
+
+    rec(ir_root)
+    return out
+
 def _build_messages(
     ir: dict,
     components: dict[str, Path],
@@ -517,6 +578,7 @@ def _build_messages(
         overview = {name: str(path) for name, path in components.items()}
 
     tw_map = FIR.build_tailwind_map(ir["root"])
+    abs_pos = _abs_pos_hints(ir["root"])
 
     user_payload = {
         "ir": ir,
@@ -525,6 +587,7 @@ def _build_messages(
         "icon_assets": icon_assets,
         "required_texts": _required_texts(ir),
         "tw_map": tw_map,
+        "abs_pos": abs_pos,  # absoluta positioneringshintar
         "constraints": {
             "framework": "react+vite",
             "mount_anchor": "AI-INJECT-MOUNT",
@@ -549,6 +612,9 @@ def _build_messages(
         "JSX får endast innehålla texterna i 'required_texts' ordagrant. "
         "För TEXT-noder: om 'text.lines' finns ska varje rad renderas separat. "
         "Rendera barn i stigande 'z' (barnens index). "
+        "POSITIONER: För noder med ABSOLUTE layout MÅSTE left-[..] och top-[..] motsvara n.bounds.x respektive n.bounds.y "
+        "(absoluta root-koordinater i pixlar). Om 'abs_pos' finns, använd exakt de klassvärdena. "
+        "Ignorera eventuella left/top i 'tw_map' om de är root-relativa. "
         "Skapa/uppdatera alltid en komponentfil (mode='file') i target_component_dir och montera via 'mount'; patch är förbjudet. "
         "Sätt inte 'mount.import_path' i svaret; lämna den tom. Sätt endast 'mount.import_name' vid behov. "
         "Formatering: Skriv läsbar JSX, inte minifierad. Bryt return(...) över flera rader, en tagg per rad, korrekt indentering. "
@@ -841,6 +907,41 @@ def _compact_arbitrary_values(src: str) -> str:
         return m.group(1) + inner + m.group(3)
     return _ARBITRARY.sub(repl, src)
 
+# === AUTO-FIX: font-family injektion på första wrappern ===
+
+def _fonts_in_ir(ir: Dict[str, Any]) -> set[str]:
+    fams: set[str] = set()
+    def rec(n: Dict[str, Any]):
+        if n.get("type") == "TEXT":
+            st = (n.get("text") or {}).get("style") or {}
+            fam = st.get("fontFamily")
+            if isinstance(fam, str) and fam.strip():
+                fams.add(fam.strip())
+        for c in n.get("children") or []:
+            rec(c)
+    rec(ir["root"])
+    return fams
+
+def _autofix_font_family(ir: Dict[str, Any], file_code: str) -> str:
+    """
+    Om IR har exakt en fontfamilj: injicera font-['{fam_us}'] i första className.
+    Undviker konflikt med kompaktering genom att använda underscore.
+    """
+    if not isinstance(file_code, str) or not file_code.strip():
+        return file_code
+    fams = _fonts_in_ir(ir)
+    if len(fams) != 1:
+        return file_code
+    fam = next(iter(fams))
+    fam_us = fam.replace(" ", "_").replace("\\","\\\\").replace("'","\\'")
+    def repl(m: re.Match) -> str:
+        q = m.group("q"); val = m.group("val") or ""
+        if "font-[" in val:
+            return m.group(0)
+        new_val = (val + " " + f"font-['{fam_us}']").strip()
+        return f'className={q}{new_val}{q}'
+    return _CLS_RE.sub(repl, file_code, count=1)
+
 # Endast för <img>: ta bort left-/top-/absolute så ikoner inte placeras utanför vyn
 _IMG_WITH_CLASS = re.compile(
     r'(<img\b[^>]*\bclassName\s*=\s*)(?P<q>"|\')(?P<cls>.*?)(?P=q)(?P<tail>[^>]*>)',
@@ -857,7 +958,7 @@ def _sanitize_img_positions(src: str) -> str:
         cls = re.sub(r'\brelative\b', '', cls)
         cls = re.sub(r'\s+', ' ', cls).strip()
         return f"{m.group(1)}{q}{cls}{q}{m.group('tail')}"
-    return _IMG_WITH_CLASS.sub(repl, src)
+    return _sanitize_tailwind_conflicts(_IMG_WITH_CLASS.sub(repl, src))
 
 _SVG_META = re.compile(r"<\s*(title|desc)\b[^>]*>.*?<\s*/\s*\1\s*>", re.IGNORECASE | re.DOTALL)
 
@@ -876,7 +977,7 @@ _ATTR_PATTERNS = [
     r'title\s*=\s*"([^"]+)"',
     r"title\s*=\s*'([^']+)'",
     r'title\s*=\s*\{\s*"([^"]+)"\s*\}',
-    r"title\s*=\s*\{\s*'([^']+)" r"'\s*\}",
+    r"title\s*=\s*\{\s*'([^']+)'\s*\}",
     r'alt\s*=\s*"([^"]+)"',
     r"alt\s*=\s*'([^']+)'",
     r'alt\s*=\s*\{\s*"([^"]+)"\s*\}',
@@ -888,7 +989,7 @@ def _extract_attr_texts(src: str) -> List[str]:
         for m in re.finditer(pat, src, flags=re.IGNORECASE | re.DOTALL):
             val = m.group(1)
             out.extend(_canon_text_lines(val))
-    return [_canon_text(p).replace("\u2026", "...") for p in out if 0 < len(p) <= 80]
+    return [_canon_text(p).replace("\u2026", "...") for p in out if p]
 
 def _purge_unexpected_text_nodes(src: str, allowed: List[str]) -> str:
     allowed_norm = {_norm_key(a) for a in allowed}
@@ -910,7 +1011,7 @@ def _extract_jsx_text(src: str) -> List[str]:
             if g is not None:
                 parts.extend(_canon_text_lines(g))
                 break
-    return [_canon_text(p).replace("\u2026", "...") for p in parts if 0 < len(p) <= 80]
+    return [_canon_text(p).replace("\u2026", "...") for p in parts if p]
 
 def _assert_no_extra_texts(ir: Dict[str, Any], file_code: str) -> None:
     exp_raw = _required_texts(ir)
@@ -954,7 +1055,7 @@ def _is_layout_only(n: Dict[str, Any]) -> bool:
         return False
     if any(_ for _ in (n.get("effects") or [])):
         return False
-    fills = n.get("fills") or []
+    fills = n.get("fills") or []  # används endast för att bedöma visuellt bidrag, ej färg
     def _has_visual_fill(f: Dict[str,Any]) -> bool:
         t = str(f.get("type") or "")
         if t == "SOLID":
@@ -966,6 +1067,10 @@ def _is_layout_only(n: Dict[str, Any]) -> bool:
         return False
     has_visual_fill = any(_has_visual_fill(f) for f in fills)
     has_stroke = bool(n.get("strokes"))
+    # Om ny IR tillhandahåller n.bg, behandla det som visuellt
+    if not has_visual_fill and not has_stroke:
+        if isinstance(n.get("bg"), dict):
+            return False
     return not has_visual_fill and not has_stroke
 
 def _assert_dims_positions(ir: Dict[str, Any], file_code: str, icon_asset_ids: set[str] | None = None) -> None:
@@ -1050,19 +1155,35 @@ def _assert_dims_positions(ir: Dict[str, Any], file_code: str, icon_asset_ids: s
 
         next_clip = _next_clip_ir(n, clip)
         for ch in n.get("children") or []:
-            rec(ch, next_clip, False)
+            rec(ch, next_clip)
 
     root = cast(Dict[str, Any], ir.get("root") or {})
     root_clip = cast(Dict[str, float] | None, (root.get("debug") or {}).get("rootClip") or root.get("bounds"))
     rec(root, root_clip, False)
 
 # ─────────────────────────────────────────────────────────
-# Färger, skuggor, gradients
+# Färger, skuggor, gradients (BG via IR n.bg)
 # ─────────────────────────────────────────────────────────
 
 def _hex_to_rgba_str(hex_col: str, a: float) -> str:
     r = int(hex_col[1:3],16); g = int(hex_col[3:5],16); b = int(hex_col[5:7],16)
     return f"rgba({r}, {g}, {b}, {a})"
+
+def _rgba_triplet_from_hex(c_hex: str) -> Tuple[int,int,int]:
+    c = c_hex.lstrip("#")
+    return int(c[0:2],16), int(c[2:4],16), int(c[4:6],16)
+
+def _bg_obj(n: Dict[str, Any]) -> Dict[str, Any] | None:
+    bg = n.get("bg")
+    if isinstance(bg, dict):
+        return bg
+    return None
+
+def _has_token(blob_tokens: set[str], tok: str) -> bool:
+    return tok.lower() in blob_tokens
+
+def _has_sub(blob_text: str, s: str) -> bool:
+    return s.lower() in blob_text
 
 def _assert_colors_shadows_and_gradients(
     ir: Dict[str, Any],
@@ -1070,48 +1191,55 @@ def _assert_colors_shadows_and_gradients(
     icon_asset_ids: set[str] | None = None,
 ) -> None:
     """
-    Färg/skugg/gradient-validering som:
-    - Ignorerar ikon-subträd (renderas som <img>).
-    - Är case-tålig för hex.
-    - Tillåter valfri whitespace i rgba() och matchar via prefix.
-    - NYTT: ignorerar fill på root när IGNORE_ROOT_FILL=1.
-    - NYTT: accepterar #rrggbbaa samt slash-opacity (bg-[#000]/20) i arbitrary.
+    BG-validering:
+    - Använd endast n.bg (SOLID/GRADIENT). Kräv bg-* endast när n.bg finns.
+    - Skippa layout-only wrappers och ikon-subträd.
+    - Root-bg ignoreras när IGNORE_ROOT_FILL=1 för bakåtkompat.
+    Textfärg:
+    - För TEXT använder vi text.style.color om den finns (hex eller rgba).
+    Skuggor:
+    - Samma som tidigare via n.css.boxShadow.
     """
     icon_asset_ids = set(icon_asset_ids or set())
 
     class_attrs = [m.group("val") or "" for m in _CLS_RE.finditer(file_code)]
-    class_blob = " ".join(class_attrs).lower()
-    class_tokens: set[str] = set()
+    class_blob_text = " ".join(class_attrs).lower()
+    class_blob_tokens: set[str] = set()
     for s in class_attrs:
         for t in s.split():
             tt = t.strip().lower()
             if tt:
-                class_tokens.add(tt)
+                class_blob_tokens.add(tt)
 
-    def has_token(tok: str) -> bool:
-        return tok.lower() in class_tokens
-
-    def has_sub(s: str) -> bool:
-        return s.lower() in class_blob
-
-    def _rgba_triplet(c_hex: str) -> Tuple[int,int,int]:
-        c = c_hex.lstrip("#")
-        return int(c[0:2],16), int(c[2:4],16), int(c[4:6],16)
-
-    def _has_alpha_variants(col_hex: str, a: float, is_text: bool) -> bool:
-        r,g,b = _rgba_triplet(col_hex)
-        pref = "text-[" if is_text else "bg-["
+    def _has_alpha_variants_bg(col_hex: str, a: float) -> bool:
+        r,g,b = _rgba_triplet_from_hex(col_hex)
         # rgba variant
-        if has_sub(f"{pref}rgba({r},{g},{b},"):
+        if _has_sub(class_blob_text, f"bg-[rgba({r},{g},{b},"):
             return True
         # hex8 variant
         aa = f"{int(round(a*255)):02x}"
-        if has_sub(f"{pref}#{col_hex.lower().lstrip('#')}{aa}]"):
+        if _has_sub(class_blob_text, f"bg-[#" + col_hex.lower().lstrip("#") + aa + "]"):
             return True
-        # slash opacity variant
-        if has_sub(f"{pref}#{col_hex.lower().lstrip('#')}/"):
+        # slash opacity variant (tolerera valfritt /NN)
+        if _has_sub(class_blob_text, f"bg-[#" + col_hex.lower().lstrip("#") + "]/"):
             return True
         return False
+
+    def _assert_text_color(n: Dict[str, Any]) -> None:
+        if n.get("type") != "TEXT":
+            return
+        st = (n.get("text") or {}).get("style") or {}
+        col = st.get("color")
+        if not isinstance(col, str) or not col.strip():
+            return
+        want = f"text-[{col}]".lower()
+        if col.strip().startswith("#"):
+            if not _has_token(class_blob_tokens, want):
+                raise HTTPException(500, f"Saknar textfärgklass {want}")
+        else:
+            # rgba(...) prefixmatch
+            if not _has_sub(class_blob_text, "text-[rgba("):
+                raise HTTPException(500, "Saknar semitransparent textfärgklass text-[rgba(...)]")
 
     def rec(n: Dict[str,Any], clip: Dict[str, float] | None):
         if n.get("id") in icon_asset_ids:
@@ -1119,35 +1247,39 @@ def _assert_colors_shadows_and_gradients(
         if not _effectively_visible_ir(n, clip):
             return
 
-        # Ignorera root-fill om flaggad
+        # TEXT-färg via text.style.color
+        _assert_text_color(n)
+
+        # Ignorera root-bg om flaggad
         if not (IGNORE_ROOT_FILL and n.get("is_root")):
-            for f in (n.get("fills") or []):
-                if _bool(f.get("visible", True), True):
-                    t = str(f.get("type") or "")
+            # BG via IR
+            if not _is_layout_only(n):
+                bg = _bg_obj(n)
+                if bg:
+                    t = str((bg.get("type") or "")).upper()
                     if t == "SOLID":
-                        col = f.get("color"); a = float(f.get("alpha",1) or 1)
-                        if not col:
-                            break
-                        if a >= 0.999:
-                            want = f"text-[{col}]" if n.get("type") == "TEXT" else f"bg-[{col}]"
-                            if not has_token(want):
-                                raise HTTPException(500, f"Saknar färgklass {want}")
-                        else:
-                            is_text = (n.get("type") == "TEXT")
-                            if not _has_alpha_variants(col, a, is_text):
-                                raise HTTPException(500, "Saknar semitransparent färgklass (rgba, #rrggbbaa eller /opacity)")
-                        break
-                    if t.startswith("GRADIENT_"):
-                        if not has_sub("bg-[linear-gradient("):
-                            raise HTTPException(500, "Saknar gradientklass bg-[linear-gradient(...)]")
-                        break
+                        col = bg.get("color")
+                        a = float(bg.get("alpha", 1) or 1)
+                        if isinstance(col, str) and col.startswith("#") and len(col) >= 7:
+                            if a >= 0.999:
+                                want = f"bg-[{col.lower()}]"
+                                if not _has_token(class_blob_tokens, want):
+                                    raise HTTPException(500, f"Saknar bakgrundsklass {want}")
+                            else:
+                                if not _has_alpha_variants_bg(col, a):
+                                    raise HTTPException(500, "Saknar semitransparent bakgrundsklass (rgba, #rrggbbaa eller /opacity)")
+                    elif t == "GRADIENT":
+                        css = str(bg.get("css") or "")
+                        # Kräv endast när IR säger gradient
+                        if css.startswith("linear-gradient("):
+                            if not _has_sub(class_blob_text, "bg-[linear-gradient("):
+                                raise HTTPException(500, "Saknar gradientklass bg-[linear-gradient(...)]")
 
         css = n.get("css") or {}
         if css.get("boxShadow"):
             want = f"shadow-[{css['boxShadow']}]".lower()
-            if want not in class_tokens and want not in class_blob:
-                if not has_sub("shadow-["):
-                    raise HTTPException(500, f"Saknar skuggklass {want}")
+            if want not in class_blob_tokens and not _has_sub(class_blob_text, "shadow-["):
+                raise HTTPException(500, f"Saknar skuggklass {want}")
 
         next_clip = _next_clip_ir(n, clip)
         for ch in n.get("children") or []:
@@ -1155,45 +1287,147 @@ def _assert_colors_shadows_and_gradients(
 
     rec(ir["root"], None)
 
-# Förbjud bakgrunder som inte finns i IR
-_BG_TOKEN = re.compile(r'\bbg-\[([^\]]+)\]')
+# ─────────────────────────────────────────────────────────
+# Bakgrunder: only-from-IR kontroll och purge
+# ─────────────────────────────────────────────────────────
+
+# Fångar bg-[ … ] med valfri frivillig slash-opacity efteråt, t.ex. bg-[#000]/20
+_BG_TOKEN = re.compile(r'\bbg-\[(?P<inner>[^\]]+)\](?P<suffix>/[0-9]{1,3})?')
 
 def _expected_bg_set(ir: Dict[str,Any]) -> set[str]:
+    """
+    Returnerar tillåtna BG-patterns från IR. Vi använder prefixmatch för
+    rgba(…) och linear-gradient(…). För hex lägger vi både #hex och #hex/ (för slash-opacity).
+    Root kan ignoreras via IGNORE_ROOT_FILL.
+    """
     exp: set[str] = set()
     def rec(n: Dict[str,Any]):
-        if n.get("type") != "TEXT":
-            for f in n.get("fills") or []:
-                if not _bool(f.get("visible",True), True):
-                    continue
-                t = str(f.get("type") or "")
-                if t == "SOLID" and f.get("color") and (float(f.get("alpha",1) or 1) > 0.001):
-                    col = str(f["color"]).lower().lstrip("#")
-                    a = float(f.get("alpha",1) or 1)
+        if not bool(n.get("visible_effective", True)):
+            return
+        bg = n.get("bg")
+        if IGNORE_ROOT_FILL and n.get("is_root"):
+            bg = None
+        if not _is_layout_only(n) and isinstance(bg, dict):
+            t = str(bg.get("type") or "").upper()
+            if t == "SOLID":
+                col = bg.get("color"); a = float(bg.get("alpha",1) or 1)
+                if isinstance(col, str) and col.startswith("#") and len(col) >= 7:
+                    hexlow = col.lower()
                     if a >= 0.999:
-                        exp.add(f"#{col}")
+                        exp.add(hexlow)        # exakt match: bg-[#hex]
                     else:
-                        r,g,b = int(col[0:2],16), int(col[2:4],16), int(col[4:6],16)
-                        exp.add(f"rgba({r},{g},{b},")  # prefixmatch
+                        # Tillåt tre sätt
+                        r,g,b = _rgba_triplet_from_hex(hexlow)
+                        exp.add(f"rgba({r},{g},{b},")  # prefix
+                        exp.add(hexlow + "/")          # prefix för slash-opacity
                         aa = f"{int(round(a*255)):02x}"
-                        exp.add(f"#{col}{aa}")        # hex8
-                        exp.add(f"#{col}/")            # slash-opacity prefix
-                elif t.startswith("GRADIENT_"):
-                    exp.add("linear-gradient(")        # prefix
+                        exp.add(hexlow + aa)           # #rrggbbaa
+            elif t == "GRADIENT":
+                css = str(bg.get("css") or "")
+                if css.startswith("linear-gradient("):
+                    exp.add("linear-gradient(")  # prefix
         for ch in n.get("children") or []:
             rec(ch)
     rec(ir["root"])
     return exp
 
+def _purge_unexpected_backgrounds(ir: Dict[str,Any], file_code: str) -> str:
+    """
+    Tar bort alla bg-* klasser som inte är i IR. Palettklasser tas alltid bort.
+    Behåller endast bg-[…] som matchar förväntat set/prefix.
+    """
+    allowed = _expected_bg_set(ir)
+
+    def keep_arbitrary(inner: str, suffix: str | None) -> bool:
+        raw = (inner or "").strip().lower().replace(" ", "")
+        suf = (suffix or "").strip().lower()
+        # rgba prefix
+        if raw.startswith("rgba("):
+            return any(raw.startswith(a) for a in allowed if a.startswith("rgba("))
+        # linear-gradient prefix
+        if raw.startswith("linear-gradient("):
+            return any(a == "linear-gradient(" for a in allowed)
+        # hex or hex8 or slash opacity
+        if raw.startswith("#"):
+            # exact hex (no suffix)
+            if suf == "":
+                return raw in allowed
+            # slash-opacity
+            if suf.startswith("/"):
+                return (raw + "/") in allowed
+        # hex8 form: inner already contains #rrggbbaa
+        if raw.startswith("#") and len(raw) in (9, 13):  # tolerate #rrggbbaa or #rrggbbaa..extras
+            return any(raw.startswith(a) for a in allowed if a.startswith("#") and len(a) >= 9)
+        return False
+
+    def repl_class(m: re.Match) -> str:
+        q = m.group("q")
+        cls = m.group("val") or ""
+        tokens = cls.split()
+        kept: List[str] = []
+        for t in tokens:
+            tl = t.strip()
+            if not tl:
+                continue
+            if tl.startswith("bg-"):
+                # Palettklass? dvs inte bg-[…] → släng
+                if not tl.startswith("bg-["):
+                    continue
+                # bg-[…] ev /NN
+                m2 = _BG_TOKEN.match(tl)
+                if not m2:
+                    continue
+                inner = (m2.group("inner") or "").replace(" ", "")
+                suffix = m2.group("suffix")
+                if keep_arbitrary(inner, suffix):
+                    kept.append(tl)
+                else:
+                    # släng
+                    continue
+            else:
+                kept.append(tl)
+        new_val = " ".join(kept)
+        return f'className={q}{new_val}{q}'
+
+    return _CLS_RE.sub(repl_class, file_code)
+
 def _assert_only_expected_backgrounds(ir: Dict[str,Any], file_code: str) -> None:
+    """
+    Säkerställ:
+    1) Inga palettklasser bg-* utan bg-[…].
+    2) Alla bg-[…] finns i IR:s tillåtna uppsättning/prefix.
+    3) Slash-opacity valideras (bg-[#hex]/NN).
+    """
     allowed = _expected_bg_set(ir)
     bad: list[str] = []
-    for m in _BG_TOKEN.finditer(file_code):
-        raw = m.group(1).strip().lower().replace(" ", "")
-        ok = any(raw.startswith(a.replace(" ", "")) for a in allowed)
-        if not ok:
-            bad.append(raw)
+    class_attrs = [m.group("val") or "" for m in _CLS_RE.finditer(file_code)]
+
+    # 1) Palettklasser
+    for s in class_attrs:
+        for tok in s.split():
+            if tok.startswith("bg-") and not tok.startswith("bg-["):
+                bad.append(tok)
+
+    # 2) Arbitrary kontroller
+    for s in class_attrs:
+        for m in _BG_TOKEN.finditer(s):
+            inner = (m.group("inner") or "").strip().lower().replace(" ", "")
+            suffix = (m.group("suffix") or "").strip().lower()
+            ok = False
+            if inner.startswith("rgba("):
+                ok = any(inner.startswith(a) for a in allowed if a.startswith("rgba("))
+            elif inner.startswith("linear-gradient("):
+                ok = any(a == "linear-gradient(" for a in allowed)
+            elif inner.startswith("#"):
+                if suffix == "":
+                    ok = inner in allowed or any(inner.startswith(a) for a in allowed if len(a) >= 9 and a.startswith("#"))
+                else:
+                    ok = (inner + "/") in allowed
+            if not ok:
+                bad.append(f"bg-[{inner}]{suffix}")
+
     if bad:
-        raise HTTPException(500, "Otillåtna bakgrunder i JSX: " + ", ".join(sorted(set(bad))[:12]))
+        raise HTTPException(500, "Otillåtna bakgrunder i JSX: " + ", ".join(sorted(set(bad))[:20]))
 
 # ─────────────────────────────────────────────────────────
 # Typografi (inkl. krav på font-family)
@@ -1234,11 +1468,24 @@ def _assert_typography(ir: Dict[str, Any], file_code: str) -> None:
                 if want not in classes:
                     raise HTTPException(500, f"Saknar line-height klass {want}")
 
+            # FIX: tolerera nära-noll och acceptera tracking-normal
             ls = st.get("letterSpacing")
-            if isinstance(ls, str) and len(ls) > 0:
-                want = f"tracking-[{ls}]"
-                if want not in classes:
-                    raise HTTPException(500, f"Saknar letter-spacing klass {want}")
+            if isinstance(ls, str) and ls.strip():
+                m = re.match(r"^\s*([+-]?\d+(?:\.\d+)?)\s*px\s*$", ls)
+                if m:
+                    try:
+                        ls_val = float(m.group(1))
+                    except ValueError:
+                        ls_val = None
+                else:
+                    ls_val = None
+
+                if ls_val is not None and abs(ls_val) < 0.01:
+                    pass
+                else:
+                    want_candidates = [f"tracking-[{ls}]", "tracking-normal"]
+                    if not any(w in classes for w in want_candidates):
+                        raise HTTPException(500, f"Saknar letter-spacing klass {want_candidates[0]}")
 
             fw = st.get("fontWeight")
             if isinstance(fw, int) and fw in range(100, 1000, 100):
@@ -1608,6 +1855,123 @@ def _call_codegen(client: OpenAI, model: str, messages: list[Any], schema: dict)
     )
 
 # ─────────────────────────────────────────────────────────
+# Hjälp: IR-logg-summering (endast om LOG_FIGMA_IR=1)
+# ─────────────────────────────────────────────────────────
+
+def _ir_root_summary(ir: Dict[str, Any]) -> Dict[str, Any]:
+    def _cnt(n: Dict[str, Any]) -> int:
+        return 1 + sum(_cnt(c) for c in n.get("children") or [])
+    root = ir.get("root") or {}
+    return {
+        "meta": ir.get("meta"),
+        "root": {
+            "id": root.get("id"),
+            "type": root.get("type"),
+            "name": root.get("name"),
+            "bounds": root.get("bounds"),
+            "bg": root.get("bg"),
+            "children_total": _cnt(root),
+        },
+    }
+
+# ─────────────────────────────────────────────────────────
+# NYTT: JSON-dumps och IR↔Figma jämförelsehjälpare
+# ─────────────────────────────────────────────────────────
+
+def _dump_json_file(tag: str, node_id: str, payload: Any) -> str:
+    """Skriv JSON till temp och returnera sökvägen. Fail-tolerant."""
+    try:
+        ts = int(time.time())
+        p = Path(tempfile.gettempdir()) / f"{tag}-{node_id}-{ts}.json"
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        _safe_print(tag, {"node_id": node_id, "path": str(p)})
+        return str(p)
+    except Exception as e:
+        _safe_print("dump.error", {"tag": tag, "err": str(e)})
+        return ""
+
+def _flat_figma(n: Dict[str, Any], out: Dict[str, Any]) -> None:
+    bb = (n.get("absoluteRenderBounds") or n.get("absoluteBoundingBox") or {}) or {}
+    out[str(n.get("id") or "")] = {
+        "id": n.get("id"), "type": n.get("type"), "name": n.get("name"),
+        "visible": n.get("visible", True), "clipsContent": n.get("clipsContent", False),
+        "opacity": n.get("opacity", 1),
+        "bounds": {"x": bb.get("x"), "y": bb.get("y"), "w": bb.get("width"), "h": bb.get("height")},
+        "fills_len": len(n.get("fills") or []), "background_len": len(n.get("background") or n.get("backgrounds") or []),
+        "bgc": bool(n.get("backgroundColor")), "strokes_len": len(n.get("strokes") or []),
+        "effects_len": len(n.get("effects") or []),
+        "text": (n.get("type") == "TEXT"), "chars_len": len((n.get("characters") or "")),
+    }
+    for c in n.get("children") or []:
+        _flat_figma(c, out)
+
+def _flat_ir(n: Dict[str, Any], out: Dict[str, Any]) -> None:
+    node_id = str(n.get("id") or "")
+    out[node_id] = {
+        "id": n.get("id"), "type": n.get("type"), "name": n.get("name"),
+        "visible_effective": n.get("visible_effective", True), "clips_content": n.get("clips_content", False),
+        "opacity": n.get("opacity", 1), "bounds": n.get("bounds"),
+        "bg": (n.get("bg") or {}).get("type"), "fills_len": len(n.get("fills") or []),
+        "strokes_len": len(n.get("strokes") or []), "effects_len": len(n.get("effects") or []),
+        "text": (n.get("type") == "TEXT"), "lines_len": len(((n.get("text") or {}).get("lines")) or []),
+    }
+    for c in n.get("children") or []:
+        _flat_ir(c, out)
+
+def _cmp_bounds(a: Dict[str, Any] | None, b: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not a or not b: return {"dx": None, "dy": None, "dw": None, "dh": None}
+    return {
+        "dx": (b.get("x") or 0) - (a.get("x") or 0),
+        "dy": (b.get("y") or 0) - (a.get("y") or 0),
+        "dw": (b.get("w") or 0) - (a.get("w") or 0),
+        "dh": (b.get("h") or 0) - (a.get("h") or 0),
+    }
+
+def _compare_figma_vs_ir(figma_doc: Dict[str, Any], ir_visible: Dict[str, Any], limit: int = 200) -> Dict[str, Any]:
+    f_map: Dict[str, Any] = {}; _flat_figma(figma_doc, f_map)
+    i_map: Dict[str, Any] = {}; _flat_ir(ir_visible["root"], i_map)
+
+    f_ids = [k for k in f_map.keys() if k]
+    i_ids = [k for k in i_map.keys() if k]
+    kept = [k for k in f_ids if k in i_map]
+    dropped = [k for k in f_ids if k not in i_map]
+    added = [k for k in i_ids if k not in f_map]
+
+    per_node = {}
+    for nid in kept[:limit]:
+        per_node[nid] = {
+            "figma": f_map[nid],
+            "ir": i_map[nid],
+            "delta": {
+                "bounds_px": _cmp_bounds(
+                    {"x": f_map[nid]["bounds"]["x"], "y": f_map[nid]["bounds"]["y"], "w": f_map[nid]["bounds"]["w"], "h": f_map[nid]["bounds"]["h"]},
+                    i_map[nid]["bounds"],
+                ),
+                "opacity_diff": (i_map[nid]["opacity"] or 0) - (f_map[nid]["opacity"] or 0),
+                "visible_to_effective": {"figma_visible": f_map[nid]["visible"], "ir_effective": i_map[nid]["visible_effective"]},
+                "fills_len_diff": (i_map[nid]["fills_len"] or 0) - (f_map[nid]["fills_len"] or 0),
+                "effects_len_diff": (i_map[nid]["effects_len"] or 0) - (f_map[nid]["effects_len"] or 0),
+                "strokes_len_diff": (i_map[nid]["strokes_len"] or 0) - (f_map[nid]["strokes_len"] or 0),
+                "text_lines_vs_chars": {"lines": i_map[nid]["lines_len"], "chars": f_map[nid]["chars_len"]},
+                "bg_kind": i_map[nid]["bg"],
+            },
+        }
+
+    return {
+        "counts": {
+            "figma_nodes": len(f_ids),
+            "ir_nodes": len(i_ids),
+            "kept": len(kept),
+            "dropped": len(dropped),
+            "added": len(added),
+            "kept_ratio": round(len(kept) / max(1, len(f_ids)), 3),
+        },
+        "dropped_ids_sample": dropped[:limit],
+        "added_ids_sample": added[:limit],
+        "per_node_sample": per_node,
+    }
+
+# ─────────────────────────────────────────────────────────
 # Celery-task
 # ─────────────────────────────────────────────────────────
 
@@ -1621,6 +1985,33 @@ def integrate_figma_node(
 
     ir_full = FIR.figma_to_ir(figma_json, node_id)
     ir = FIR.filter_visible_ir(ir_full) if hasattr(FIR, "filter_visible_ir") else ir_full
+
+    # Endast önskad logg: vad figma_ir.py producerade
+    if LOG_FIGMA_IR:
+        try:
+            _safe_print("figma_ir.output", _ir_root_summary(ir_full))
+        except Exception:
+            pass
+
+    # NYTT: dumpa IR och jämförelse (valfritt via flaggor)
+    try:
+        if LOG_IR_FULL:
+            _dump_json_file("ir-full", node_id, ir_full)
+            _dump_json_file("ir-visible", node_id, ir)
+        if LOG_IR_COMPARE:
+            node_doc = ((figma_json or {}).get("nodes", {}).get(node_id, {}) or {}).get("document") or {}
+            if node_doc:
+                report = _compare_figma_vs_ir(node_doc, ir, IR_COMPARE_LIMIT)
+                _dump_json_file("ir-compare", node_id, report)
+                _safe_print("ir.compare.summary", {
+                    "node_id": node_id,
+                    **report["counts"],
+                    "dropped_sample": report.get("dropped_ids_sample", [])[:10],
+                    "added_sample": report.get("added_ids_sample", [])[:10],
+                })
+    except Exception as _e:
+        _safe_print("ir.compare.error", {"err": str(_e)})
+
     t2 = time.time()
 
     # Samla ikon-noder och filtrera bort orimliga/text-bärande SVG
@@ -1684,6 +2075,20 @@ def integrate_figma_node(
     schema = build_codegen_schema(TARGET_COMPONENT_DIR, ALLOW_PATCH)
     client = OpenAI(api_key=OPENAI_API_KEY)
     messages = _build_messages(ir, components, placement, icon_assets)
+
+    # ======= ENKEL PROMPTLOGG: ENDAST IR SOM SKICKAS TILL MODELLEN =======
+    if LOG_PROMPT_IR:
+        try:
+            umsg = messages[1]
+            content = umsg["content"] if isinstance(umsg, dict) else getattr(umsg, "content", None)
+            payload = json.loads(content) if isinstance(content, str) else {}
+            ir_for_model = payload.get("ir")
+            if ir_for_model:
+                _safe_print("ir.for_model.summary", _ir_root_summary(ir_for_model))
+                _dump_json_file("ir-for-model", node_id, ir_for_model)
+        except Exception as _e:
+            _safe_print("ir.log.error", {"err": str(_e)})
+    # =====================================================================
 
     # GPT-5-säkert anrop med snabbare fallback
     resp = _call_codegen(client, OPENAI_MODEL, messages, schema)
@@ -1768,6 +2173,10 @@ def integrate_figma_node(
     file_code = _sanitize_img_positions(file_code)
     # Kompaktar arbitrary (tar bort blanks i bg-[rgba(...)] etc.)
     file_code = _compact_arbitrary_values(file_code)
+    # Purge oönskade bg-* innan validering (IR-källsanning)
+    file_code = _purge_unexpected_backgrounds(ir, file_code)
+    # AUTO-FIX font-family på första wrappern om IR har exakt en fontfamilj
+    file_code = _autofix_font_family(ir, file_code)
 
     # Valideringar (kör på oformatterad sträng)
     _assert_icons_used(str(file_code), icon_assets)
@@ -1795,13 +2204,18 @@ def integrate_figma_node(
 
     # Root-offset wrapper för korrekt placering i viewport
     try:
-        # Använd rootClip för origo och invertera tecknet så renderingen hamnar i (0,0)
+        # Fallback till root.bounds om debug.rootClip saknas
         USE_CLIP = os.getenv("MOUNT_USE_ROOTCLIP", "1").lower() in ("1", "true", "yes")
         vw = int(ir["meta"]["viewport"]["w"])
         vh = int(ir["meta"]["viewport"]["h"])
-        base_rect = ((ir.get("root", {}).get("debug") or {}).get("rootClip") if USE_CLIP else ir["root"].get("bounds")) or {}
-        cx = int(round(float(base_rect.get("x") or 0)))
-        cy = int(round(float(base_rect.get("y") or 0)))
+        root_obj = ir.get("root", {}) or {}
+        base_rect = (
+            (root_obj.get("debug", {}) or {}).get("rootClip") or root_obj.get("bounds")
+        ) if USE_CLIP else (root_obj.get("bounds") or {})
+        if base_rect is None:
+            base_rect = {}
+        cx = int(round(float((base_rect.get("x") or 0))))
+        cy = int(round(float((base_rect.get("y") or 0))))
         dx, dy = -cx, -cy
 
         mount["jsx"] = (
@@ -1864,16 +2278,6 @@ def integrate_figma_node(
         final_changes.append(_read_rel(tmp_root, returned_primary_path))
 
     primary = next((c for c in final_changes if c["path"] == returned_primary_path), final_changes[0])
-
-    if CODEGEN_TIMING:
-        t5 = time.time()
-        print("[codegen_timing]", {
-            "figma": round(t1 - t0, 3),
-            "ir": round(t2 - t1, 3),
-            "svg": round(t3 - t2, 3),
-            "model": round(t4 - t3, 3),
-            "post": round(t5 - t4, 3),
-        })
 
     result: Dict[str, Any] = {
         "status": "SUCCESS",
