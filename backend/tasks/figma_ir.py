@@ -216,29 +216,35 @@ def _effective_fills(doc_node: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Best-effort “faktiskt använda” fills enligt Figma:
     - Om `fills` finns och har någon synlig paint → använd dessa.
-    - Annars, om `background`/`backgrounds` finns (t.ex. CANVAS/FRAME) → använd dem.
-      NYTT: för layout-wrappers som inte clippar filtreras opaque svart (#000, α≈1) bort.
-    - Annars, om `backgroundColor` har numeriskt rgb → skapa SOLID av den
-      med samma filtrering för layout-wrappers.
+    - Annars, begränsa `background`/`backgrounds` och `backgroundColor` till riktiga containers
+      (FRAME/COMPONENT) som clippar. Detta undviker oavsiktliga wrapper-bakgrunder.
+    - För layout-wrappers filtreras opaque svart (#000, α≈1) bort.
     """
+    # 1) Direkta fills vinner alltid
     fills_list = [p for p in (_get(doc_node,"fills",[]) or []) if _bool(_get(p,"visible",True),True)]
     if fills_list:
         return [_paint_to_fill(p) for p in fills_list]
 
+    # 2) Begränsad användning av backgrounds
     bgs = _get(doc_node, "background") or _get(doc_node, "backgrounds")
-    if isinstance(bgs, list) and bgs:
+    node_type = str(_get(doc_node, "type", ""))
+    clips = _clips_content(doc_node)
+
+    if isinstance(bgs, list) and bgs and node_type in ("FRAME", "COMPONENT") and clips:
         vis = [p for p in bgs if _bool(_get(p,"visible",True),True)]
         if LAYOUT_STRIP_OPAQUE_BLACK and _is_layout_wrapper(doc_node):
             vis = [p for p in vis if not _is_opaque_black_paint(p)]
         if vis:
             return [_paint_to_fill(p) for p in vis]
 
+    # 3) backgroundColor som sista utväg, samma begränsning
     bgc = _get(doc_node, "backgroundColor")
-    if _has_rgb(bgc):
+    if clips and node_type in ("FRAME", "COMPONENT") and _has_rgb(bgc):
         hex_, a = _rgba_hex(cast(Dict[str, Any], bgc))
         if LAYOUT_STRIP_OPAQUE_BLACK and _is_layout_wrapper(doc_node) and hex_ == "#000000" and (a or 0) >= 0.999:
             return []
         return [{"type":"SOLID","visible":True,"alpha":a,"color":hex_}]
+
     return []
 
 # NYTT: IR.bg från effective fills
@@ -698,7 +704,7 @@ def _node_to_ir(doc_node: Dict[str, Any], *,
         "layout": l,
         "constraints": cons,
         "fills": fills_eff,
-        "bg": bg_eff,                     # ← NYTT: explicit bakgrund för validering/TW
+        "bg": bg_eff,                     # ← explicit bakgrund från begränsade backgrounds
         "strokes": strokes,
         "stroke_alignment": stroke_align if strokes else "NONE",
         "radius": radius,
@@ -758,7 +764,7 @@ def _node_to_ir(doc_node: Dict[str, Any], *,
                     bg_desc = "gradient"; break
         _minlog("bg.root.summary", resolved=bg_desc)
 
-    # NYTT: per-nod logg
+    # Per-nod trace
     if TRACE_NODES:
         try:
             _minlog(
@@ -777,6 +783,10 @@ def _node_to_ir(doc_node: Dict[str, Any], *,
             )
         except Exception:
             pass
+
+    # NYTT: sista skydd – inga oavsiktliga bg på wrappers som inte clippar och saknar fills
+    if not clips_here and not fills_eff and ir.get("bg") and ir["type"] in ("GROUP", "INSTANCE"):
+        ir["bg"] = None
 
     return ir
 
@@ -846,7 +856,7 @@ def filter_visible_ir(ir_full: Dict[str, Any]) -> Dict[str, Any]:
     def contributes(n: Dict[str, Any]) -> bool:
         if bool(n.get("visible_effective", True)) and (
             (n.get("type")=="TEXT" and (n.get("text") or {}).get("content")) or
-            (n.get("fills")) or (n.get("strokes")) or (n.get("effects")) or
+            (n.get("fills")) or (n.get("effects")) or (n.get("strokes")) or
             _clips_content(n)
         ):
             return True

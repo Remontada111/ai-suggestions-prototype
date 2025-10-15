@@ -59,14 +59,9 @@ import requests
 from celery import Celery
 from dotenv import load_dotenv
 from fastapi import HTTPException
-from openai import OpenAI  # type: ignore
-from openai.types.chat import (
-    ChatCompletionSystemMessageParam,
-    ChatCompletionUserMessageParam,
-)
 
 from . import figma_ir as FIR
-from .schemas import build_codegen_schema
+from .det_codegen import generate_tsx_component
 from .utils import clone_repo, list_components, unique_branch
 
 # ─────────────────────────────────────────────────────────
@@ -77,11 +72,6 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 
 BROKER_URL = (os.getenv("CELERY_BROKER_URL") or "redis://redis:6379/0").strip()
 RESULT_BACKEND = (os.getenv("CELERY_RESULT_BACKEND") or BROKER_URL).strip()
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ""
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5").strip()
-# OBS: GPT-5 accepterar endast default-temperatur. Vi skickar aldrig 'temperature' för gpt-5*.
-OPENAI_TEMPERATURE = os.getenv("OPENAI_TEMPERATURE", "").strip()  # används endast för icke-gpt-5
 
 TARGET_COMPONENT_DIR = (
     os.getenv("TARGET_COMPONENT_DIR", "frontendplay/src/components/ai").strip().rstrip("/")
@@ -118,7 +108,6 @@ LOG_FIGMA_JSON = os.getenv("LOG_FIGMA_JSON", "0").lower() in ("1", "true", "yes"
 LOG_FIGMA_IR = os.getenv("LOG_FIGMA_IR", "0").lower() in ("1", "true", "yes")
 
 # NYTT: IR/Prompt jämförelseloggar
-LOG_PROMPT_IR = os.getenv("LOG_PROMPT_IR", "0").lower() in ("1", "true", "yes")
 LOG_IR_FULL = os.getenv("LOG_IR_FULL", "0").lower() in ("1", "true", "yes")
 LOG_IR_COMPARE = os.getenv("LOG_IR_COMPARE", "0").lower() in ("1", "true", "yes")
 IR_COMPARE_LIMIT = int(os.getenv("IR_COMPARE_LIMIT", "200") or "200")
@@ -535,99 +524,6 @@ def _icon_size_ok(w: float, h: float) -> bool:
     return (ICON_MIN <= iw <= ICON_MAX) and (ICON_MIN <= ih <= ICON_MAX) and _aspect_ok(iw, ih)
 
 # ─────────────────────────────────────────────────────────
-# LLM-prompt
-# ─────────────────────────────────────────────────────────
-
-def _abs_pos_hints(ir_root: dict) -> Dict[str, Dict[str, str]]:
-    """
-    Bygger explicita left-/top-klasshintar från ABSOLUTA root-koordinater (n.bounds.x/y).
-    Används för att styra modellen bort från ev. relativa pos-värden i tw_map.
-    """
-    out: Dict[str, Dict[str, str]] = {}
-
-    def _px(v: Any) -> str:
-        try:
-            f = float(v or 0)
-            return f"{int(round(f))}px" if abs(f - round(f)) < 1e-6 else f"{round(f,2)}px"
-        except Exception:
-            return "0px"
-
-    def rec(n: Dict[str, Any]):
-        if n.get("abs"):
-            b = n.get("bounds") or {}
-            lid = str(n.get("id") or "")
-            out[lid] = {
-                "left": f"left-[{_px(b.get('x', 0))}]",
-                "top":  f"top-[{_px(b.get('y', 0))}]",
-            }
-        for c in n.get("children") or []:
-            rec(c)
-
-    rec(ir_root)
-    return out
-
-def _build_messages(
-    ir: dict,
-    components: dict[str, Path],
-    placement: dict | None,
-    icon_assets: List[Dict[str, Any]],
-) -> list[Any]:
-    try:
-        overview = {name: str(path.relative_to(Path.cwd())) for name, path in components.items() if isinstance(path, Path)}
-    except Exception:
-        overview = {name: str(path) for name, path in components.items()}
-
-    tw_map = FIR.build_tailwind_map(ir["root"])
-    abs_pos = _abs_pos_hints(ir["root"])
-
-    user_payload = {
-        "ir": ir,
-        "components": overview,
-        "placement": placement or {},
-        "icon_assets": icon_assets,
-        "required_texts": _required_texts(ir),
-        "tw_map": tw_map,
-        "abs_pos": abs_pos,  # absoluta positioneringshintar
-        "constraints": {
-            "framework": "react+vite",
-            "mount_anchor": "AI-INJECT-MOUNT",
-            "target_component_dir": TARGET_COMPONENT_DIR,
-            "allow_patch": ALLOW_PATCH,
-            "no_inline_styles": True,
-            "no_dangerous_html": True,
-        },
-    }
-
-    system = (
-        "Du genererar en enda React-komponentfil som återger Figma-noden 1:1. "
-        "Inga extra texter, inga extra ikoner, inga wrappers utöver vad som krävs för exakt layout. "
-        "Inga inline-styles, ingen farlig HTML, inga design-tokens; använd Tailwind med godtyckliga värden. "
-        "ALLA visuella värden ska uttryckas explicit som Tailwind arbitrary utilities: "
-        "w-[NNpx]/h-[NNpx]/gap-[NNpx]/pt-[..], text-[NNpx], leading-[NNpx], tracking-[..], "
-        "färger text-[#RRGGBB]/bg-[#RRGGBB] eller rgba, skuggor shadow-[...], hörn rounded-[..], border-[..]. "
-        "IKONER: För VARJE post i 'icon_assets' måste du importera exakt import_path med suffix '?url' "
-        "och rendera exakt EN <img> per ikon med: src={ImportVar} alt='' aria-hidden='true' "
-        "width={w} height={h} className='inline-block align-middle w-[{w}px] h-[{h}px]'. "
-        "Använd inte absoluta left/top för ikoner i flex-rader; ikonen placeras i rätt rad enligt IR-strukturen. "
-        "JSX får endast innehålla texterna i 'required_texts' ordagrant. "
-        "För TEXT-noder: om 'text.lines' finns ska varje rad renderas separat. "
-        "Rendera barn i stigande 'z' (barnens index). "
-        "POSITIONER: För noder med ABSOLUTE layout MÅSTE left-[..] och top-[..] motsvara n.bounds.x respektive n.bounds.y "
-        "(absoluta root-koordinater i pixlar). Om 'abs_pos' finns, använd exakt de klassvärdena. "
-        "Ignorera eventuella left/top i 'tw_map' om de är root-relativa. "
-        "Skapa/uppdatera alltid en komponentfil (mode='file') i target_component_dir och montera via 'mount'; patch är förbjudet. "
-        "Sätt inte 'mount.import_path' i svaret; lämna den tom. Sätt endast 'mount.import_name' vid behov. "
-        "Formatering: Skriv läsbar JSX, inte minifierad. Bryt return(...) över flera rader, en tagg per rad, korrekt indentering. "
-        "Speglas i koden: behåll IR-hierarkin i JSX, så varje IR-node motsvarar ett element. "
-        "Skriv aldrig ``` i något fält."
-    )
-
-    return [
-        ChatCompletionSystemMessageParam(role="system", content=system),
-        ChatCompletionUserMessageParam(role="user", content=json.dumps(user_payload, ensure_ascii=False)),
-    ]
-
-# ─────────────────────────────────────────────────────────
 # Hjälpare för relativ import till main.tsx
 # ─────────────────────────────────────────────────────────
 
@@ -643,6 +539,22 @@ def _rel_import_from_main(main_tsx: Path, target_file: Path) -> str:
     if not rel.startswith("."):
         rel = "./" + rel
     return rel
+
+# Hjälpfunktion som tidigare låg inline i tasken
+def _derive_import_name(source: str | None) -> str:
+    base = (source or "GeneratedComponent")
+    try:
+        base = Path(base).name
+    except Exception:
+        pass
+    base = base.split(".")[0]
+    parts = re.split(r"[^A-Za-z0-9]+", base)
+    name = "".join(p[:1].upper() + p[1:] for p in parts if p)
+    if not name:
+        name = "GeneratedComponent"
+    if not re.match(r"[A-Za-z_]", name[0]):
+        name = "_" + name
+    return name
 
 # ─────────────────────────────────────────────────────────
 # AST-injektion (main.tsx) och säkert ankare
@@ -1755,106 +1667,6 @@ def _assert_layout_justify(ir: Dict[str,Any], file_code: str) -> None:
         raise HTTPException(500, "Modellen använde justify-between trots att IR inte kräver det.")
 
 # ─────────────────────────────────────────────────────────
-# GPT-5-säker anropare med fallback
-# ─────────────────────────────────────────────────────────
-
-def _supports_temperature(model: str) -> bool:
-    # GPT-5-modeller accepterar inte explicit temperatur ≠ default
-    return not model.lower().startswith("gpt-5")
-
-def _parse_temperature(s: str) -> float | None:
-    try:
-        v = float(s)
-        return v
-    except Exception:
-        return None
-
-def _is_invalid_content_err(e: Exception) -> bool:
-    t = str(e).lower()
-    return ("invalid content" in t) or ("model produced invalid" in t)
-
-def _is_temp_unsupported_err(e: Exception) -> bool:
-    t = str(e).lower()
-    return ("temperature" in t) and ("unsupported" in t or "only the default" in t)
-
-def _call_codegen(client: OpenAI, model: str, messages: list[Any], schema: dict) -> Any:
-    """
-    Robust kedja:
-      gpt-5: JSON Schema strict=False → json_object
-      övriga: strict=True → strict=False → json_object
-    Tar hänsyn till GPT-5:s temperaturbegränsning.
-    """
-    base_kwargs: Dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-    }
-
-    # Lägg endast temperatur för icke-gpt-5 och om användaren faktiskt satt ett värde != 1
-    if _supports_temperature(model):
-        t = _parse_temperature(OPENAI_TEMPERATURE)
-        if t is not None and t != 1.0:
-            base_kwargs["temperature"] = t
-
-    # Hjälpare som kan prova en create med automatisk retry om temps är ogiltig
-    def _try_create(**kw):
-        try:
-            return client.chat.completions.create(**kw)
-        except Exception as e:
-            if _is_temp_unsupported_err(e) and "temperature" in kw:
-                kw2 = dict(kw)
-                kw2.pop("temperature", None)
-                return client.chat.completions.create(**kw2)
-            raise
-
-    ml = model.lower()
-    if ml.startswith("gpt-5"):
-        # 1) strict=False
-        try:
-            return _try_create(
-                **base_kwargs,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {"name": "Codegen", "schema": schema, "strict": False},
-                },
-            )
-        except Exception:
-            # 2) json_object
-            return _try_create(
-                **base_kwargs,
-                response_format={"type": "json_object"},
-            )
-
-    # Icke gpt-5: full kedja
-    try:
-        return _try_create(
-            **base_kwargs,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {"name": "Codegen", "schema": schema, "strict": True},
-            },
-        )
-    except Exception as e:
-        if not _is_invalid_content_err(e):
-            raise
-
-    try:
-        return _try_create(
-            **base_kwargs,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {"name": "Codegen", "schema": schema, "strict": False},
-            },
-        )
-    except Exception as e:
-        if not _is_invalid_content_err(e):
-            raise
-
-    return _try_create(
-        **base_kwargs,
-        response_format={"type": "json_object"},
-    )
-
-# ─────────────────────────────────────────────────────────
 # Hjälp: IR-logg-summering (endast om LOG_FIGMA_IR=1)
 # ─────────────────────────────────────────────────────────
 
@@ -2070,88 +1882,18 @@ def integrate_figma_node(
 
     _ensure_node_modules(tmp_root)
 
-    components = list_components(str(tmp_root))
+    # Tillgängliga komponenter i reposet om det behövs för framtida logik
+    _ = list_components(str(tmp_root))
 
-    schema = build_codegen_schema(TARGET_COMPONENT_DIR, ALLOW_PATCH)
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    messages = _build_messages(ir, components, placement, icon_assets)
+    # === Deterministisk generering (ingen LLM) ===
+    comp_name = _derive_import_name(ir["root"].get("name") or "FigmaNode")
+    target_rel = (Path(TARGET_COMPONENT_DIR) / f"{comp_name}.tsx").as_posix()
+    _gen_filename, file_code = generate_tsx_component(ir, icon_assets, comp_name)
 
-    # ======= ENKEL PROMPTLOGG: ENDAST IR SOM SKICKAS TILL MODELLEN =======
-    if LOG_PROMPT_IR:
-        try:
-            umsg = messages[1]
-            content = umsg["content"] if isinstance(umsg, dict) else getattr(umsg, "content", None)
-            payload = json.loads(content) if isinstance(content, str) else {}
-            ir_for_model = payload.get("ir")
-            if ir_for_model:
-                _safe_print("ir.for_model.summary", _ir_root_summary(ir_for_model))
-                _dump_json_file("ir-for-model", node_id, ir_for_model)
-        except Exception as _e:
-            _safe_print("ir.log.error", {"err": str(_e)})
-    # =====================================================================
-
-    # GPT-5-säkert anrop med snabbare fallback
-    resp = _call_codegen(client, OPENAI_MODEL, messages, schema)
-    t4 = time.time()
-
-    raw = resp.choices[0].message.content or "{}"
-    try:
-        out = json.loads(raw)
-    except Exception as e:
-        raise HTTPException(500, f"Modellen returnerade ogiltig JSON: {e}")
-
-    mode = out.get("mode")
-    if mode != "file":
-        raise HTTPException(400, "Model must return mode='file'.")
-    for key in ("file_code", "unified_diff", "mount"):
-        v = out.get(key)
-        if isinstance(v, str) and _TRIPLE_BACKTICKS.search(v):
-            raise HTTPException(500, f"Ogiltigt innehåll i '{key}': innehåller ```")
-
-    mount = out.get("mount") or {}
-    mount.setdefault("anchor", _ANCHOR_SINGLE)
-    # Ignorera modellens import_path, pipeline härleder en säker relativ
-    mount.pop("import_path", None)
-
-    def _derive_import_name(source: str | None) -> str:
-        base = (source or "GeneratedComponent")
-        try:
-            base = Path(base).name
-        except Exception:
-            pass
-        base = base.split(".")[0]
-        parts = re.split(r"[^A-Za-z0-9]+", base)
-        name = "".join(p[:1].upper() + p[1:] for p in parts if p)
-        if not name:
-            name = "GeneratedComponent"
-        if not re.match(r"[A-Za-z_]", name[0]):
-            name = "_" + name
-        return name
-
-    if not mount.get("import_name"):
-        cand = out.get("target_path") or "GeneratedComponent"
-        mount["import_name"] = _derive_import_name(str(cand))
-
-    imp_raw = (mount.get("import_path") or "").strip().replace("\\", "/")
-    if not imp_raw:
-        tmp_rel = (Path(TARGET_COMPONENT_DIR) / f"{mount['import_name']}.tsx").as_posix()
-        imp_raw = Path(tmp_rel).with_suffix("").as_posix()
-    if imp_raw.endswith((".tsx", ".ts", ".jsx", ".js")):
-        imp_raw = imp_raw.rsplit(".", 1)[0]
-    if imp_raw.startswith("/") or ".." in imp_raw:
-        raise HTTPException(400, "import_path är ogiltig (absolut path eller '..').")
-    if not imp_raw.startswith("."):
-        imp_raw = "./" + imp_raw
-    mount["import_path"] = imp_raw
-
-    if not mount.get("jsx"):
-        mount["jsx"] = f"<{mount['import_name']} />"
-
-    out["mount"] = mount
-
-    target_rel = cast(str, out.get("target_path") or "")
-    if not target_rel:
-        raise HTTPException(500, "Saknar 'target_path' i modelsvaret.")
+    # Sätt upp mount som tidigare, import_path härleds senare relativt main.tsx
+    mount = {"anchor": _ANCHOR_SINGLE, "import_name": comp_name}
+    # Dummy 'out' för kompatibilitet längre ner (assets mm.)
+    out: Dict[str, Any] = {}
 
     branch = unique_branch(node_id)
     repo.git.checkout("-b", branch)
@@ -2161,9 +1903,6 @@ def integrate_figma_node(
 
     target_path = _safe_join(tmp_root, target_rel)
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    file_code = out.get("file_code")
-    if not isinstance(file_code, str) or not file_code.strip():
-        raise HTTPException(500, "file_code saknas för mode='file'.")
 
     # Rensa otillåten text
     file_code = _purge_unexpected_text_nodes(str(file_code), _required_texts(ir))
@@ -2248,11 +1987,8 @@ def integrate_figma_node(
     if main_abs.exists():
         changed_paths.append(main_rel)
 
-    assets = out.get("assets") or []
-    for a in assets if isinstance(assets, list) else []:
-        rel = str(a.get("path", "")).replace("\\", "/")
-        if rel:
-            changed_paths.append(rel)
+    # (ingen extra asset-hantering i deterministisk generator ännu)
+    assets: List[Dict[str, Any]] = []
 
     for ia in icon_assets:
         changed_paths.append(ia.get("fs_path") or ia["import_path"])
