@@ -25,8 +25,7 @@ function App() {
         {/* Lägg din iframe/devUrl-overlay här om du vill */}
         {/* AI-INJECT-MOUNT:BEGIN */}
         <Menu />
-        {/* AI-INJECT-MOUNT:END */}
-      </div>
+        {/* AI-INJECT-MOUNT:END */}</div>
     </div>
   );
 }

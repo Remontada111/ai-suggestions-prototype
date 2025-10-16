@@ -1,3 +1,4 @@
+# backend/figma_ir.py
 from __future__ import annotations
 """
 Figma → Lossless Render-IR för 1:1-kodgenerering.
@@ -9,8 +10,11 @@ Mål:
 - Tailwind-klasser för PX-exakta mått, position, färg, typografi, skuggor m.m.
 - Ingen “fallback-pruning”: wrappers som påverkar layout/färg/clip bevaras.
 - Ikon-hints för export (små vektorleaves eller typiska containerikoner).
-- Kompatibel med existerande pipeline-funktioner: figma_to_ir, filter_visible_ir,
+- Kompatibel med pipeline-funktioner: figma_to_ir, filter_visible_ir,
   build_tailwind_map, collect_icon_nodes.
+
+Viktigt:
+- IGNORE_ROOT_FILL=1 i miljön tar bort rootens bg direkt i IR (och rensar bg-klasser på root).
 """
 
 from typing import Any, Dict, List, Optional, Tuple, cast
@@ -21,18 +25,18 @@ import json
 from copy import deepcopy
 
 # ────────────────────────────────────────────────────────────────────────────
-# Konfiguration (konservativa defaults, inga onödiga toggles)
+# Konfiguration
 # ────────────────────────────────────────────────────────────────────────────
 
-ICON_MIN   = int(os.getenv("ICON_MIN", "12"))
-ICON_MAX   = int(os.getenv("ICON_MAX", "256"))
+ICON_MIN    = int(os.getenv("ICON_MIN", "12"))
+ICON_MAX    = int(os.getenv("ICON_MAX", "256"))
 ICON_AR_MIN = float(os.getenv("ICON_AR_MIN", "0.75"))
 ICON_AR_MAX = float(os.getenv("ICON_AR_MAX", "1.33"))
 
-# NYTT: ta bort opaque svart bakgrund på layout-wrappers (barnramar) som inte clippar
+# Ta bort opaque svart bakgrund på layout-wrappers (barnramar) som inte clippar
 LAYOUT_STRIP_OPAQUE_BLACK = os.getenv("LAYOUT_STRIP_OPAQUE_BLACK", "1").lower() in ("1","true","yes")
 
-_MINLOG = os.getenv("FIGMA_IR_MINLOG", "0").lower() in ("1","true","yes")
+_MINLOG     = os.getenv("FIGMA_IR_MINLOG", "0").lower() in ("1","true","yes")
 TRACE_NODES = int(os.getenv("FIGMA_IR_TRACE_NODES", "0") or "0")
 
 def _minlog(evt: str, **kv):
@@ -247,7 +251,7 @@ def _effective_fills(doc_node: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     return []
 
-# NYTT: IR.bg från effective fills
+# IR.bg från effective fills
 def _bg_from_effective_fills(fills: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
     Härled en enda bakgrund från effective fills:
@@ -493,8 +497,7 @@ def _tw_required_for_node(n: Dict[str, Any]) -> List[str]:
         st = (n.get("text") or {}).get("style") or {}
         col = st.get("color")
         if col:
-            if col.startswith("rgba("): tw.append(f"text-[{col}]")
-            else:                       tw.append(f"text-[{col}]")
+            tw.append(f"text-[{col}]")
     else:
         bg = n.get("bg")
         if isinstance(bg, dict):
@@ -682,6 +685,9 @@ def _node_to_ir(doc_node: Dict[str, Any], *,
 
     fills_eff = _effective_fills(doc_node)
     bg_eff = _bg_from_effective_fills(fills_eff)
+    if str(_get(doc_node, "type", "")) == "TEXT":
+        bg_eff = None
+        
     strokes, stroke_align = _stroke_to_ir(doc_node)
     radius = _radius_to_ir(doc_node)
     effects = _effects_to_ir(doc_node)
@@ -784,11 +790,16 @@ def _node_to_ir(doc_node: Dict[str, Any], *,
         except Exception:
             pass
 
-    # NYTT: sista skydd – inga oavsiktliga bg på wrappers som inte clippar och saknar fills
+    # Sista skydd – inga oavsiktliga bg på wrappers som inte clippar och saknar fills
     if not clips_here and not fills_eff and ir.get("bg") and ir["type"] in ("GROUP", "INSTANCE"):
         ir["bg"] = None
 
     return ir
+
+def _rebuild_tw_for_node(n: Dict[str, Any]) -> None:
+    """Rekalkylera TW för en nod utifrån dess aktuella IR-fält."""
+    tw = _tw_required_for_node(n)
+    n["tw"] = {"classes": " ".join(tw), "list": tw}
 
 # ────────────────────────────────────────────────────────────────────────────
 # Publikt API
@@ -810,7 +821,7 @@ def figma_to_ir(figma_json: Dict[str, Any], node_id: str) -> Dict[str, Any]:
 
     root_bounds = _bounds(doc)
 
-    # NYTT: startlogg
+    # Startlogg
     _minlog("ir.build.start", node_id=node_id, root_bounds=root_bounds)
 
     clip = dict(root_bounds)  # viewport = root-bounds
@@ -820,9 +831,17 @@ def figma_to_ir(figma_json: Dict[str, Any], node_id: str) -> Dict[str, Any]:
     root_ir = _node_to_ir(doc, root_origin=root_origin, inherited_clip=clip,
                           inherited_visible=True, _z=0, _is_root=True)
 
-    # Stabil z/order
+    # Ignorera rootens bg om flagga är satt: rensa IR och TW på root
+    if os.getenv("IGNORE_ROOT_FILL") == "1":
+        if isinstance(root_ir.get("bg"), dict) or root_ir.get("bg") is not None:
+            root_ir["bg"] = None
+        # rensa ev. bg-klass i TW genom att bygga om från IR
+        _rebuild_tw_for_node(root_ir)
+        _minlog("bg.root.ignored", flag="IGNORE_ROOT_FILL=1")
+
+    # Stabil z/order metadata
     def _reindex(n: Dict[str, Any]):
-        for i,ch in enumerate(n.get("children") or []):
+        for i, ch in enumerate(n.get("children") or []):
             ch["z"] = i
             by = int(round((ch.get("bounds",{}).get("y") or 0)))
             bx = int(round((ch.get("bounds",{}).get("x") or 0)))
@@ -840,7 +859,7 @@ def figma_to_ir(figma_json: Dict[str, Any], node_id: str) -> Dict[str, Any]:
     }
     out = {"meta": meta, "root": root_ir}
 
-    # NYTT: slutlogg
+    # Slutlogg
     try:
         _minlog("ir.build.done", meta=meta, totals={"nodes": len(json.dumps(root_ir))})
     except Exception:

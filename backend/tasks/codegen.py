@@ -1,3 +1,4 @@
+# backend/codegen.py
 from __future__ import annotations
 """
 Celery-worker: Figma-node → IR → LLM-förslag → (AST-mount + file) → validering → commit → returnera ändringar
@@ -112,6 +113,9 @@ LOG_IR_FULL = os.getenv("LOG_IR_FULL", "0").lower() in ("1", "true", "yes")
 LOG_IR_COMPARE = os.getenv("LOG_IR_COMPARE", "0").lower() in ("1", "true", "yes")
 IR_COMPARE_LIMIT = int(os.getenv("IR_COMPARE_LIMIT", "200") or "200")
 
+# NYTT: BG-debug
+LOG_BG_DEBUG = os.getenv("LOG_BG_DEBUG", "0").lower() in ("1", "true", "yes")
+
 # ─────────────────────────────────────────────────────────
 # Celery-app
 # ─────────────────────────────────────────────────────────
@@ -216,6 +220,11 @@ def _safe_print(tag: str, payload: Any) -> None:
             print(f"[{tag}]", str(payload), flush=True)
         except Exception:
             pass
+
+
+def _dbg_bg(event: str, payload: dict) -> None:
+    if LOG_BG_DEBUG:
+        _safe_print(f"bg.{event}", payload)
 
 
 def _fetch_figma_node(file_key: str, node_id: str) -> Dict[str, Any]:
@@ -810,14 +819,21 @@ def _sanitize_tailwind_conflicts(src: str) -> str:
     return _CLS_RE.sub(fix, src)
 
 # Kompaktar alla Tailwind arbitrary values: bg-[rgba(0,0,0,0.2)] etc.
-_ARBITRARY = re.compile(r'(\-[[])([^]]+)([]])')
+_ARB_WITH_PREFIX = re.compile(r'(?P<prefix>\b[a-zA-Z-]+)-\[(?P<inner>[^\]]+)\](?P<suf>/[0-9]{1,3})?')
 def _compact_arbitrary_values(src: str) -> str:
     def repl(m: re.Match) -> str:
-        inner = m.group(2)
-        inner = re.sub(r'\s+', '', inner)
-        inner = inner.replace('% ', '%')
-        return m.group(1) + inner + m.group(3)
-    return _ARBITRARY.sub(repl, src)
+        prefix = m.group('prefix')
+        inner  = m.group('inner')
+        suf    = m.group('suf') or ''
+        if prefix == 'font':
+            # behåll blanks i font-namn
+            cleaned = inner.replace('% ', '%')
+            return f'{prefix}-[{cleaned}]{suf}'
+        # komprimera för övriga arbitrary-klasser
+        inner2 = re.sub(r'\s+', '', inner).replace('% ', '%')
+        return f'{prefix}-[{inner2}]{suf}'
+    return _ARB_WITH_PREFIX.sub(repl, src)
+
 
 # === AUTO-FIX: font-family injektion på första wrappern ===
 
@@ -835,24 +851,23 @@ def _fonts_in_ir(ir: Dict[str, Any]) -> set[str]:
     return fams
 
 def _autofix_font_family(ir: Dict[str, Any], file_code: str) -> str:
-    """
-    Om IR har exakt en fontfamilj: injicera font-['{fam_us}'] i första className.
-    Undviker konflikt med kompaktering genom att använda underscore.
-    """
-    if not isinstance(file_code, str) or not file_code.strip():
-        return file_code
     fams = _fonts_in_ir(ir)
-    if len(fams) != 1:
+    # Only auto-fix when exactly one font-family exists in the IR
+    if not fams or len(fams) != 1:
         return file_code
     fam = next(iter(fams))
-    fam_us = fam.replace(" ", "_").replace("\\","\\\\").replace("'","\\'")
+    # behåll blanks så fonten matchar den laddade webfonten
+    fam_space = fam.replace("\\","\\\\").replace("'","\\'")
     def repl(m: re.Match) -> str:
         q = m.group("q"); val = m.group("val") or ""
         if "font-[" in val:
             return m.group(0)
-        new_val = (val + " " + f"font-['{fam_us}']").strip()
+        inner_q = '"' if q == "'" else "'"
+        new_val = (val + " " + f"font-[{inner_q}{fam_space}{inner_q}]").strip()
         return f'className={q}{new_val}{q}'
     return _CLS_RE.sub(repl, file_code, count=1)
+
+
 
 # Endast för <img>: ta bort left-/top-/absolute så ikoner inte placeras utanför vyn
 _IMG_WITH_CLASS = re.compile(
@@ -1037,6 +1052,9 @@ def _assert_dims_positions(ir: Dict[str, Any], file_code: str, icon_asset_ids: s
         nid = n.get("id"); nname = n.get("name"); ntype = n.get("type")
 
         w_tokens = _need_w(b.get("w"))
+        # TEXT-noder får använda auto i stället för px-bredd
+        if n.get("type") == "TEXT":
+            w_tokens = w_tokens + ["w-auto"]
         if w_tokens and not _any(w_tokens):
             raise HTTPException(
                 500,
@@ -1044,6 +1062,9 @@ def _assert_dims_positions(ir: Dict[str, Any], file_code: str, icon_asset_ids: s
                 f"för node id={nid} name={nname} type={ntype} bounds={b}"
             )
         h_tokens = _need_h(b.get("h"))
+        # TEXT-noder får använda auto i stället för px-höjd
+        if n.get("type") == "TEXT":
+            h_tokens = h_tokens + ["h-auto"]
         if h_tokens and not _any(h_tokens):
             raise HTTPException(
                 500,
@@ -1123,6 +1144,9 @@ def _assert_colors_shadows_and_gradients(
             if tt:
                 class_blob_tokens.add(tt)
 
+    # debug: lista ett urval av klasser som valideras mot
+    _dbg_bg("class-scan", {"sample_classes": list(class_blob_tokens)[:40]})
+
     def _has_alpha_variants_bg(col_hex: str, a: float) -> bool:
         r,g,b = _rgba_triplet_from_hex(col_hex)
         # rgba variant
@@ -1159,6 +1183,15 @@ def _assert_colors_shadows_and_gradients(
         if not _effectively_visible_ir(n, clip):
             return
 
+        # debug: per-nod bg som kontrolleras
+        if isinstance(n.get("bg"), dict):
+            _dbg_bg("check", {
+                "id": n.get("id"),
+                "name": n.get("name"),
+                "type": n.get("type"),
+                "bg": n.get("bg"),
+            })
+
         # TEXT-färg via text.style.color
         _assert_text_color(n)
 
@@ -1176,16 +1209,19 @@ def _assert_colors_shadows_and_gradients(
                             if a >= 0.999:
                                 want = f"bg-[{col.lower()}]"
                                 if not _has_token(class_blob_tokens, want):
-                                    raise HTTPException(500, f"Saknar bakgrundsklass {want}")
+                                    nid = n.get("id"); nname = n.get("name"); ntype = n.get("type"); b = n.get("bounds")
+                                    raise HTTPException(500, f"Saknar bakgrundsklass {want} för node id={nid} name={nname!r} type={ntype} bounds={b}")
                             else:
                                 if not _has_alpha_variants_bg(col, a):
-                                    raise HTTPException(500, "Saknar semitransparent bakgrundsklass (rgba, #rrggbbaa eller /opacity)")
+                                    nid = n.get("id"); nname = n.get("name"); ntype = n.get("type"); b = n.get("bounds")
+                                    raise HTTPException(500, f"Saknar semitransparent bakgrundsklass (rgba, #rrggbbaa eller /opacity) för node id={nid} name={nname!r} type={ntype} bounds={b}")
                     elif t == "GRADIENT":
                         css = str(bg.get("css") or "")
                         # Kräv endast när IR säger gradient
                         if css.startswith("linear-gradient("):
                             if not _has_sub(class_blob_text, "bg-[linear-gradient("):
-                                raise HTTPException(500, "Saknar gradientklass bg-[linear-gradient(...)]")
+                                nid = n.get("id"); nname = n.get("name"); ntype = n.get("type"); b = n.get("bounds")
+                                raise HTTPException(500, f"Saknar gradientklass bg-[linear-gradient(...)] för node id={nid} name={nname!r} type={ntype} bounds={b}")
 
         css = n.get("css") or {}
         if css.get("boxShadow"):
@@ -1277,6 +1313,7 @@ def _purge_unexpected_backgrounds(ir: Dict[str,Any], file_code: str) -> str:
         cls = m.group("val") or ""
         tokens = cls.split()
         kept: List[str] = []
+        removed: List[str] = []
         for t in tokens:
             tl = t.strip()
             if not tl:
@@ -1284,21 +1321,22 @@ def _purge_unexpected_backgrounds(ir: Dict[str,Any], file_code: str) -> str:
             if tl.startswith("bg-"):
                 # Palettklass? dvs inte bg-[…] → släng
                 if not tl.startswith("bg-["):
-                    continue
+                    removed.append(tl); continue
                 # bg-[…] ev /NN
                 m2 = _BG_TOKEN.match(tl)
                 if not m2:
-                    continue
+                    removed.append(tl); continue
                 inner = (m2.group("inner") or "").replace(" ", "")
                 suffix = m2.group("suffix")
                 if keep_arbitrary(inner, suffix):
                     kept.append(tl)
                 else:
-                    # släng
-                    continue
+                    removed.append(tl); continue
             else:
                 kept.append(tl)
         new_val = " ".join(kept)
+        if removed:
+            _dbg_bg("purge", {"removed": removed, "kept": kept})
         return f'className={q}{new_val}{q}'
 
     return _CLS_RE.sub(repl_class, file_code)
@@ -1311,6 +1349,8 @@ def _assert_only_expected_backgrounds(ir: Dict[str,Any], file_code: str) -> None
     3) Slash-opacity valideras (bg-[#hex]/NN).
     """
     allowed = _expected_bg_set(ir)
+    _dbg_bg("allowed", {"allowed": sorted(list(allowed))[:60]})
+
     bad: list[str] = []
     class_attrs = [m.group("val") or "" for m in _CLS_RE.finditer(file_code)]
 
@@ -1702,6 +1742,18 @@ def _dump_json_file(tag: str, node_id: str, payload: Any) -> str:
         _safe_print("dump.error", {"tag": tag, "err": str(e)})
         return ""
 
+def _dump_text_file(tag: str, node_id: str, text: str) -> str:
+    """Skriv text/TSX till temp och returnera sökvägen. Fail-tolerant."""
+    try:
+        ts = int(time.time())
+        p = Path(tempfile.gettempdir()) / f"{tag}-{node_id}-{ts}.tsx"
+        p.write_text(text, encoding="utf-8")
+        _safe_print(tag, {"node_id": node_id, "path": str(p), "len": len(text)})
+        return str(p)
+    except Exception as e:
+        _safe_print("dump.error", {"tag": tag, "err": str(e)})
+        return ""
+
 def _flat_figma(n: Dict[str, Any], out: Dict[str, Any]) -> None:
     bb = (n.get("absoluteRenderBounds") or n.get("absoluteBoundingBox") or {}) or {}
     out[str(n.get("id") or "")] = {
@@ -1912,8 +1964,20 @@ def integrate_figma_node(
     file_code = _sanitize_img_positions(file_code)
     # Kompaktar arbitrary (tar bort blanks i bg-[rgba(...)] etc.)
     file_code = _compact_arbitrary_values(file_code)
+
+    # Debug: snapshot före purge
+    if LOG_BG_DEBUG:
+        _dbg_bg("before_purge_snapshot", {"len": len(file_code)})
+        _dump_text_file("bg-before-purge", node_id, str(file_code))
+
     # Purge oönskade bg-* innan validering (IR-källsanning)
     file_code = _purge_unexpected_backgrounds(ir, file_code)
+
+    # Debug: snapshot efter purge
+    if LOG_BG_DEBUG:
+        _dbg_bg("after_purge_snapshot", {"len": len(file_code)})
+        _dump_text_file("bg-after-purge", node_id, str(file_code))
+
     # AUTO-FIX font-family på första wrappern om IR har exakt en fontfamilj
     file_code = _autofix_font_family(ir, file_code)
 
@@ -1941,31 +2005,8 @@ def integrate_figma_node(
     main_abs = _safe_join(tmp_root, main_rel)
     mount["import_path"] = _rel_import_from_main(main_abs, target_path)
 
-    # Root-offset wrapper för korrekt placering i viewport
-    try:
-        # Fallback till root.bounds om debug.rootClip saknas
-        USE_CLIP = os.getenv("MOUNT_USE_ROOTCLIP", "1").lower() in ("1", "true", "yes")
-        vw = int(ir["meta"]["viewport"]["w"])
-        vh = int(ir["meta"]["viewport"]["h"])
-        root_obj = ir.get("root", {}) or {}
-        base_rect = (
-            (root_obj.get("debug", {}) or {}).get("rootClip") or root_obj.get("bounds")
-        ) if USE_CLIP else (root_obj.get("bounds") or {})
-        if base_rect is None:
-            base_rect = {}
-        cx = int(round(float((base_rect.get("x") or 0))))
-        cy = int(round(float((base_rect.get("y") or 0))))
-        dx, dy = -cx, -cy
-
-        mount["jsx"] = (
-            f"<div className='relative w-[{vw}px] h-[{vh}px] overflow-hidden'>"
-            f"<div className='absolute left-[{dx}px] top-[{dy}px]'>"
-            f"<{mount['import_name']} />"
-            f"</div></div>"
-        )
-    except Exception:
-        if not mount.get("jsx"):
-            mount["jsx"] = f"<{mount['import_name']} />"
+    # Injicera endast komponenten utan wrapper för att undvika osynlig nod
+    mount["jsx"] = f"<{mount['import_name']} />"
 
     _ast_inject_mount(tmp_root, mount)
 
