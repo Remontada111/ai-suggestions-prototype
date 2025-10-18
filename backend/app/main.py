@@ -41,15 +41,9 @@ from backend.tasks.codegen import (  # noqa: E402
 # Figma-proxy (sRGB). Återanvänd handler-funktionen som route.
 from backend.tasks.figma_proxy import figma_image as figma_image_handler  # noqa: E402
 
-# Analyzer-router (måste finnas som backend/app/analyze.py med "router")
-try:
-    from .analyze import router as analyze_router  # noqa: E402
-except Exception as e:
-    raise RuntimeError(
-        "Kunde inte importera analyze-routern från backend.app.analyze.\n"
-        "Kontrollera att 'backend/__init__.py' och 'backend/app/__init__.py' finns (kan vara tomma)\n"
-        "och att backend/app/analyze.py exponerar 'router'."
-    ) from e
+# Analyzer-router: importeras senare (efter att app är skapad) för att undvika cirkulära imports.
+# backend/app/analyze.py måste exponera 'router'.
+analyze_router = None  # importeras vid användning
 
 # ── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -65,13 +59,22 @@ app.add_middleware(
 )
 
 # Inkludera analyzern (routern definierar sina paths)
-app.include_router(analyze_router)
+if analyze_router is not None:
+    app.include_router(analyze_router)
 
 # Registrera Figma-proxy-endpointen så URL blir /api/figma-image
 app.add_api_route("/api/figma-image", figma_image_handler, methods=["GET", "HEAD"], name="figma_image")
 
-# Preflight (CORS-mellanvaran svarar också, men detta gör 204 utan kropp)
-@app.options("/api/figma-image")
+# Inkludera analyzern (routern definierar sina paths)
+try:
+    from .analyze import router as analyze_router  # noqa: E402
+except Exception as e:
+    raise RuntimeError(
+        "Kunde inte importera analyze-routern från backend.app.analyze.\n"
+        "Kontrollera att 'backend/__init__.py' och 'backend/app/__init__.py' finns (kan vara tomma)\n"
+        "och att backend/app/analyze.py exponerar 'router'."
+    ) from e
+app.include_router(analyze_router)
 def _figma_image_options() -> Response:
     return Response(status_code=204)
 

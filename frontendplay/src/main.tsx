@@ -24,7 +24,7 @@ function App() {
       >
         {/* Lägg din iframe/devUrl-overlay här om du vill */}
         {/* AI-INJECT-MOUNT:BEGIN */}
-        <Menu />
+        <div className="fixed inset-0 z-[2147483647] pointer-events-none">  <div className="absolute left-0 top-0 w-[1280px] h-[800px]">    <div className="absolute left-[491px] top-[2px] w-[243px] h-[713px] overflow-hidden pointer-events-auto">      <Menu />    </div>  </div></div>
         {/* AI-INJECT-MOUNT:END */}</div>
     </div>
   );

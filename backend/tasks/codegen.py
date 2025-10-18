@@ -1,4 +1,3 @@
-# backend/codegen.py
 from __future__ import annotations
 """
 Celery-worker: Figma-node → IR → LLM-förslag → (AST-mount + file) → validering → commit → returnera ändringar
@@ -896,7 +895,7 @@ _ATTR_PATTERNS = [
     r'placeholder\s*=\s*"([^"]+)"',
     r"placeholder\s*=\s*'([^']+)'",
     r'placeholder\s*=\s*\{\s*"([^"]+)"\s*\}',
-    r"placeholder\s*=\s*\{\s*'([^']+)'\s*\}",
+    r"placeholder\s*=\s*\{\s*'([^']+)'",
     r'aria-label\s*=\s*"([^"]+)"',
     r"aria-label\s*=\s*'([^']+)'",
     r'aria-label\s*=\s*\{\s*"([^"]+)"\s*\}',
@@ -904,7 +903,7 @@ _ATTR_PATTERNS = [
     r'title\s*=\s*"([^"]+)"',
     r"title\s*=\s*'([^']+)'",
     r'title\s*=\s*\{\s*"([^"]+)"\s*\}',
-    r"title\s*=\s*\{\s*'([^']+)'\s*\}",
+    r"title\s*=\s*\{\s*'([^']+)'",
     r'alt\s*=\s*"([^"]+)"',
     r"alt\s*=\s*'([^']+)'",
     r'alt\s*=\s*\{\s*"([^"]+)"\s*\}',
@@ -980,7 +979,8 @@ def _is_layout_only(n: Dict[str, Any]) -> bool:
         return False
     if (n.get("text") or {}).get("content") or (n.get("text") or {}).get("lines"):
         return False
-    if any(_ for _ in (n.get("effects") or [])):
+    # ändring: undvik any(True) → iterera inte över potentiell bool
+    if n.get("effects"):
         return False
     fills = n.get("fills") or []  # används endast för att bedöma visuellt bidrag, ej färg
     def _has_visual_fill(f: Dict[str,Any]) -> bool:
@@ -2005,8 +2005,31 @@ def integrate_figma_node(
     main_abs = _safe_join(tmp_root, main_rel)
     mount["import_path"] = _rel_import_from_main(main_abs, target_path)
 
-    # Injicera endast komponenten utan wrapper för att undvika osynlig nod
-    mount["jsx"] = f"<{mount['import_name']} />"
+    # ======= ÄNDRING: exakt placering och overlay som ignorerar sidlayout =======
+    px = placement or {}
+    stage = px.get("projectBase") if isinstance(px, dict) else None
+    ovl = px.get("overlayStage") if isinstance(px, dict) else None
+    if isinstance(stage, dict) and isinstance(ovl, dict):
+        sw = _px(stage.get("w") or 1280)
+        sh = _px(stage.get("h") or 800)
+        x  = _px(ovl.get("x") or 0)
+        y  = _px(ovl.get("y") or 0)
+        w  = _px(ovl.get("w") or (stage.get("w") or 800))
+        h  = _px(ovl.get("h") or (stage.get("h") or 600))
+
+        mount["jsx"] = (
+            f'<div className="fixed inset-0 z-[2147483647] pointer-events-none">'
+            f'  <div className="absolute left-0 top-0 w-[{sw}] h-[{sh}]">'
+            f'    <div className="absolute left-[{x}] top-[{y}] w-[{w}] h-[{h}] overflow-hidden pointer-events-auto">'
+            f'      <{mount["import_name"]} />'
+            f'    </div>'
+            f'  </div>'
+            f'</div>'
+        )
+    else:
+        # Fallback om ingen placement skickades
+        mount["jsx"] = f"<{mount['import_name']} />"
+    # ======= SLUT ÄNDRING =======
 
     _ast_inject_mount(tmp_root, mount)
 
