@@ -1,6 +1,6 @@
 from __future__ import annotations
 """
-Celery-worker: Figma-node → IR → LLM-förslag → (AST-mount + file) → validering → commit → returnera ändringar
+Celery-worker: Figma-node → IR → deterministisk TSX → (AST-mount + file) → validering → commit → returnera ändringar
 
 Uppdateringar:
 - ENDAST IR-fält används för bakgrund: läs n.bg, aldrig n.fills för bakgrund.
@@ -9,8 +9,9 @@ Uppdateringar:
 - Spärr för palettklasser: alla bg- som inte är bg-[…] blockeras.
 - Pre-purge: oönskade bg-* som inte finns i IR strippas innan validering.
 - Gradients valideras enbart mot IR (n.bg.css), inte mot Figma-fills.
+- Stabil multi-node: komponentnamn och filväg är unika per node-id; main.tsx injicerar i append-läge.
 
-Övrigt (oförändrat från tidigare variant):
+Övrigt:
 - Endast synlig text (visible_effective=True) byggs till textkrav.
 - Tailwind-hints (tw_map) skickas till modellen.
 - Tolerant men informativ validering för mått/position.
@@ -107,12 +108,12 @@ CODEGEN_TIMING = os.getenv("CODEGEN_TIMING", "0").lower() in ("1", "true", "yes"
 LOG_FIGMA_JSON = os.getenv("LOG_FIGMA_JSON", "0").lower() in ("1", "true", "yes")
 LOG_FIGMA_IR = os.getenv("LOG_FIGMA_IR", "0").lower() in ("1", "true", "yes")
 
-# NYTT: IR/Prompt jämförelseloggar
+# IR/Prompt jämförelseloggar
 LOG_IR_FULL = os.getenv("LOG_IR_FULL", "0").lower() in ("1", "true", "yes")
 LOG_IR_COMPARE = os.getenv("LOG_IR_COMPARE", "0").lower() in ("1", "true", "yes")
 IR_COMPARE_LIMIT = int(os.getenv("IR_COMPARE_LIMIT", "200") or "200")
 
-# NYTT: BG-debug
+# BG-debug
 LOG_BG_DEBUG = os.getenv("LOG_BG_DEBUG", "0").lower() in ("1", "true", "yes")
 
 # ─────────────────────────────────────────────────────────
@@ -612,6 +613,25 @@ def _ensure_anchor_in_main(main_tsx: Path) -> None:
         main_tsx.write_text(new_src, encoding="utf-8")
         return
 
+    # 1) Injicera inuti .render(<App />) utan att förstöra kedjan "createRoot(...).render(...)"
+    m = re.search(r"\.render\(\s*(<[^)]+>)\s*\)", src)
+    if m:
+        inner = m.group(1)
+        # positionsgränser för parenteserna i den matchade .render(...)
+        open_paren = src.rfind("(", m.start(), m.end())
+        close_paren = src.find(")", open_paren + 1)
+        if open_paren != -1 and close_paren != -1 and close_paren > open_paren:
+            # bevara ".render(" och injicera BEGIN/END med fragment
+            injected = (
+                f"<>{inner} {_ANCHOR_JSX_BEGIN}\n"
+                f"{_ANCHOR_JSX_END}</>"
+            )
+            src = src[:open_paren + 1] + injected + src[close_paren:]
+            src = _normalize_mount_markers(src)
+            main_tsx.write_text(src, encoding="utf-8")
+            return
+
+    # 2) Fallback: placera parmarkörer före </React.StrictMode> om den finns
     m = re.search(r"</React\.StrictMode>", src)
     if m:
         insert = "    " + _ANCHOR_JSX_BEGIN + "\n" + "    " + _ANCHOR_JSX_END + "\n"
@@ -620,15 +640,7 @@ def _ensure_anchor_in_main(main_tsx: Path) -> None:
         main_tsx.write_text(src, encoding="utf-8")
         return
 
-    m = re.search(r"render\(\s*(<App\s*/>)\s*\)", src)
-    if m:
-        inner = m.group(1)
-        frag = f"<>{inner} {_ANCHOR_JSX_BEGIN} {_ANCHOR_JSX_END}</>"
-        src = src[:m.start()] + "render(" + frag + ")" + src[m.end():]
-        src = _normalize_mount_markers(src)
-        main_tsx.write_text(src, encoding="utf-8")
-        return
-
+    # 3) Sista fallback: lägg till en liten wrapper med markörer längst ner
     if _ANCHOR_BEGIN not in src and _ANCHOR_END not in src:
         src += (
             "\n\n// Auto-added safe mount wrapper\n"
@@ -672,10 +684,10 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
         if not script_path.exists():
             raise HTTPException(500, f"Saknar scripts/ai_inject_mount.ts: {script_path}")
 
-        # Först: Node med tsx ESM-import
+        # Node med tsx ESM-import (append-läge)
         cmd1 = [
             "node", "--import", "tsx",
-            str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path),
+            str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "append",
         ]
         rc, out, err = _run(cmd1, cwd=base)
         if rc == 0:
@@ -685,10 +697,10 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
                 main_tsx.write_text(ns, encoding="utf-8")
             return
 
-        # Andra: Node med --loader tsx
+        # Node med --loader tsx (append-läge)
         cmd1b = [
             "node", "--loader", "tsx",
-            str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path),
+            str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "append",
         ]
         rc1b, out1b, err1b = _run(cmd1b, cwd=base)
         if rc1b == 0:
@@ -698,10 +710,10 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
                 main_tsx.write_text(ns, encoding="utf-8")
             return
 
-        # Tredje: Lokal .bin/tsx om den finns (ingen npx)
+        # Lokal .bin/tsx om den finns (append-läge)
         local_tsx = base / "node_modules" / ".bin" / ("tsx.cmd" if os.name == "nt" else "tsx")
         if local_tsx.exists():
-            cmd2 = [str(local_tsx), str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path)]
+            cmd2 = [str(local_tsx), str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "append"]
             rc2, out2, err2 = _run(cmd2, cwd=base)
             if rc2 == 0:
                 s = main_tsx.read_text(encoding="utf-8")
@@ -735,7 +747,7 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
 # Typecheck/lint/visual
 # ─────────────────────────────────────────────────────────
 
-def _typecheck_and_lint(repo_root: Path) -> None:
+def _typecheck_and_lint(repo_root: Path, fix_only: List[str] | None = None) -> None:
     base = repo_root
     if not (base / "package.json").exists() and (repo_root / "frontendplay" / "package.json").exists():
         base = repo_root / "frontendplay"
@@ -744,10 +756,12 @@ def _typecheck_and_lint(repo_root: Path) -> None:
         rc, out, err = _run_pm_script(base, "typecheck")
         if rc != 0:
             raise HTTPException(500, f"Typecheck misslyckades:\n{err or out}")
+
     if _has_script(base, "lint:fix"):
-        rc, out, err = _run_pm_script(base, "lint:fix")
-        if rc != 0:
-            pass
+        extra = fix_only or []
+        rc, out, err = _run_pm_script(base, "lint:fix", extra)
+        # Ignorera ev. fel från lint:fix
+
 
 def _visual_validate(repo_root: Path) -> Dict[str, Any] | None:
     if not ENABLE_VISUAL_VALIDATE:
@@ -895,11 +909,11 @@ _ATTR_PATTERNS = [
     r'placeholder\s*=\s*"([^"]+)"',
     r"placeholder\s*=\s*'([^']+)'",
     r'placeholder\s*=\s*\{\s*"([^"]+)"\s*\}',
-    r"placeholder\s*=\s*\{\s*'([^']+)'",
+    r"placeholder\s*=\s*\{\s*'([^']+)" r"'\s*\}",
     r'aria-label\s*=\s*"([^"]+)"',
     r"aria-label\s*=\s*'([^']+)'",
     r'aria-label\s*=\s*\{\s*"([^"]+)"\s*\}',
-    r"aria-label\s*=\s*\{\s*'([^']+)" r"'\s*\}",
+    r"aria-label\s*=\s*\{\s*'([^']+)'",
     r'title\s*=\s*"([^"]+)"',
     r"title\s*=\s*'([^']+)'",
     r'title\s*=\s*\{\s*"([^"]+)"\s*\}',
@@ -979,8 +993,7 @@ def _is_layout_only(n: Dict[str, Any]) -> bool:
         return False
     if (n.get("text") or {}).get("content") or (n.get("text") or {}).get("lines"):
         return False
-    # ändring: undvik any(True) → iterera inte över potentiell bool
-    if n.get("effects"):
+    if any(_ for _ in (n.get("effects") or [])):
         return False
     fills = n.get("fills") or []  # används endast för att bedöma visuellt bidrag, ej färg
     def _has_visual_fill(f: Dict[str,Any]) -> bool:
@@ -1304,7 +1317,7 @@ def _purge_unexpected_backgrounds(ir: Dict[str,Any], file_code: str) -> str:
             if suf.startswith("/"):
                 return (raw + "/") in allowed
         # hex8 form: inner already contains #rrggbbaa
-        if raw.startswith("#") and len(raw) in (9, 13):  # tolerate #rrggbbaa or #rrggbbaa..extras
+        if raw.startswith("#") and len(raw) in (9, 13):
             return any(raw.startswith(a) for a in allowed if a.startswith("#") and len(a) >= 9)
         return False
 
@@ -1727,7 +1740,7 @@ def _ir_root_summary(ir: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 # ─────────────────────────────────────────────────────────
-# NYTT: JSON-dumps och IR↔Figma jämförelsehjälpare
+# JSON-dumps och IR↔Figma jämförelsehjälpare
 # ─────────────────────────────────────────────────────────
 
 def _dump_json_file(tag: str, node_id: str, payload: Any) -> str:
@@ -1857,7 +1870,7 @@ def integrate_figma_node(
         except Exception:
             pass
 
-    # NYTT: dumpa IR och jämförelse (valfritt via flaggor)
+    # IR-dumpar och jämförelse (valfritt via flaggor)
     try:
         if LOG_IR_FULL:
             _dump_json_file("ir-full", node_id, ir_full)
@@ -1938,13 +1951,15 @@ def integrate_figma_node(
     _ = list_components(str(tmp_root))
 
     # === Deterministisk generering (ingen LLM) ===
-    comp_name = _derive_import_name(ir["root"].get("name") or "FigmaNode")
-    target_rel = (Path(TARGET_COMPONENT_DIR) / f"{comp_name}.tsx").as_posix()
+    base_name = _derive_import_name(ir["root"].get("name") or "FigmaNode")
+    suffix = hashlib.sha1(node_id.encode("utf-8")).hexdigest()[:6]
+    comp_name = f"{base_name}{suffix}"                                 # unik symbol
+    target_rel = (Path(TARGET_COMPONENT_DIR) / f"{base_name}-{suffix}.tsx").as_posix()  # unik fil
+
     _gen_filename, file_code = generate_tsx_component(ir, icon_assets, comp_name)
 
-    # Sätt upp mount som tidigare, import_path härleds senare relativt main.tsx
+    # Sätt upp mount
     mount = {"anchor": _ANCHOR_SINGLE, "import_name": comp_name}
-    # Dummy 'out' för kompatibilitet längre ner (assets mm.)
     out: Dict[str, Any] = {}
 
     branch = unique_branch(node_id)
@@ -1992,7 +2007,7 @@ def integrate_figma_node(
     _assert_layout_justify(ir, str(file_code))
     _assert_typography(ir, str(file_code))
 
-    # Skriv fil och formatera med Prettier för tydlig struktur
+    # Skriv fil och formatera
     cleaned = _sanitize_tailwind_conflicts(_compact_arbitrary_values(file_code))
     target_path.write_text(cleaned, encoding="utf-8")
     _format_tsx(tmp_root, target_path)
@@ -2005,35 +2020,35 @@ def integrate_figma_node(
     main_abs = _safe_join(tmp_root, main_rel)
     mount["import_path"] = _rel_import_from_main(main_abs, target_path)
 
-    # ======= ÄNDRING: exakt placering och overlay som ignorerar sidlayout =======
+    # Procentbaserad placering för att matcha preview/dev-url
     px = placement or {}
     stage = px.get("projectBase") if isinstance(px, dict) else None
     ovl = px.get("overlayStage") if isinstance(px, dict) else None
     if isinstance(stage, dict) and isinstance(ovl, dict):
-        sw = _px(stage.get("w") or 1280)
-        sh = _px(stage.get("h") or 800)
-        x  = _px(ovl.get("x") or 0)
-        y  = _px(ovl.get("y") or 0)
-        w  = _px(ovl.get("w") or (stage.get("w") or 800))
-        h  = _px(ovl.get("h") or (stage.get("h") or 600))
+        def _pct(val: Any, base: Any) -> float:
+            try:
+                return round(float(val) / float(base) * 100.0, 4)
+            except Exception:
+                return 0.0
+
+        nx = _pct(ovl.get("x", 0), stage.get("w", 1280))
+        ny = _pct(ovl.get("y", 0), stage.get("h", 800))
+        nw = _pct(ovl.get("w", stage.get("w", 1280)), stage.get("w", 1280))
+        nh = _pct(ovl.get("h", stage.get("h", 800)),  stage.get("h", 800))
 
         mount["jsx"] = (
-            f'<div className="fixed inset-0 z-[2147483647] pointer-events-none">'
-            f'  <div className="absolute left-0 top-0 w-[{sw}] h-[{sh}]">'
-            f'    <div className="absolute left-[{x}] top-[{y}] w-[{w}] h-[{h}] overflow-hidden pointer-events-auto">'
-            f'      <{mount["import_name"]} />'
-            f'    </div>'
+            f'<div className="absolute inset-0 w-full h-full pointer-events-none">'
+            f'  <div className="absolute left-[{nx}%] top-[{ny}%] w-[{nw}%] h-[{nh}%] overflow-hidden pointer-events-auto">'
+            f'    <{mount["import_name"]} />'
             f'  </div>'
             f'</div>'
         )
     else:
-        # Fallback om ingen placement skickades
         mount["jsx"] = f"<{mount['import_name']} />"
-    # ======= SLUT ÄNDRING =======
 
     _ast_inject_mount(tmp_root, mount)
 
-    _typecheck_and_lint(tmp_root)
+    _typecheck_and_lint(tmp_root, [returned_primary_path])
 
     try:
         _ = _visual_validate(tmp_root)
@@ -2051,7 +2066,6 @@ def integrate_figma_node(
     if main_abs.exists():
         changed_paths.append(main_rel)
 
-    # (ingen extra asset-hantering i deterministisk generator ännu)
     assets: List[Dict[str, Any]] = []
 
     for ia in icon_assets:

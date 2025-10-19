@@ -2,6 +2,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
 import  Menu  from './components/ai/Menu';
+import Menua0fa98 from './components/ai/Menu-a0fa98';
 
 const VP = { w: 1280, h: 800 };
 
@@ -24,7 +25,7 @@ function App() {
       >
         {/* Lägg din iframe/devUrl-overlay här om du vill */}
         {/* AI-INJECT-MOUNT:BEGIN */}
-        <div className="fixed inset-0 z-[2147483647] pointer-events-none">  <div className="absolute left-0 top-0 w-[1280px] h-[800px]">    <div className="absolute left-[491px] top-[2px] w-[243px] h-[713px] overflow-hidden pointer-events-auto">      <Menu />    </div>  </div></div>
+        <div className="absolute inset-0 w-full h-full pointer-events-none">  <div className="absolute left-[20.8594%] top-[0.0%] w-[16.3281%] h-[100.0%] overflow-hidden pointer-events-auto">    <Menua0fa98 />  </div></div>
         {/* AI-INJECT-MOUNT:END */}</div>
     </div>
   );

@@ -8,7 +8,7 @@ import IconsFaae42 from "/src/assets/icons/icons-faae42.svg?url";
 import SettingsA24F08 from "/src/assets/icons/settings-a24f08.svg?url";
 import ZapCbadb5 from "/src/assets/icons/zap-cbadb5.svg?url";
 
-export default function Menu() {
+export default function Menud96dc2() {
   return (
     <div className='w-[251px] h-[736px] relative overflow-hidden flex flex-col gap-[32px] pt-[24px] pr-[24px] pb-[32px] pl-[24px] items-start justify-between bg-[#09090a] z-[0] font-["Open Sans"]'>
       <div className="w-[218px] h-[496px] relative flex flex-col gap-[44px] items-start justify-start z-[0]">

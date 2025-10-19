@@ -3,27 +3,42 @@
  * Robust injector for mounting JSX at the AI-INJECT-MOUNT anchor in a TSX entry file.
  *
  * Usage (from repo root):
- *   node --import tsx scripts/ai_inject_mount.ts <main.tsx> <importName> <importPath> <jsxFilePath>
+ *   node --import tsx scripts/ai_inject_mount.ts <main.tsx> <importName> <importPath> <jsxFilePath> [append]
  *   # fallback on older Node (may warn on Node ≥20):
- *   node --loader tsx scripts/ai_inject_mount.ts <main.tsx> <importName> <importPath> <jsxFilePath>
+ *   node --loader tsx scripts/ai_inject_mount.ts <main.tsx> <importName> <importPath> <jsxFilePath> [append]
  *
  * Behavior:
  * - Ensures an import for <importName> from <importPath> exists (default vs named based on target file if resolvable).
- * - Removes conflicting imports of the same symbol from other specifiers.
- * - Replaces AI-INJECT-MOUNT with an idempotent BEGIN/END region and injects JSX inside it, preserving indentation.
+ * - Never deletes previous imports. If the identifier is already used from another specifier, a unique alias is created.
+ * - Replaces AI-INJECT-MOUNT with an idempotent BEGIN/END region and injects JSX.
+ * - In "append" mode, new JSX is appended as a new tile in a grid so previous tiles remain visible.
+ * - If no grid exists inside the anchor, a grid wrapper is created automatically.
  * - Minimal edits. Adds a separate import line when safer than rewriting.
  *
  * Debug:
  *   Set AI_INJECT_DEBUG=1 to print trace logs.
+ *   Set AI_INJECT_APPEND=1 to force append mode.
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 
 type ImportStyle = 'default' | 'named';
+type AnchorSingle = { kind: 'single'; start: number; end: number; indent: string };
+type AnchorPaired = {
+  kind: 'paired';
+  beginStart: number;
+  beginEnd: number;
+  endStart: number;
+  endEnd: number;
+  indent: string;
+};
+type Anchor = AnchorSingle | AnchorPaired;
 
 const DEBUG = process.env.AI_INJECT_DEBUG === '1';
-const dbg = (...a: any[]) => { if (DEBUG) console.log('[ai_inject_mount:dbg]', ...a); };
+const dbg = (...a: any[]) => {
+  if (DEBUG) console.log('[ai_inject_mount:dbg]', ...a);
+};
 
 function fail(msg: string, code = 1): never {
   console.error(`[ai_inject_mount] ${msg}`);
@@ -105,21 +120,71 @@ function detectExportStyle(moduleFile: string, importName: string): ImportStyle 
   return 'unknown';
 }
 
-function hasImportFor(code: string, importName: string, importPath: string): boolean {
+/** Checks whether a given local identifier is already imported from a specifier. */
+function hasImportForLocal(code: string, localName: string, importPath: string): boolean {
   const spec = normalizeSpecifier(importPath);
   const reFrom = new RegExp(String.raw`import\s+([^;]*?)\s+from\s+["\']${escapeRegex(spec)}["\']`, 'g');
 
   let m: RegExpExecArray | null;
   while ((m = reFrom.exec(code))) {
     const clause = m[1] || '';
-    // default or alias presence
-    if (new RegExp(String.raw`(^|[,\s])${importName}(\s|,|$)`).test(clause)) return true;
-    // named presence
-    if (new RegExp(String.raw`\{[^}]*\b${importName}\b[^}]*\}`).test(clause)) return true;
-    // default as alias presence
-    if (new RegExp(String.raw`\{[^}]*\bdefault\s+as\s+${importName}\b[^}]*\}`).test(clause)) return true;
+    // default presence using the local binding
+    if (new RegExp(String.raw`(^|[,\s])${localName}(\s|,|$)`).test(clause)) return true;
+    // named alias presence
+    if (new RegExp(String.raw`\bas\s+${localName}(\s|,|$)`).test(clause)) return true;
   }
   return false;
+}
+
+/** Checks whether an identifier is imported from a different specifier than goodSpec. */
+function hasIdentFromOtherSpec(code: string, ident: string, goodSpec: string): boolean {
+  const re = new RegExp(String.raw`(^|\n)import\s+([^;]*?)\s+from\s+['"]([^'"]+)['"];?`, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code))) {
+    const clause = m[2] || '';
+    const spec = normalizeSpecifier(m[3] || '');
+    const mentions =
+      new RegExp(String.raw`(^|[,\s])${ident}(\s|,|$)`).test(clause) ||
+      new RegExp(String.raw`\{[^}]*\b${ident}\b[^}]*\}`).test(clause) ||
+      new RegExp(String.raw`\{[^}]*\bdefault\s+as\s+${ident}\b[^}]*\}`).test(clause);
+    if (mentions && spec !== normalizeSpecifier(goodSpec)) return true;
+  }
+  return false;
+}
+
+/** Returns all locally bound identifiers from import clauses. */
+function listImportedIdents(code: string): Set<string> {
+  const ids = new Set<string>();
+  const re = /(^|\n)import\s+([^;]*?)\s+from\s+['"][^'"]+['"];?/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code))) {
+    const clause = m[2] || '';
+    const def = /^\s*([A-Za-z_$][\w$]*)/.exec(clause)?.[1];
+    if (def) ids.add(def);
+    const named = /\{([^}]*)\}/.exec(clause)?.[1] || '';
+    for (const t of named.split(',').map((s) => s.trim()).filter(Boolean)) {
+      const alias =
+        /as\s+([A-Za-z_$][\w$]*)$/.exec(t)?.[1] ||
+        /^([A-Za-z_$][\w$]*)$/.exec(t)?.[1] ||
+        null;
+      if (alias) ids.add(alias);
+    }
+  }
+  return ids;
+}
+
+function pickUnique(base: string, taken: Set<string>): string {
+  if (!taken.has(base)) return base;
+  let i = 2;
+  while (taken.has(`${base}${i}`)) i++;
+  return `${base}${i}`;
+}
+
+function rewriteJsxIdent(jsx: string, from: string, to: string): string {
+  if (from === to) return jsx;
+  const open = new RegExp(`(<\\s*)${from}(\\b)`, 'g');
+  const close = new RegExp(`(<\\/\\s*)${from}(\\b)`, 'g');
+  return jsx.replace(open, `$1${to}$2`).replace(close, `$1${to}$2`);
 }
 
 function insertAfterLastImportFrom(code: string, spec: string, lineToInsert: string): string {
@@ -135,6 +200,7 @@ function insertAfterLastImportFrom(code: string, spec: string, lineToInsert: str
 }
 
 function insertAfterLastImportTop(code: string, lineToInsert: string): string {
+  // all import lines at top are matched including type-only and side-effect imports
   const importBlockRe = /^(?:[ \t]*import\b[^;]*;[ \t]*\r?\n)+/m;
   const m = importBlockRe.exec(code);
   if (m) {
@@ -145,88 +211,9 @@ function insertAfterLastImportTop(code: string, lineToInsert: string): string {
   return lineToInsert + '\n' + code;
 }
 
-/**
- * Remove any imports of `importName` that come from a different specifier than `goodSpec`.
- * If an import line becomes empty after removal, drop the line.
- * Keep `import type { ... }` lines intact.
- */
-function removeConflictingImports(code: string, importName: string, goodSpec: string): string {
-  const re = new RegExp(
-    String.raw`(^|\n)(?<indent>[ \t]*)import\s+([^;]*?)\s+from\s+['"]([^'"]+)['"];?`,
-    'g',
-  );
-  type Hit = { start: number; end: number; indent: string; clause: string; spec: string };
-  const hits: Hit[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(code))) {
-    const start = m.index + (m[1] ? m[1].length : 0);
-    const end = re.lastIndex;
-    const indent = m.groups?.indent ?? '';
-    const clause = m[3] ?? '';
-    const spec = m[4] ?? '';
-    hits.push({ start, end, indent, clause, spec });
-  }
-
-  let out = code;
-  for (let i = hits.length - 1; i >= 0; i--) {
-    const { start, end, indent, clause, spec } = hits[i];
-
-    // Skip the good spec
-    if (normalizeSpecifier(spec) === normalizeSpecifier(goodSpec)) continue;
-    // Skip type-only imports
-    if (/^\s*type\b/.test(clause)) continue;
-
-    // Does this clause import our symbol at all?
-    const mentions =
-      new RegExp(String.raw`(^|[,\s])${importName}(\s|,|$)`).test(clause) ||
-      new RegExp(String.raw`\{[^}]*\b${importName}\b[^}]*\}`).test(clause) ||
-      new RegExp(String.raw`\{[^}]*\bdefault\s+as\s+${importName}\b[^}]*\}`).test(clause);
-
-    if (!mentions) continue;
-
-    // Decompose clause into default and named parts
-    const namedMatch = /\{([^}]*)\}/.exec(clause);
-    const namedInside = namedMatch ? namedMatch[1] : '';
-    const defaultMatch = /^\s*([A-Za-z_$][\w$]*)\s*(?:,|$)/.exec(clause);
-    const defaultName = defaultMatch ? defaultMatch[1] : '';
-
-    let keepDefault = defaultName.length > 0 && defaultName !== importName;
-    let keptNamed: string[] = [];
-
-    if (namedInside) {
-      const rawTokens = namedInside.split(',').map((s) => s.trim()).filter(Boolean);
-      for (const t of rawTokens) {
-        // tokens can be: Foo | Foo as Bar | default as X
-        const isDefaultAlias = new RegExp(String.raw`^default\s+as\s+${importName}$`).test(t);
-        const isExact = new RegExp(String.raw`^${importName}$`).test(t);
-        const isAliasedFrom = new RegExp(String.raw`^${importName}\s+as\s+[A-Za-z_$][\w$]*$`).test(t);
-        if (isDefaultAlias || isExact || isAliasedFrom) continue;
-        keptNamed.push(t);
-      }
-    }
-
-    // Rebuild clause
-    let newClause = '';
-    if (keepDefault && keptNamed.length > 0) newClause = `${defaultName}, { ${keptNamed.join(', ')} }`;
-    else if (keepDefault) newClause = defaultName;
-    else if (keptNamed.length > 0) newClause = `{ ${keptNamed.join(', ')} }`;
-    else newClause = '';
-
-    if (newClause === '') {
-      // Drop the whole line
-      out = out.slice(0, start) + out.slice(end);
-    } else {
-      const rebuilt = `${indent}import ${newClause} from '${spec}';`;
-      out = out.slice(0, start) + rebuilt + out.slice(end);
-    }
-  }
-
-  return out;
-}
-
 function addOrAmendImport(code: string, chosen: ImportStyle, importName: string, importPath: string): string {
   const spec = normalizeSpecifier(importPath);
-  if (hasImportFor(code, importName, spec)) {
+  if (hasImportForLocal(code, importName, spec)) {
     dbg('import already present for', importName, 'from', spec);
     return code;
   }
@@ -248,13 +235,13 @@ function addOrAmendImport(code: string, chosen: ImportStyle, importName: string,
   dbg('existing imports from spec', spec, imports.length);
 
   const newImportLine = (indent = '') =>
-    `${indent}import ${chosen === 'default' ? importName : `{ ${importName} }`} from '${spec}';`;
+    `${indent}import ${chosen === 'named' ? `{ ${importName} }` : importName} from '${spec}';`;
   const newImportDefaultAliasViaNamed = (indent = '') =>
     `${indent}import { default as ${importName} } from '${spec}';`;
 
   if (imports.length > 0) {
     const indent = imports[0].indent;
-    const anyHasDefault = imports.some((im) => /(^|[,\s])[A-Za-z_$][\w$]*/.test(im.clause));
+    const anyHasDefault = imports.some((im) => /^\s*[A-Za-z_$][\w$]*/.test(im.clause));
     if (chosen === 'default' && anyHasDefault) {
       dbg('adding default-as alias import');
       return insertAfterLastImportFrom(code, spec, newImportDefaultAliasViaNamed(indent));
@@ -267,14 +254,34 @@ function addOrAmendImport(code: string, chosen: ImportStyle, importName: string,
   return insertAfterLastImportTop(code, newImportLine());
 }
 
-type AnchorSingle = { kind: 'single'; start: number; end: number; indent: string };
-type AnchorPaired = { kind: 'paired'; beginStart: number; beginEnd: number; endStart: number; endEnd: number; indent: string };
-type Anchor = AnchorSingle | AnchorPaired;
+function addImportWithAlias(
+  code: string,
+  chosen: ImportStyle,
+  exportedName: string,
+  localName: string,
+  importPath: string,
+): string {
+  const spec = normalizeSpecifier(importPath);
+  if (hasImportForLocal(code, localName, spec)) return code;
+
+  const line = (indent = '') =>
+    chosen === 'named'
+      ? `${indent}import { ${exportedName} as ${localName} } from '${spec}';`
+      : `${indent}import { default as ${localName} } from '${spec}';`;
+
+  const re = new RegExp(
+    String.raw`(^|\n)(?<indent>[\t ]*)import\s+([^;]*?)\s+from\s+["\']${escapeRegex(spec)}["\'];?`,
+    'g',
+  );
+  const m = re.exec(code);
+  if (m) return insertAfterLastImportFrom(code, spec, line(m.groups?.indent ?? ''));
+  return insertAfterLastImportTop(code, line());
+}
 
 function findAnchor(code: string): Anchor | null {
   // Prefer paired region: {/* AI-INJECT-MOUNT:BEGIN */} ... {/* AI-INJECT-MOUNT:END */}
   const reBegin = /\{\/\*\s*AI-INJECT-MOUNT:BEGIN\s*\*\/\}/;
-  const reEnd   = /\{\/\*\s*AI-INJECT-MOUNT:END\s*\*\/\}/;
+  const reEnd = /\{\/\*\s*AI-INJECT-MOUNT:END\s*\*\/\}/;
   const mb = reBegin.exec(code);
   if (mb) {
     reEnd.lastIndex = mb.index + mb[0].length;
@@ -282,14 +289,21 @@ function findAnchor(code: string): Anchor | null {
     if (me && me.index > mb.index) {
       const lineStart = code.lastIndexOf('\n', mb.index) + 1;
       const indent = (/^(\s*)/.exec(code.slice(lineStart, mb.index))?.[1]) ?? '';
-      return { kind: 'paired', beginStart: mb.index, beginEnd: mb.index + mb[0].length, endStart: me.index, endEnd: me.index + me[0].length, indent };
+      return {
+        kind: 'paired',
+        beginStart: mb.index,
+        beginEnd: mb.index + mb[0].length,
+        endStart: me.index,
+        endEnd: me.index + me[0].length,
+        indent,
+      };
     }
   }
 
   // Fallback: single anchor comment (JSX, line, or block)
   const patterns = [
     /\{\/\*\s*AI-INJECT-MOUNT\s*\*\/\}/, // JSX comment node
-    /\/\/[ \t]*AI-INJECT-MOUNT.*/,       // line comment
+    /\/\/[ \t]*AI-INJECT-MOUNT.*/, // line comment
     /\/\*[ \t]*AI-INJECT-MOUNT[ \t]*\*\//, // block comment
   ];
   for (const re of patterns) {
@@ -321,10 +335,54 @@ function indentMultilineJsx(jsx: string, baseIndent: string): string {
   return indented.join('\n');
 }
 
+function normalizeForDedupe(s: string): string {
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+/** ───────────────────────────────────────────────────────
+ * Grid support: append tiles instead of replacing content
+ * Tile size follows 1280x800 viewport used by the app.
+ * ─────────────────────────────────────────────────────── */
+const GRID_ID = '__AI_MOUNT_GRID__' as const;
+
+function hasGrid(code: string, beginEnd: number, endStart: number): boolean {
+  const inner = code.slice(beginEnd, endStart);
+  return /\bid=["']__AI_MOUNT_GRID__["']/.test(inner);
+}
+
+function makeTile(jsxIndented: string, indent: string): string {
+  return (
+    `\n${indent}<div className="relative w-[1280px] h-[800px] overflow-hidden rounded-md ring-1 ring-black/10 bg-white">` +
+    `\n${indent}${jsxIndented}\n${indent}</div>`
+  );
+}
+
+function wrapInnerWithGrid(code: string, anchor: AnchorPaired): { code: string; anchor: AnchorPaired } {
+  const indent = anchor.indent;
+  const existing = code.slice(anchor.beginEnd, anchor.endStart).trim();
+  const open = `\n${indent}<div id="${GRID_ID}" className="flex flex-wrap gap-4 items-start">`;
+  const close = `\n${indent}</div>\n${indent}`;
+  const wrapped =
+    open +
+    (existing
+      ? `\n${indent}<div className="relative w-[1280px] h-[800px] overflow-hidden rounded-md ring-1 ring-black/10 bg-white">\n${indent}${existing}\n${indent}</div>`
+      : '') +
+    close;
+  const next = code.slice(0, anchor.beginEnd) + wrapped + code.slice(anchor.endStart);
+  const a2 = findAnchor(next);
+  if (!a2 || a2.kind !== 'paired') fail('Failed to re-find anchor after wrapping with grid.');
+  return { code: next, anchor: a2 as AnchorPaired };
+}
+
 function main(): void {
   const [, , mainFileArg, importNameArg, importPathArg, jsxFileArg] = process.argv;
+  const modeArg = (process.argv[6] || '').toLowerCase();
+  const APPEND = modeArg === 'append' || process.env.AI_INJECT_APPEND === '1';
+
   if (!mainFileArg || !importNameArg || !importPathArg || !jsxFileArg) {
-    fail('Usage: node --import tsx scripts/ai_inject_mount.ts <main.tsx> <importName> <importPath> <jsxFilePath>');
+    fail(
+      'Usage: node --import tsx scripts/ai_inject_mount.ts <main.tsx> <importName> <importPath> <jsxFilePath> [append]',
+    );
   }
 
   const mainFile = path.resolve(process.cwd(), mainFileArg);
@@ -332,15 +390,14 @@ function main(): void {
   const importPath = importPathArg.trim();
   const jsxFile = path.resolve(process.cwd(), jsxFileArg);
 
-  dbg('argv', { mainFile, importName, importPath, jsxFile });
+  dbg('argv', { mainFile, importName, importPath, jsxFile, APPEND });
 
   if (!fileExists(mainFile)) fail(`main file does not exist: ${mainFile}`);
   if (!fileExists(jsxFile)) fail(`jsx temp file does not exist: ${jsxFile}`);
   if (!/^[A-Z][A-Za-z0-9]*$/.test(importName)) fail(`importName must be a PascalCase identifier: ${importName}`);
 
   const originalCode = readFileUtf8(mainFile);
-  const jsxRaw = readFileUtf8(jsxFile);
-  const jsx = jsxRaw.trim();
+  let jsx = readFileUtf8(jsxFile).trim();
   if (!jsx) fail('jsx is empty');
 
   const resolvedModule = resolveModuleFile(mainFile, importPath);
@@ -355,39 +412,85 @@ function main(): void {
   dbg('exportStyle', styleDetected);
   const chosen: ImportStyle = styleDetected === 'named' ? 'named' : 'default';
 
-  // 1) Remove conflicting imports of the same identifier from other specifiers
-  let nextCode = removeConflictingImports(originalCode, importName, normalizeSpecifier(importPath));
+  // Start with original code
+  let nextCode = originalCode;
 
-  // 2) Ensure desired import exists
-  nextCode = addOrAmendImport(nextCode, chosen, importName, importPath);
+  // Determine effective local name and alias if the identifier is already taken by another specifier
+  const taken = listImportedIdents(nextCode);
+  let effectiveName = importName;
+
+  if (!hasImportForLocal(nextCode, importName, importPath) && taken.has(importName)) {
+    // 'importName' already bound from some import; pick a free alias and rewrite JSX
+    effectiveName = pickUnique(importName, taken);
+    jsx = rewriteJsxIdent(jsx, importName, effectiveName);
+    dbg('alias due to taken ident', { importName, effectiveName });
+  } else if (hasIdentFromOtherSpec(nextCode, importName, importPath)) {
+    // Name used by another specifier; alias our new import
+    effectiveName = pickUnique(importName, taken);
+    jsx = rewriteJsxIdent(jsx, importName, effectiveName);
+    dbg('alias due to other spec', { importName, effectiveName });
+  }
+
+  // Ensure desired import exists (with alias if needed). Never delete existing imports.
+  if (effectiveName === importName) {
+    nextCode = addOrAmendImport(nextCode, chosen, importName, importPath);
+  } else {
+    nextCode = addImportWithAlias(nextCode, chosen, importName, effectiveName, importPath);
+  }
 
   // 3) Anchor handling: prefer paired region, else upgrade single anchor to paired
-  const anchor = findAnchor(nextCode);
+  let anchor = findAnchor(nextCode);
   dbg('anchor', anchor);
   if (!anchor) fail('Could not find AI-INJECT-MOUNT anchor or BEGIN/END markers in main file.');
 
   const BEGIN = '{/* AI-INJECT-MOUNT:BEGIN */}';
-  const END   = '{/* AI-INJECT-MOUNT:END */}';
+  const END = '{/* AI-INJECT-MOUNT:END */}';
 
   const jsxIndented = indentMultilineJsx(jsx, (anchor as any).indent);
+  const jsxNorm = normalizeForDedupe(jsxIndented);
 
   if (anchor.kind === 'paired') {
-    // Replace only inner content to keep markers. Idempotent.
-    const before = nextCode.slice(0, anchor.beginEnd);
-    const after  = nextCode.slice(anchor.endStart);
-    const inner  = `\n${anchor.indent}${jsxIndented}\n${anchor.indent}`;
-    const newCode = before + inner + nextCode.slice(anchor.endStart, anchor.endEnd) + after;
-
-    if (newCode === nextCode) {
-      console.log('[ai_inject_mount] No changes needed.');
-      process.exit(0);
+    // Ensure grid wrapper exists
+    if (!hasGrid(nextCode, anchor.beginEnd, anchor.endStart)) {
+      const res = wrapInnerWithGrid(nextCode, anchor);
+      nextCode = res.code;
+      anchor = res.anchor;
     }
-    nextCode = newCode;
+
+    const innerStart = anchor.beginEnd;
+    const innerEnd = anchor.endStart;
+    const innerRegion = nextCode.slice(innerStart, innerEnd);
+    const innerRegionNorm = normalizeForDedupe(innerRegion);
+    const tile = makeTile(jsxIndented, anchor.indent);
+    const tileNorm = normalizeForDedupe(tile);
+
+    if (APPEND) {
+      // Append before grid close if not already present
+      if (!innerRegionNorm.includes(tileNorm) && !innerRegionNorm.includes(jsxNorm)) {
+        const gridCloseRel = innerRegion.lastIndexOf('</div>');
+        if (gridCloseRel < 0) fail('Grid closing tag not found inside anchor region.');
+        const gridCloseAbs = innerStart + gridCloseRel;
+        nextCode = nextCode.slice(0, gridCloseAbs) + tile + nextCode.slice(gridCloseAbs);
+      } else {
+        console.log('[ai_inject_mount] No changes needed (duplicate JSX skipped).');
+        writeFileUtf8(mainFile, nextCode);
+        process.exit(0);
+      }
+    } else {
+      // Replace inner region content with single-tile grid
+      const open = `\n${anchor.indent}<div id="${GRID_ID}" className="flex flex-wrap gap-4 items-start">`;
+      const close = `\n${anchor.indent}</div>\n${anchor.indent}`;
+      const single = open + makeTile(jsxIndented, anchor.indent) + close;
+      nextCode = nextCode.slice(0, anchor.beginEnd) + single + nextCode.slice(anchor.endStart);
+    }
   } else {
-    // Single anchor → replace with paired markers + JSX inside.
+    // Single anchor → paired + grid with one tile
     const before = nextCode.slice(0, anchor.start);
-    const after  = nextCode.slice(anchor.end);
-    const block  = `${BEGIN}\n${anchor.indent}${jsxIndented}\n${anchor.indent}${END}`;
+    const after = nextCode.slice(anchor.end);
+    const block =
+      `${BEGIN}\n${anchor.indent}<div id="${GRID_ID}" className="flex flex-wrap gap-4 items-start">` +
+      makeTile(jsxIndented, anchor.indent) +
+      `\n${anchor.indent}</div>\n${anchor.indent}${END}`;
     nextCode = before + block + after;
   }
 
