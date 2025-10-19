@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import "./index.css";
 import  Menu  from './components/ai/Menu';
 import Menua0fa98 from './components/ai/Menu-a0fa98';
+import Menud96dc2 from './components/ai/Menu-d96dc2';
 
 const VP = { w: 1280, h: 800 };
 
@@ -25,7 +26,11 @@ function App() {
       >
         {/* Lägg din iframe/devUrl-overlay här om du vill */}
         {/* AI-INJECT-MOUNT:BEGIN */}
-        <div className="absolute inset-0 w-full h-full pointer-events-none">  <div className="absolute left-[20.8594%] top-[0.0%] w-[16.3281%] h-[100.0%] overflow-hidden pointer-events-auto">    <Menua0fa98 />  </div></div>
+        <div id="__AI_MOUNT_GRID__" className="flex flex-wrap gap-4 items-start">
+        <div className="relative w-[1280px] h-[800px] overflow-hidden rounded-md ring-1 ring-black/10 bg-white">
+        <div className="absolute inset-0 w-full h-full pointer-events-none">  <div className="absolute left-[22.6562%] top-[0.0%] w-[18.9844%] h-[89.125%] overflow-hidden pointer-events-auto">    <Menud96dc2 />  </div></div>
+        </div>
+        </div>
         {/* AI-INJECT-MOUNT:END */}</div>
     </div>
   );

@@ -684,12 +684,27 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
         if not script_path.exists():
             raise HTTPException(500, f"Saknar scripts/ai_inject_mount.ts: {script_path}")
 
+        # ── DEBUG: aktivera injektorns console.log och logga kontext ─────────────────
+        os.environ["AI_INJECT_DEBUG"] = "1"
+        _safe_print("ai.inject.env", {
+            "AI_INJECT_DEBUG": os.environ.get("AI_INJECT_DEBUG"),
+            "node_cwd": str(base),
+            "script": str(script_path),
+            "main_tsx": str(main_tsx),
+            "import_name": import_name,
+            "import_path": import_path,
+            "jsx_tmp": str(jsx_file_path),
+        })
+        # ─────────────────────────────────────────────────────────────────────────────
+
         # Node med tsx ESM-import (append-läge)
         cmd1 = [
             "node", "--import", "tsx",
-            str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "append",
+            str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "replace",
         ]
+
         rc, out, err = _run(cmd1, cwd=base)
+        _safe_print("ai.inject.cmd1", {"rc": rc, "cmd": cmd1, "out": out, "err": err})
         if rc == 0:
             s = main_tsx.read_text(encoding="utf-8")
             ns = _normalize_mount_markers(s)
@@ -700,9 +715,11 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
         # Node med --loader tsx (append-läge)
         cmd1b = [
             "node", "--loader", "tsx",
-            str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "append",
+            str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "replace",
         ]
+
         rc1b, out1b, err1b = _run(cmd1b, cwd=base)
+        _safe_print("ai.inject.cmd1b", {"rc": rc1b, "cmd": cmd1b, "out": out1b, "err": err1b})
         if rc1b == 0:
             s = main_tsx.read_text(encoding="utf-8")
             ns = _normalize_mount_markers(s)
@@ -713,8 +730,9 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
         # Lokal .bin/tsx om den finns (append-läge)
         local_tsx = base / "node_modules" / ".bin" / ("tsx.cmd" if os.name == "nt" else "tsx")
         if local_tsx.exists():
-            cmd2 = [str(local_tsx), str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "append"]
+            cmd2 = [str(local_tsx), str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "replace"]
             rc2, out2, err2 = _run(cmd2, cwd=base)
+            _safe_print("ai.inject.cmd2", {"rc": rc2, "cmd": cmd2, "out": out2, "err": err2})
             if rc2 == 0:
                 s = main_tsx.read_text(encoding="utf-8")
                 ns = _normalize_mount_markers(s)
@@ -1093,10 +1111,10 @@ def _assert_dims_positions(ir: Dict[str, Any], file_code: str, icon_asset_ids: s
                     f"Saknar positionsklass {l_tokens[0]} för node id={nid} name={nname} type={ntype} bounds={b}"
                 )
             t_tokens = _need_top(b.get("y"))
-            if t_tokens and not _any(t_tokens):
+            if t_tokens and not _any(tokens := t_tokens):
                 raise HTTPException(
                     500,
-                    f"Saknar positionsklass {t_tokens[0]} för node id={nid} name={nname} type={ntype} bounds={b}"
+                    f"Saknar positionsklass {tokens[0]} för node id={nid} name={nname} type={ntype} bounds={b}"
                 )
 
         next_clip = _next_clip_ir(n, clip)
