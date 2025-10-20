@@ -9,7 +9,7 @@
  *
  * What’s new here:
  * - Verbose DEBUG logs that print EXACT reasons why imports stay or get pruned.
- * - Prunes dead relative imports (file missing).
+ * - Prunes dead relative imports (file missing). Now robust for CRLF and side-effect imports.
  * - Prunes unused AI component imports (under components/ai) even if file exists.
  * - In replace-mode, prunes all other AI imports except the current one.
  */
@@ -83,7 +83,8 @@ function escapeRegex(s: string): string {
 }
 
 function normalizeSpecifier(spec: string): string {
-  return spec.trim();
+  // robust jämförelse oavsett OS och extra whitespace
+  return spec.trim().replace(/\\/g, '/');
 }
 
 function resolveModuleFile(fromFile: string, importPath: string): string | null {
@@ -476,15 +477,21 @@ function snapshotImports(tag: string, code: string, mainFile: string): ImportInf
   return infos;
 }
 
+/**
+ * Robust prune: tar bort både "import X from './...'" och "import './...'" när filen saknas.
+ * Tål CRLF.
+ */
 function pruneDeadRelativeImports(code: string, mainFile: string): string {
-  const re = /(^|\n)(?<indent>[ \t]*)import\s+([^;]*?)\s+from\s+['"](?<spec>[^'"]+)['"]\s*;?/g;
+  const re = /(^|\r?\n)(?<indent>[ \t]*)import\s+(?:([^;]*?)\s+from\s+['"](?<spec>[^'"]+)['"]|['"](?<spec2>[^'"]+)['"])\s*;?/g;
   let out = '';
   let lastIndex = 0;
   let m: RegExpExecArray | null;
+
   while ((m = re.exec(code))) {
     const start = m.index + (m[1] ? m[1].length : 0);
     const end = re.lastIndex;
-    const spec = m.groups?.spec ?? '';
+    const rawSpec = m.groups?.spec ?? m.groups?.spec2 ?? '';
+    const spec = normalizeSpecifier(rawSpec);
     let drop = false;
 
     if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('file:')) {
@@ -541,7 +548,7 @@ function pruneUnusedAiComponentImports(code: string): string {
 
 function pruneAiImportsExcept(code: string, keepSpec: string): string {
   const keep = normalizeSpecifier(keepSpec);
-  const re = /(^|\n)(?<indent>[ \t]*)import\s+([^;]*?)\s+from\s+['"](?<spec>[^'"]+)['"]\s*;?/g;
+  const re = /(^|\r?\n)(?<indent>[ \t]*)import\s+([^;]*?)\s+from\s+['"](?<spec>[^'"]+)['"]\s*;?/g;
   let out = '';
   let last = 0;
   let m: RegExpExecArray | null;
@@ -602,6 +609,7 @@ function main(): void {
   let originalCode = readFileUtf8(mainFile);
   snapshotImports('BEFORE', originalCode, mainFile);
 
+  // alltid: ta bort döda och oanvända AI-imports oavsett mode
   originalCode = pruneDeadRelativeImports(originalCode, mainFile);
   originalCode = pruneUnusedAiComponentImports(originalCode);
 

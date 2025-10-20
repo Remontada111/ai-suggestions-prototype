@@ -17,10 +17,11 @@ services:
 
   # ─────────────── Bas-bild (Python + deps) byggs en gång ─────────────────── #
   backend:
-    image: ai-backend:latest
     build:
       context: ./backend           # Dockerfile ligger i ./backend
       dockerfile: Dockerfile
+    image: ai-backend:latest
+    command: sleep infinity
     env_file:
       - ./backend/.env             # gemensamma secrets/nycklar
     volumes:
@@ -49,7 +50,7 @@ services:
   worker:
     image: ai-backend:latest
     command: >
-      celery -A backend.tasks.codegen worker --loglevel=info --concurrency=4 -I backend.tasks.analyze
+      python -m celery -A backend.tasks.codegen:celery_app worker -l info -I backend.tasks.analyze
     env_file:
       - ./backend/.env
     volumes:
@@ -75,7 +76,6 @@ services:
       - TZ=Europe/Stockholm
     depends_on:
       - api                         # om din React-dev-server behöver API:t
-    # Ingen restart-policy: containern startas bara när VS Code ber om den
 
 # ───────────────────────────── Volymer ───────────────────────────────────── #
 volumes:

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TypedDict, Optional, Dict, Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+import fastapi
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
@@ -50,7 +50,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-pr-bot")
 
 # ── FastAPI + CORS ────────────────────────────────────────────────────────
-app = FastAPI(title="AI PR-bot")
+app = fastapi.FastAPI(title="AI PR-bot")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],      # begränsa i prod
@@ -96,7 +96,7 @@ async def figma_hook(payload: Payload) -> Dict[str, Any]:
     file_key = payload.get("fileKey")
     node_id = payload.get("nodeId")
     if not (file_key and node_id):
-        raise HTTPException(400, "Både fileKey och nodeId krävs")
+        raise fastapi.HTTPException(400, "Både fileKey och nodeId krävs")
 
     placement = payload.get("placement")  # kan vara None
     task = integrate_figma_node.delay(file_key=file_key, node_id=node_id, placement=placement)
@@ -130,7 +130,7 @@ async def task_cancel(task_id: str) -> Dict[str, Any]:
         _celery_app.control.revoke(task_id, terminate=True)
         return {"status": "CANCELLED"}
     except Exception as e:
-        raise HTTPException(500, f"Kunde inte avbryta jobb: {e}")
+        raise fastapi.HTTPException(500, f"Kunde inte avbryta jobb: {e}")
 
 # ── Logga alla rutter vid uppstart (hjälper felsöka 404) ──────────────────
 @app.on_event("startup")
