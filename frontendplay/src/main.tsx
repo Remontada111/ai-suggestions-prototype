@@ -1,6 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
-import "./index.css";
+import Menud96dc2 from './components/ai/Menu-d96dc2';
+
 import Menufc7725 from './components/ai/Menu-fc7725';
 
 
@@ -31,7 +32,11 @@ function App() {
         <div className="relative w-[1280px] h-[800px] overflow-hidden rounded-md ring-1 ring-black/10 bg-white">
         <div className="absolute inset-0 w-full h-full pointer-events-none">  <div className="absolute left-[23.2031%] top-[0.0%] w-[6.3281%] h-[100.0%] overflow-hidden pointer-events-auto">    <Menufc7725 />  </div></div>
         </div>
-        </div>
+        
+        <> {/* AI-TILE:./components/ai/Menu-d96dc2:BEGIN */}
+        <div className="relative w-[1280px] h-[800px] overflow-hidden rounded-md ring-1 ring-black/10 bg-white">
+        <div className="absolute inset-0 w-full h-full pointer-events-none">  <div className="absolute left-[0.0%] top-[10.875%] w-[18.9844%] h-[89.125%] overflow-hidden pointer-events-auto">    <Menud96dc2 />  </div></div>
+        </div> {/* AI-TILE:./components/ai/Menu-d96dc2:END */}</></div>
         {/* AI-INJECT-MOUNT:END */}</div>
     </div>
   );

@@ -9,9 +9,12 @@
  *
  * What’s new here:
  * - Verbose DEBUG logs that print EXACT reasons why imports stay or get pruned.
- * - Prunes dead relative imports (file missing). Now robust for CRLF and side-effect imports.
+ * - Prunes dead relative imports (file missing). Robust for CRLF and side-effect imports.
+ * - Keeps side-effect asset imports (e.g. "./index.css", images, fonts).
  * - Prunes unused AI component imports (under components/ai) even if file exists.
  * - In replace-mode, prunes all other AI imports except the current one.
+ * - Marks legacy contents as a tile (__LEGACY__) on first grid wrap.
+ * - Drops tiles whose component import no longer exists.
  */
 
 import fs from 'node:fs';
@@ -83,7 +86,6 @@ function escapeRegex(s: string): string {
 }
 
 function normalizeSpecifier(spec: string): string {
-  // robust jämförelse oavsett OS och extra whitespace
   return spec.trim().replace(/\\/g, '/');
 }
 
@@ -355,7 +357,7 @@ function wrapInnerWithGrid(code: string, anchor: AnchorPaired): { code: string; 
   const wrapped =
     open +
     (existing
-      ? `\n${indent}<div className="relative w-[1280px] h-[800px] overflow-hidden rounded-md ring-1 ring-black/10 bg-white">\n${indent}${existing}\n${indent}</div>`
+      ? `\n${indent}<> {/* AI-TILE:__LEGACY__:BEGIN */}\n${indent}<div className="relative w-[1280px] h-[800px] overflow-hidden rounded-md ring-1 ring-black/10 bg-white">\n${indent}${existing}\n${indent}</div> {/* AI-TILE:__LEGACY__:END */}</>`
       : '') +
     close;
   const next = code.slice(0, anchor.beginEnd) + wrapped + code.slice(anchor.endStart);
@@ -477,9 +479,13 @@ function snapshotImports(tag: string, code: string, mainFile: string): ImportInf
   return infos;
 }
 
+/** Side-effect assets to keep, even if relative. */
+const ASSET_EXT_RE =
+  /\.(css|scss|sass|less|pcss|styl|svg(?:\?url)?|png|jpe?g|gif|webp|ico|bmp|avif|woff2?|ttf|otf)(?:\?.*)?$/i;
+
 /**
- * Robust prune: tar bort både "import X from './...'" och "import './...'" när filen saknas.
- * Tål CRLF.
+ * Robust prune: remove dead relative module imports when target file is missing.
+ * Keep side-effect asset imports like "./index.css".
  */
 function pruneDeadRelativeImports(code: string, mainFile: string): string {
   const re = /(^|\r?\n)(?<indent>[ \t]*)import\s+(?:([^;]*?)\s+from\s+['"](?<spec>[^'"]+)['"]|['"](?<spec2>[^'"]+)['"])\s*;?/g;
@@ -494,11 +500,19 @@ function pruneDeadRelativeImports(code: string, mainFile: string): string {
     const spec = normalizeSpecifier(rawSpec);
     let drop = false;
 
-    if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('file:')) {
-      const resolved = resolveModuleFile(mainFile, spec);
-      if (!resolved) {
-        drop = true;
-        dbg('PRUNE: dead relative import (file missing)', spec);
+    const isRelative = spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('file:');
+    const isAsset = ASSET_EXT_RE.test(spec);
+
+    if (isRelative) {
+      if (isAsset) {
+        dbg('KEEP: side-effect asset import', spec);
+        drop = false;
+      } else {
+        const resolved = resolveModuleFile(mainFile, spec);
+        if (!resolved) {
+          drop = true;
+          dbg('PRUNE: dead relative import (file missing)', spec);
+        }
       }
     }
 
@@ -572,6 +586,47 @@ function pruneAiImportsExcept(code: string, keepSpec: string): string {
   return out;
 }
 
+/** Drop tiles in the grid whose component import is missing. Handles marked tiles and legacy block. */
+function dropTilesWhoseImportMissing(code: string): string {
+  const regionRe = /\{\/\*\s*AI-INJECT-MOUNT:BEGIN\s*\*\/\}([\s\S]*?)\{\/\*\s*AI-INJECT-MOUNT:END\s*\*\/\}/;
+  const m = regionRe.exec(code);
+  if (!m) return code;
+
+  const region = m[1];
+  let regionOut = region;
+
+  const hasImport = (ident: string) => {
+    const re = new RegExp(
+      String.raw`(^|\n)\s*import\s+([^;]*?\b${ident}\b[^;]*?)\s+from\s+['"][^'"]+['"]\s*;`,
+      'm'
+    );
+    return re.test(code);
+  };
+
+  // Marked tiles
+  const tileRe = /\{\s*\/\*\s*AI-TILE:([^\*]+):BEGIN\s*\*\/\}([\s\S]*?)\{\s*\/\*\s*AI-TILE:\1:END\s*\*\/\}/g;
+  regionOut = regionOut.replace(tileRe, (full, _key: string, body: string) => {
+    const ident = /<\s*([A-Z]\w*)\b/.exec(body)?.[1];
+    if (ident && !hasImport(ident)) {
+      dbg('DROP TILE: missing import for ident', ident);
+      return '';
+    }
+    return full;
+  });
+
+  // Unmarked legacy tile fallback (should be rare after marking, but keep for safety)
+  const legacyRe = /(<div className="relative [^>]+>[\s\S]*?<([A-Z]\w*)\b[\s\S]*?<\/div>)/g;
+  regionOut = regionOut.replace(legacyRe, (full, _tile: string, ident: string) => {
+    if (ident && !hasImport(ident)) {
+      dbg('DROP LEGACY TILE: missing import for ident', ident);
+      return '';
+    }
+    return full;
+  });
+
+  return code.replace(region, regionOut);
+}
+
 function main(): void {
   const [, , mainFileArg, importNameArg, importPathArg, jsxFileArg] = process.argv;
   const modeArg = (process.argv[6] || '').toLowerCase();
@@ -609,8 +664,9 @@ function main(): void {
   let originalCode = readFileUtf8(mainFile);
   snapshotImports('BEFORE', originalCode, mainFile);
 
-  // alltid: ta bort döda och oanvända AI-imports oavsett mode
+  // always: prune dead relative modules and unused AI imports
   originalCode = pruneDeadRelativeImports(originalCode, mainFile);
+  originalCode = dropTilesWhoseImportMissing(originalCode);
   originalCode = pruneUnusedAiComponentImports(originalCode);
 
   snapshotImports('AFTER_PRE_PRUNE', originalCode, mainFile);
@@ -659,49 +715,50 @@ function main(): void {
   const jsxIndented = indentMultilineJsx(jsx, (anchor as any).indent);
 
   if (anchor.kind === 'paired') {
-    if (!hasGrid(nextCode, anchor.beginEnd, anchor.endStart)) {
+    if (!hasGrid(nextCode, (anchor as AnchorPaired).beginEnd, (anchor as AnchorPaired).endStart)) {
       console.log('[ai_inject_mount] wrap with grid');
-      const res = wrapInnerWithGrid(nextCode, anchor);
+      const res = wrapInnerWithGrid(nextCode, anchor as AnchorPaired);
       nextCode = res.code;
       anchor = res.anchor;
     }
 
     const key = tileKeyFor(importPath, effectiveName);
-    const tileContent = makeTile(jsxIndented, anchor.indent);
+    const tileContent = makeTile(jsxIndented, (anchor as AnchorPaired).indent);
     if (APPEND) {
-      const replaced = replaceMarkedTile(nextCode, anchor, key, tileContent);
+      const replaced = replaceMarkedTile(nextCode, anchor as AnchorPaired, key, tileContent);
       console.log('[ai_inject_mount] tile action', replaced.replaced ? 'update-existing' : 'append-new', { key });
       if (replaced.replaced) {
         nextCode = replaced.code;
       } else {
-        const insertAt = findGridInsertionIndex(nextCode, anchor);
+        const insertAt = findGridInsertionIndex(nextCode, anchor as AnchorPaired);
         nextCode =
           nextCode.slice(0, insertAt) +
-          `\n${anchor.indent}<> {/* ${key}:BEGIN */}${tileContent} {/* ${key}:END */}</>` +
+          `\n${(anchor as AnchorPaired).indent}<> {/* ${key}:BEGIN */}${tileContent} {/* ${key}:END */}</>` +
           nextCode.slice(insertAt);
       }
     } else {
       console.log('[ai_inject_mount] replace mode single tile', { key });
-      const open = `\n${anchor.indent}<div id="__AI_MOUNT_GRID__" className="flex flex-wrap gap-4 items-start">`;
-      const close = `\n${anchor.indent}</div>\n${anchor.indent}`;
+      const open = `\n${(anchor as AnchorPaired).indent}<div id="__AI_MOUNT_GRID__" className="flex flex-wrap gap-4 items-start">`;
+      const close = `\n${(anchor as AnchorPaired).indent}</div>\n${(anchor as AnchorPaired).indent}`;
       const single = open + tileContent + close;
-      nextCode = nextCode.slice(0, anchor.beginEnd) + single + nextCode.slice(anchor.endStart);
+      nextCode = nextCode.slice(0, (anchor as AnchorPaired).beginEnd) + single + nextCode.slice((anchor as AnchorPaired).endStart);
     }
   } else {
-    const before = nextCode.slice(0, anchor.start);
-    const after = nextCode.slice(anchor.end);
+    const before = nextCode.slice(0, (anchor as AnchorSingle).start);
+    const after = nextCode.slice((anchor as AnchorSingle).end);
     const key = tileKeyFor(importPath, effectiveName);
     console.log('[ai_inject_mount] upgrade single anchor → paired grid', { key });
-    const tileContent = makeTile(jsxIndented, anchor.indent);
+    const tileContent = makeTile(jsxIndented, (anchor as AnchorSingle).indent);
     const block =
-      `{/* AI-INJECT-MOUNT:BEGIN */}\n${anchor.indent}<div id="__AI_MOUNT_GRID__" className="flex flex-wrap gap-4 items-start">` +
-      `\n${anchor.indent}<> {/* ${key}:BEGIN */}${tileContent} {/* ${key}:END */}</>` +
-      `\n${anchor.indent}</div>\n${anchor.indent}{/* AI-INJECT-MOUNT:END */}`;
+      `{/* AI-INJECT-MOUNT:BEGIN */}\n${(anchor as AnchorSingle).indent}<div id="__AI_MOUNT_GRID__" className="flex flex-wrap gap-4 items-start">` +
+      `\n${(anchor as AnchorSingle).indent}<> {/* ${key}:BEGIN */}${tileContent} {/* ${key}:END */}</>` +
+      `\n${(anchor as AnchorSingle).indent}</div>\n${(anchor as AnchorSingle).indent}{/* AI-INJECT-MOUNT:END */}`;
     nextCode = before + block + after;
   }
 
   // Final pruning
   nextCode = pruneDeadRelativeImports(nextCode, mainFile);
+  nextCode = dropTilesWhoseImportMissing(nextCode);
   nextCode = pruneUnusedAiComponentImports(nextCode);
   if (REPLACE_REQUESTED) {
     nextCode = pruneAiImportsExcept(nextCode, importPath);

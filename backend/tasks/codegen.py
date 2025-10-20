@@ -699,9 +699,10 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
 
         # Node med tsx ESM-import (append-läge)
         cmd1 = [
-            "node", "--import", "tsx",
-            str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "replace",
-        ]
+    "node", "--import", "tsx",
+    str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path),
+    ]
+
 
         rc, out, err = _run(cmd1, cwd=base)
         _safe_print("ai.inject.cmd1", {"rc": rc, "cmd": cmd1, "out": out, "err": err})
@@ -714,9 +715,9 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
 
         # Node med --loader tsx (append-läge)
         cmd1b = [
-            "node", "--loader", "tsx",
-            str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "replace",
-        ]
+    "node", "--loader", "tsx",
+    str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path),
+    ]
 
         rc1b, out1b, err1b = _run(cmd1b, cwd=base)
         _safe_print("ai.inject.cmd1b", {"rc": rc1b, "cmd": cmd1b, "out": out1b, "err": err1b})
@@ -730,7 +731,7 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
         # Lokal .bin/tsx om den finns (append-läge)
         local_tsx = base / "node_modules" / ".bin" / ("tsx.cmd" if os.name == "nt" else "tsx")
         if local_tsx.exists():
-            cmd2 = [str(local_tsx), str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "replace"]
+            cmd2 = [str(local_tsx), str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path)]
             rc2, out2, err2 = _run(cmd2, cwd=base)
             _safe_print("ai.inject.cmd2", {"rc": rc2, "cmd": cmd2, "out": out2, "err": err2})
             if rc2 == 0:

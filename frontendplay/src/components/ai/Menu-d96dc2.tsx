@@ -2,9 +2,7 @@
 import React from "react";
 import AvatarC0Aa97 from "/src/assets/icons/avatar-c0aa97.svg?url";
 import ChatBubble8A6B37 from "/src/assets/icons/chat-bubble-8a6b37.svg?url";
-import Icons8877Ca from "/src/assets/icons/icons-8877ca.svg?url";
 import IconsDa553D from "/src/assets/icons/icons-da553d.svg?url";
-import IconsFaae42 from "/src/assets/icons/icons-faae42.svg?url";
 import SettingsA24F08 from "/src/assets/icons/settings-a24f08.svg?url";
 import ZapCbadb5 from "/src/assets/icons/zap-cbadb5.svg?url";
 
@@ -28,28 +26,19 @@ export default function Menud96dc2() {
         </div>
         <div className="w-[218px] h-[56px] relative flex flex-col gap-[10px] pt-[16px] pr-[16px] pb-[16px] pl-[16px] items-start justify-center bg-[#1f1f22] rounded-[16px] z-[1]">
           <div className="w-[186px] h-[24px] relative flex flex-row gap-[16px] items-center justify-start z-[0]">
-            <img
-              src={Icons8877Ca}
-              alt=""
-              aria-hidden="true"
-              width={24}
-              height={24}
-              className="inline-block align-middle w-[24px] h-[24px]"
-            />
+            <div className="w-[24px] h-[24px] relative z-[0]">
+              <div className="w-[15.5px] h-[15.5px] relative z-[0]"></div>
+              <div className="w-[5.31px] h-[5.31px] relative rotate-[0.79deg] z-[1]"></div>
+            </div>
             <div className='relative text-[#efefef] z-[1] text-[16px] leading-[22.4px] font-[400] font-["Open Sans"] text-left whitespace-nowrap w-auto h-auto'>{`Search...`}</div>
           </div>
         </div>
         <div className="w-[218px] h-[296px] relative flex flex-col gap-[24px] items-start justify-start z-[2]">
           <div className="w-[218px] h-[56px] relative flex flex-col gap-[10px] pt-[16px] pr-[16px] pb-[16px] pl-[16px] items-start justify-start rounded-[8px] z-[0]">
             <div className="w-[186px] h-[24px] relative flex flex-row gap-[16px] items-center justify-start z-[0]">
-              <img
-                src={IconsFaae42}
-                alt=""
-                aria-hidden="true"
-                width={24}
-                height={24}
-                className="inline-block align-middle w-[24px] h-[24px]"
-              />
+              <div className="w-[24px] h-[24px] relative z-[0]">
+                <div className="w-[19.5px] h-[19.59px] relative z-[0]"></div>
+              </div>
               <div className='relative text-[#efefef] z-[1] text-[16px] leading-[22.4px] font-[400] font-["Open Sans"] text-left whitespace-nowrap w-auto h-auto'>{`Dashboard`}</div>
             </div>
           </div>
