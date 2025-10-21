@@ -652,6 +652,148 @@ def _ensure_anchor_in_main(main_tsx: Path) -> None:
     src = _normalize_mount_markers(src)
     main_tsx.write_text(src, encoding="utf-8")
 
+# ─────────────────────────────────────────────────────────
+# Ghost-preflight för main.tsx (robust och icke-invasiv)
+# ─────────────────────────────────────────────────────────
+
+_ASSET_EXT_RE = re.compile(r'\.(css|scss|sass|less|pcss|styl|svg(?:\?url)?|png|jpe?g|gif|webp|ico|bmp|avif|woff2?|ttf|otf)(?:\?.*)?$', re.I)
+
+def _resolve_ts_module(main_tsx: Path, spec: str) -> Path | None:
+    """
+    För relativa imports: härma Node/TSX-resolving för .tsx/.ts/.jsx/.js + index.*.
+    Returnerar Path om fil hittas, annars None.
+    """
+    spec = spec.replace("\\", "/")
+    if not (spec.startswith(".") or spec.startswith("/") or spec.startswith("file:")):
+        return None
+    base = main_tsx.parent
+    candidates: list[Path] = []
+    p = (base / spec)
+    candidates.append(p)
+    for ext in (".tsx", ".ts", ".jsx", ".js"):
+        candidates.append(base / f"{spec}{ext}")
+        candidates.append((base / spec) / f"index{ext}")
+    for c in candidates:
+        try:
+            rc = c.resolve()
+            if rc.exists():
+                return rc
+        except Exception:
+            pass
+    return None
+
+def _prune_ghosts_in_main(repo_root: Path, main_rel: str) -> None:
+    """
+    Rensar bort “ghost” imports och deras tiles i main.tsx innan typecheck/commit:
+      1) Tar bort relativa modul-importer vars målfil saknas. Bevarar side-effect assets (t.ex. index.css).
+      2) Tar bort AI-tiles i mount-regionen som refererar till icke-importerade komponenter.
+      3) Återställer import "./index.css" om filen finns men importen saknas.
+
+    No-ops om main.tsx saknas. Skrivs in-place och ändrar inte övrig struktur.
+    """
+    main_tsx = (repo_root / main_rel).resolve()
+    if not main_tsx.exists():
+        return
+    src = main_tsx.read_text(encoding="utf-8")
+
+    # 1) Rensa “dead relative” imports
+    imp_re = re.compile(
+        r'(^|\r?\n)([ \t]*)import\s+(?:([^;]*?)\s+from\s+[\'"]([^\'"]+)[\'"]|[\'"]([^\'"]+)[\'"])\s*;?',
+        re.M,
+    )
+    out_chunks: list[str] = []
+    last = 0
+    for m in imp_re.finditer(src):
+        out_chunks.append(src[last:m.start()])
+        clause = (m.group(3) or "")
+        spec = (m.group(4) or m.group(5) or "")
+        spec_norm = spec.replace("\\", "/")
+        is_relative = spec_norm.startswith(".") or spec_norm.startswith("/") or spec_norm.startswith("file:")
+        is_asset = bool(_ASSET_EXT_RE.search(spec_norm))
+        keep = True
+        if is_relative and not is_asset:
+            keep = _resolve_ts_module(main_tsx, spec_norm) is not None
+        if keep:
+            out_chunks.append(m.group(0))
+        last = m.end()
+    out_chunks.append(src[last:])
+    src = "".join(out_chunks)
+
+    # Bygg nu set av importerade identifierare efter ev. rensning
+    idents_present: set[str] = set()
+    for clause, spec in re.findall(r'^\s*import\s+([^;]+?)\s+from\s+[\'"]([^\'"]+)[\'"]', src, flags=re.M):
+        # default ident före ev. named
+        mdef = re.match(r'\s*([A-Za-z_$][\w$]*)', clause or "")
+        if mdef:
+            idents_present.add(mdef.group(1))
+        # named + alias
+        for name in re.findall(r'\{([^}]*)\}', clause or ""):
+            for tok in name.split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                malias = re.search(r'\bas\s+([A-Za-z_$][\w$]*)', tok)
+                if malias:
+                    idents_present.add(malias.group(1))
+                else:
+                    mname = re.match(r'([A-Za-z_$][\w$]*)', tok)
+                    if mname:
+                        idents_present.add(mname.group(1))
+
+    # 2) Ta bort tiles vars komponenter inte längre importeras
+    region = re.search(
+        r'\{/\*\s*AI-INJECT-MOUNT:BEGIN\s*\*/\}([\s\S]*?)\{/\*\s*AI-INJECT-MOUNT:END\s*\*/\}',
+        src,
+    )
+    if region:
+        inner = region.group(1)
+
+        # a) markerade tiles
+        def drop_marked_tile(m: re.Match) -> str:
+            body = m.group(1)
+            ident = re.search(r'<\s*([A-Z]\w*)\b', body)
+            if ident and ident.group(1) not in idents_present:
+                return ''
+            return m.group(0)
+
+        inner2 = re.sub(
+            r'\{\s*/\*\s*AI-TILE:[^*]+:BEGIN\s*\*/\}([\s\S]*?)\{\s*/\*\s*AI-TILE:[^*]+:END\s*\*/\}',
+            drop_marked_tile,
+            inner,
+        )
+
+        # b) legacy-tiles
+        def drop_legacy_tile(m: re.Match) -> str:
+            tile = m.group(1)
+            ident = re.search(r'<\s*([A-Z]\w*)\b', tile)
+            if ident and ident.group(1) not in idents_present:
+                return ''
+            return m.group(0)
+
+        inner2 = re.sub(
+            r'(<div className="relative [^>]+>[\s\S]*?<([A-Z]\w*)\b[\s\S]*?<\/div>)',
+            drop_legacy_tile,
+            inner2,
+        )
+
+        # skriv tillbaka
+        src = src[:region.start(1)] + inner2 + src[region.end(1):]
+
+    # 3) Säkerställ index.css-import om filen finns
+    css_path = (main_tsx.parent / "index.css")
+    if css_path.exists() and 'import "./index.css"' not in src and "import './index.css'" not in src:
+        # lägg efter sista importblock
+        insert_at = 0
+        import_block = re.search(r'^(?:[ \t]*import\b[^\n]*\n)+', src, flags=re.M)
+        if import_block:
+            insert_at = import_block.end()
+        insert_text = ('\n' if insert_at and not src[:insert_at].endswith('\n') else '') + 'import "./index.css";\n'
+        src = src[:insert_at] + insert_text + src[insert_at:]
+
+    # Normalisera ev. dubblettmarkörer
+    src = _normalize_mount_markers(src)
+    main_tsx.write_text(src, encoding="utf-8")
+
 def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
     main_tsx = next(
         (Path(repo_root, p) for p in ALLOW_PATCH if p.endswith("main.tsx")),
@@ -685,22 +827,27 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
             raise HTTPException(500, f"Saknar scripts/ai_inject_mount.ts: {script_path}")
 
         # ── DEBUG: aktivera injektorns console.log och logga kontext ─────────────────
+        # ── DEBUG: aktivera injektorns console.log och logga kontext ─────────────────
         os.environ["AI_INJECT_DEBUG"] = "1"
+        os.environ["AI_INJECT_APPEND"] = "1"  # tillåt replace-läge
         _safe_print("ai.inject.env", {
-            "AI_INJECT_DEBUG": os.environ.get("AI_INJECT_DEBUG"),
-            "node_cwd": str(base),
-            "script": str(script_path),
-            "main_tsx": str(main_tsx),
-            "import_name": import_name,
-            "import_path": import_path,
-            "jsx_tmp": str(jsx_file_path),
-        })
+    "AI_INJECT_DEBUG": os.environ.get("AI_INJECT_DEBUG"),
+    "AI_INJECT_APPEND": os.environ.get("AI_INJECT_APPEND"),
+    "node_cwd": str(base),
+    "script": str(script_path),
+    "main_tsx": str(main_tsx),
+    "import_name": import_name,
+    "import_path": import_path,
+    "jsx_tmp": str(jsx_file_path),
+})
+# ──────────────────────────────────────────────────────────────────────────────
+
         # ─────────────────────────────────────────────────────────────────────────────
 
         # Node med tsx ESM-import (append-läge)
         cmd1 = [
     "node", "--import", "tsx",
-    str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path),
+    str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "replace",
     ]
 
 
@@ -716,8 +863,9 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
         # Node med --loader tsx (append-läge)
         cmd1b = [
     "node", "--loader", "tsx",
-    str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path),
+    str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "replace",
     ]
+
 
         rc1b, out1b, err1b = _run(cmd1b, cwd=base)
         _safe_print("ai.inject.cmd1b", {"rc": rc1b, "cmd": cmd1b, "out": out1b, "err": err1b})
@@ -731,7 +879,7 @@ def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
         # Lokal .bin/tsx om den finns (append-läge)
         local_tsx = base / "node_modules" / ".bin" / ("tsx.cmd" if os.name == "nt" else "tsx")
         if local_tsx.exists():
-            cmd2 = [str(local_tsx), str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path)]
+            cmd2 = [str(local_tsx), str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "replace"]
             rc2, out2, err2 = _run(cmd2, cwd=base)
             _safe_print("ai.inject.cmd2", {"rc": rc2, "cmd": cmd2, "out": out2, "err": err2})
             if rc2 == 0:
@@ -2066,6 +2214,9 @@ def integrate_figma_node(
         mount["jsx"] = f"<{mount['import_name']} />"
 
     _ast_inject_mount(tmp_root, mount)
+
+    # NYTT: Ghost-preflight innan typecheck/commit
+    _prune_ghosts_in_main(tmp_root, main_rel)
 
     _typecheck_and_lint(tmp_root, [returned_primary_path])
 

@@ -15,6 +15,7 @@
  * - In replace-mode, prunes all other AI imports except the current one.
  * - Marks legacy contents as a tile (__LEGACY__) on first grid wrap.
  * - Drops tiles whose component import no longer exists.
+ * - Idempotent append: removes duplicate tiles with the same key before appending.
  */
 
 import fs from 'node:fs';
@@ -401,6 +402,7 @@ function tileKeyFor(importPath: string, effectiveName: string): string {
   return `AI-TILE:${base}`;
 }
 
+/** Tolerant replace: match comments with flexible spacing, keep markers normalized. */
 function replaceMarkedTile(
   code: string,
   anchor: AnchorPaired,
@@ -408,26 +410,34 @@ function replaceMarkedTile(
   newTileContent: string,
 ): { code: string; replaced: boolean } {
   const inner = code.slice(anchor.beginEnd, anchor.endStart);
-  const open = `{/* ${escapeRegex(key)}:BEGIN */}`;
-  const close = `{/* ${escapeRegex(key)}:END */}`;
+  const openRe = new RegExp(String.raw`\{\s*/\*\s*${escapeRegex(key)}\s*:\s*BEGIN\s*\*/\}`, 'm');
+  const closeRe = new RegExp(String.raw`\{\s*/\*\s*${escapeRegex(key)}\s*:\s*END\s*\*/\}`, 'm');
+  const mOpen = openRe.exec(inner);
+  if (!mOpen) return { code, replaced: false };
+  closeRe.lastIndex = mOpen.index;
+  const mClose = closeRe.exec(inner);
+  if (!mClose) return { code, replaced: false };
 
-  const openIdx = inner.indexOf(open);
-  if (openIdx === -1) return { code, replaced: false };
-  const afterOpen = openIdx + open.length;
-  const closeIdx = inner.indexOf(close, afterOpen);
-  if (closeIdx === -1) return { code, replaced: false };
-
-  const absOpen = anchor.beginEnd + openIdx;
-  const absClose = anchor.beginEnd + closeIdx;
+  const absOpen = anchor.beginEnd + mOpen.index;
+  const absCloseEnd = anchor.beginEnd + mClose.index + mClose[0].length;
+  const openStr = `{/* ${key}:BEGIN */}`;
+  const closeStr = `{/* ${key}:END */}`;
 
   const updated =
-    code.slice(0, absOpen) +
-    open +
-    newTileContent +
-    close +
-    code.slice(absClose + close.length);
+    code.slice(0, absOpen) + openStr + newTileContent + closeStr + code.slice(absCloseEnd);
 
   return { code: updated, replaced: true };
+}
+
+/** Dedupe: remove all tiles with the same key inside the paired region. */
+function removeAllMarkedTiles(code: string, anchor: AnchorPaired, key: string): string {
+  const inner = code.slice(anchor.beginEnd, anchor.endStart);
+  const allRe = new RegExp(
+    String.raw`\{\s*/\*\s*${escapeRegex(key)}\s*:\s*BEGIN\s*\*/\}[\s\S]*?\{\s*/\*\s*${escapeRegex(key)}\s*:\s*END\s*\*/\}`,
+    'gm',
+  );
+  const cleanedInner = inner.replace(allRe, '');
+  return code.slice(0, anchor.beginEnd) + cleanedInner + code.slice(anchor.endStart);
 }
 
 function parseImportLocals(clause: string): string[] {
@@ -614,7 +624,7 @@ function dropTilesWhoseImportMissing(code: string): string {
     return full;
   });
 
-  // Unmarked legacy tile fallback (should be rare after marking, but keep for safety)
+  // Unmarked legacy tile fallback
   const legacyRe = /(<div className="relative [^>]+>[\s\S]*?<([A-Z]\w*)\b[\s\S]*?<\/div>)/g;
   regionOut = regionOut.replace(legacyRe, (full, _tile: string, ident: string) => {
     if (ident && !hasImport(ident)) {
@@ -664,7 +674,7 @@ function main(): void {
   let originalCode = readFileUtf8(mainFile);
   snapshotImports('BEFORE', originalCode, mainFile);
 
-  // always: prune dead relative modules and unused AI imports
+  // always: prune dead relative modules and unused AI imports, and drop orphan tiles
   originalCode = pruneDeadRelativeImports(originalCode, mainFile);
   originalCode = dropTilesWhoseImportMissing(originalCode);
   originalCode = pruneUnusedAiComponentImports(originalCode);
@@ -725,6 +735,8 @@ function main(): void {
     const key = tileKeyFor(importPath, effectiveName);
     const tileContent = makeTile(jsxIndented, (anchor as AnchorPaired).indent);
     if (APPEND) {
+      // Idempotent append: dedupe by key, then insert once
+      nextCode = removeAllMarkedTiles(nextCode, anchor as AnchorPaired, key);
       const replaced = replaceMarkedTile(nextCode, anchor as AnchorPaired, key, tileContent);
       console.log('[ai_inject_mount] tile action', replaced.replaced ? 'update-existing' : 'append-new', { key });
       if (replaced.replaced) {
