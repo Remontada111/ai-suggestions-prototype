@@ -41,6 +41,10 @@ GPT-5-kompatibilitet:
 - Skicka aldrig 'temperature' till GPT-5-modeller. De accepterar endast default. Robust fallback-kedja:
   gpt-5 → json_schema strict=False → json_object
   övriga → strict=True → strict=False → json_object
+
+Ny konfiguration:
+- AI_MOUNT_MODE ('append' | 'replace'), default 'append'.
+  Styr om injektorn ska lägga till nya tiles i grid (append) eller ersätta (replace).
 """
 
 import hashlib
@@ -101,6 +105,9 @@ if not FIGMA_TOKEN:
 ENABLE_VISUAL_VALIDATE = (
     os.getenv("ENABLE_VISUAL_VALIDATE", "false").lower() in ("1", "true", "yes")
 )
+
+# NY: Läge för montering – default append för att inte ersätta tidigare tiles
+AI_MOUNT_MODE = os.getenv("AI_MOUNT_MODE", "append").strip().lower()  # 'append' | 'replace'
 
 CODEGEN_TIMING = os.getenv("CODEGEN_TIMING", "0").lower() in ("1", "true", "yes")
 
@@ -2103,9 +2110,10 @@ def integrate_figma_node(
     else:
         mount["jsx"] = f"<{mount['import_name']} />"
 
-    # Säkerställ markörer och städa regionen helt före replace
+    # Säkerställ markörer. Töm endast i replace-läge.
     _ensure_anchor_in_main(main_abs)
-    _clear_mount_region(main_abs)
+    if AI_MOUNT_MODE == "replace":
+        _clear_mount_region(main_abs)
     _snapshot_main(main_abs, "before_inject")
 
     # NY: Före injektion – extra logg mot importPath OCH ident
@@ -2119,7 +2127,7 @@ def integrate_figma_node(
     except Exception:
         scripts_sha_meta = None
     _safe_print("ai.inject.meta", {
-        "mode_arg": "replace",
+        "mode_arg": ("replace" if AI_MOUNT_MODE == "replace" else "append"),
         "env_APPEND": os.environ.get("AI_INJECT_APPEND"),
         "env_DEBUG": os.environ.get("AI_INJECT_DEBUG"),
         "scripts_ts": str(scripts_ts_meta),
@@ -2130,14 +2138,14 @@ def integrate_figma_node(
     })
     _dump_text_file("main-before-inject", node_id, src_before)
 
-    # Absolut TS-injektor, replace-läge, ingen fallback
+    # Absolut TS-injektor, läge styrt av AI_MOUNT_MODE. Ingen fallback.
     scripts_ts = (tmp_root / "scripts" / "ai_inject_mount.ts").resolve()
     if not scripts_ts.exists():
         raise HTTPException(500, f"TS-injektor saknas: {scripts_ts}")
 
     node_cwd = _find_project_base(tmp_root, hint=main_abs.parent)  # typ .../frontendplay
     os.environ["AI_INJECT_DEBUG"] = "1"
-    os.environ["AI_INJECT_APPEND"] = "0"
+    os.environ["AI_INJECT_APPEND"] = "1" if AI_MOUNT_MODE != "replace" else "0"
 
     jsx_tmp = Path(tempfile.gettempdir()) / f"ai-mount-{hashlib.sha1((mount['import_name']+mount['import_path']).encode()).hexdigest()[:8]}.jsx"
     jsx_tmp.write_text(mount["jsx"] + "\n", encoding="utf-8")
@@ -2145,7 +2153,7 @@ def integrate_figma_node(
     _safe_print("ai.inject.env", {
         "AI_INJECT_DEBUG": os.environ.get("AI_INJECT_DEBUG"),
         "AI_INJECT_APPEND": os.environ.get("AI_INJECT_APPEND"),
-        "mode_expected": "replace",
+        "mode_expected": ("replace" if AI_MOUNT_MODE == "replace" else "append"),
         "node_cwd": str(node_cwd),
         "main_tsx": str(main_abs),
         "import_name": mount.get("import_name"),
@@ -2161,8 +2169,10 @@ def integrate_figma_node(
         str(mount["import_name"]),
         str(mount["import_path"]),
         str(jsx_tmp),
-        "replace",
     ]
+    if AI_MOUNT_MODE == "replace":
+        cmd.append("replace")
+
     rc, out_text, err = _run(cmd, cwd=node_cwd)
     _safe_print("ai.inject.cmd", {"rc": rc, "out": out_text[:2000], "err": err[:2000]})
     if rc != 0:
@@ -2180,8 +2190,9 @@ def integrate_figma_node(
     })
     _dump_text_file("main-after-inject", node_id, src_after)
 
-    # Aggressiv städning: ta bort ALLA andra ai-importer än vår
-    _prune_other_ai_imports(main_abs, mount["import_path"])
+    # I replace-läge: ta bort ALLA andra ai-importer än vår. I append-läge: behåll.
+    if AI_MOUNT_MODE == "replace":
+        _prune_other_ai_imports(main_abs, mount["import_path"])
 
     _snapshot_main(main_abs, "after_inject")
 
