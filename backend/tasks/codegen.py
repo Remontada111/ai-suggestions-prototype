@@ -9,7 +9,7 @@ Uppdateringar:
 - Spärr för palettklasser: alla bg- som inte är bg-[…] blockeras.
 - Pre-purge: oönskade bg-* som inte finns i IR strippas innan validering.
 - Gradients valideras enbart mot IR (n.bg.css), inte mot Figma-fills.
-- Stabil multi-node: komponentnamn och filväg är unika per node-id; main.tsx injicerar i append-läge.
+- Stabil multi-node: komponentnamn och filväg är unika per node-id; main.tsx injicerar i replace-läge.
 
 Övrigt:
 - Endast synlig text (visible_effective=True) byggs till textkrav.
@@ -25,7 +25,7 @@ Uppdateringar:
 - Dims/pos-validering hoppar över ikon-subträd (leafs i exporterad ikon kontrolleras inte separat).
 - Färgvalidering hoppar över ikon-subträd och är case-/format-tålig (hex och rgba).
 - Prettier kör endast lokal bin om den finns, annars lätt fallback-formattering (ingen npx).
-- AST-injektion använder endast lokala metoder (node + tsx eller lokal .bin/tsx), ingen npx.
+- AST-injektion kör via scripts/ai_inject_mount.ts med ABSOLUT väg i REPLACE-läge. Ingen fallback.
 - Figma SVG-hämtning parallelliseras med kortare timeouts.
 - GPT-5: hoppa direkt till strikt=False schema, därefter json_object.
 - Systemprompten ber modellen att lämna mount.import_path tomt.
@@ -358,18 +358,20 @@ def _format_tsx(repo_root: Path, target_path: Path) -> None:
     if cmd is not None:
         try:
             rc, out, err = _run([*cmd, "--parser", "babel-ts", "--write", str(target_path)], cwd=base)
+            _safe_print("prettier.run", {"base": str(base), "rc": rc, "out": out[:2000], "err": err[:2000]})
             if rc == 0:
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            _safe_print("prettier.error", {"base": str(base), "err": str(e)})
     # Fallback-formattering: bryt mellan '><' för bättre diffbarhet
     try:
         code = target_path.read_text(encoding="utf-8")
         code2 = re.sub(r'><', '>\n<', code)
         if code2 != code:
             target_path.write_text(code2, encoding="utf-8")
-    except Exception:
-        pass
+            _safe_print("prettier.fallback", {"path": str(target_path), "changed": True})
+    except Exception as e:
+        _safe_print("prettier.fallback.error", {"path": str(target_path), "err": str(e)})
 
 # ─────────────────────────────────────────────────────────
 # Geometrihjälp
@@ -425,8 +427,9 @@ def _fetch_svgs(file_key: str, ids: List[str]) -> Dict[str, str]:
                 nid, svg_text = f.result()
                 if svg_text:
                     out[nid] = svg_text
-            except Exception:
+            except Exception as e:
                 # Ignorera enskilda fel
+                _safe_print("svg.fetch.warn", {"id": nid, "err": str(e)})
                 pass
 
     return out
@@ -613,15 +616,13 @@ def _ensure_anchor_in_main(main_tsx: Path) -> None:
         main_tsx.write_text(new_src, encoding="utf-8")
         return
 
-    # 1) Injicera inuti .render(<App />) utan att förstöra kedjan "createRoot(...).render(...)"
+    # 1) Injicera inuti .render(<App />)
     m = re.search(r"\.render\(\s*(<[^)]+>)\s*\)", src)
     if m:
         inner = m.group(1)
-        # positionsgränser för parenteserna i den matchade .render(...)
         open_paren = src.rfind("(", m.start(), m.end())
         close_paren = src.find(")", open_paren + 1)
         if open_paren != -1 and close_paren != -1 and close_paren > open_paren:
-            # bevara ".render(" och injicera BEGIN/END med fragment
             injected = (
                 f"<>{inner} {_ANCHOR_JSX_BEGIN}\n"
                 f"{_ANCHOR_JSX_END}</>"
@@ -631,7 +632,7 @@ def _ensure_anchor_in_main(main_tsx: Path) -> None:
             main_tsx.write_text(src, encoding="utf-8")
             return
 
-    # 2) Fallback: placera parmarkörer före </React.StrictMode> om den finns
+    # 2) Fallback: före </React.StrictMode>
     m = re.search(r"</React\.StrictMode>", src)
     if m:
         insert = "    " + _ANCHOR_JSX_BEGIN + "\n" + "    " + _ANCHOR_JSX_END + "\n"
@@ -640,7 +641,7 @@ def _ensure_anchor_in_main(main_tsx: Path) -> None:
         main_tsx.write_text(src, encoding="utf-8")
         return
 
-    # 3) Sista fallback: lägg till en liten wrapper med markörer längst ner
+    # 3) Längst ner
     if _ANCHOR_BEGIN not in src and _ANCHOR_END not in src:
         src += (
             "\n\n// Auto-added safe mount wrapper\n"
@@ -654,15 +655,13 @@ def _ensure_anchor_in_main(main_tsx: Path) -> None:
 
 # ─────────────────────────────────────────────────────────
 # Ghost-preflight för main.tsx (robust och icke-invasiv)
+# + NY: pruna ALLA andra ai-importer än den vi just injicerar
+# + NY: rensa mount-regionen före körning i replace-läge
 # ─────────────────────────────────────────────────────────
 
 _ASSET_EXT_RE = re.compile(r'\.(css|scss|sass|less|pcss|styl|svg(?:\?url)?|png|jpe?g|gif|webp|ico|bmp|avif|woff2?|ttf|otf)(?:\?.*)?$', re.I)
 
 def _resolve_ts_module(main_tsx: Path, spec: str) -> Path | None:
-    """
-    För relativa imports: härma Node/TSX-resolving för .tsx/.ts/.jsx/.js + index.*.
-    Returnerar Path om fil hittas, annars None.
-    """
     spec = spec.replace("\\", "/")
     if not (spec.startswith(".") or spec.startswith("/") or spec.startswith("file:")):
         return None
@@ -682,14 +681,56 @@ def _resolve_ts_module(main_tsx: Path, spec: str) -> Path | None:
             pass
     return None
 
+def _prune_other_ai_imports(main_tsx: Path, keep_spec: str) -> None:
+    """
+    Tar bort alla import-rader som pekar på components/ai UTOM den som motsvarar keep_spec.
+    Använder faktisk modulresolution för att jämföra målfil.
+    """
+    src = main_tsx.read_text(encoding="utf-8")
+    keep_abs = _resolve_ts_module(main_tsx, keep_spec) or Path("__nope__")
+    out_chunks: list[str] = []
+    last = 0
+    imp_re = re.compile(
+        r'(^|\r?\n)([ \t]*)import\s+(?:([^;]*?)\s+from\s+[\'"]([^\'"]+)[\'"]|[\'"]([^\'"]+)[\'"])\s*;?',
+        re.M,
+    )
+    changed = False
+    for m in imp_re.finditer(src):
+        out_chunks.append(src[last:m.start()])
+        spec = (m.group(4) or m.group(5) or "").replace("\\", "/")
+        if "/components/ai/" in spec or spec.startswith("./components/ai/") or spec.startswith("../components/ai/"):
+            tgt = _resolve_ts_module(main_tsx, spec)
+            if tgt and tgt != keep_abs:
+                # drop
+                changed = True
+                last = m.end()
+                continue
+        out_chunks.append(m.group(0))
+        last = m.end()
+    out_chunks.append(src[last:])
+    if changed:
+        src2 = "".join(out_chunks)
+        main_tsx.write_text(_normalize_mount_markers(src2), encoding="utf-8")
+
+def _clear_mount_region(main_tsx: Path) -> None:
+    """
+    Töm innehållet mellan AI-INJECT-MOUNT:BEGIN/END. Behåller markörerna.
+    """
+    src = main_tsx.read_text(encoding="utf-8")
+    region = re.search(
+        r'(\{/\*\s*AI-INJECT-MOUNT:BEGIN\s*\*/\})([\s\S]*?)(\{/\*\s*AI-INJECT-MOUNT:END\s*\*/\})',
+        src
+    )
+    if region:
+        new_src = src[:region.start(2)] + "" + src[region.end(2):]
+        main_tsx.write_text(_normalize_mount_markers(new_src), encoding="utf-8")
+
 def _prune_ghosts_in_main(repo_root: Path, main_rel: str) -> None:
     """
     Rensar bort “ghost” imports och deras tiles i main.tsx innan typecheck/commit:
       1) Tar bort relativa modul-importer vars målfil saknas. Bevarar side-effect assets (t.ex. index.css).
       2) Tar bort AI-tiles i mount-regionen som refererar till icke-importerade komponenter.
       3) Återställer import "./index.css" om filen finns men importen saknas.
-
-    No-ops om main.tsx saknas. Skrivs in-place och ändrar inte övrig struktur.
     """
     main_tsx = (repo_root / main_rel).resolve()
     if not main_tsx.exists():
@@ -713,20 +754,19 @@ def _prune_ghosts_in_main(repo_root: Path, main_rel: str) -> None:
         keep = True
         if is_relative and not is_asset:
             keep = _resolve_ts_module(main_tsx, spec_norm) is not None
+            _safe_print("main.prune.relative", {"spec": spec_norm, "keep": keep})
         if keep:
             out_chunks.append(m.group(0))
         last = m.end()
     out_chunks.append(src[last:])
     src = "".join(out_chunks)
 
-    # Bygg nu set av importerade identifierare efter ev. rensning
+    # Bygg set av importerade identifierare efter rensning
     idents_present: set[str] = set()
     for clause, spec in re.findall(r'^\s*import\s+([^;]+?)\s+from\s+[\'"]([^\'"]+)[\'"]', src, flags=re.M):
-        # default ident före ev. named
         mdef = re.match(r'\s*([A-Za-z_$][\w$]*)', clause or "")
         if mdef:
             idents_present.add(mdef.group(1))
-        # named + alias
         for name in re.findall(r'\{([^}]*)\}', clause or ""):
             for tok in name.split(","):
                 tok = tok.strip()
@@ -748,11 +788,12 @@ def _prune_ghosts_in_main(repo_root: Path, main_rel: str) -> None:
     if region:
         inner = region.group(1)
 
-        # a) markerade tiles
         def drop_marked_tile(m: re.Match) -> str:
             body = m.group(1)
             ident = re.search(r'<\s*([A-Z]\w*)\b', body)
-            if ident and ident.group(1) not in idents_present:
+            keep = bool(ident and ident.group(1) in idents_present)
+            _safe_print("main.prune.tile", {"kind": "marked", "ident": ident.group(1) if ident else None, "keep": keep})
+            if not keep:
                 return ''
             return m.group(0)
 
@@ -762,11 +803,12 @@ def _prune_ghosts_in_main(repo_root: Path, main_rel: str) -> None:
             inner,
         )
 
-        # b) legacy-tiles
         def drop_legacy_tile(m: re.Match) -> str:
             tile = m.group(1)
             ident = re.search(r'<\s*([A-Z]\w*)\b', tile)
-            if ident and ident.group(1) not in idents_present:
+            keep = bool(ident and ident.group(1) in idents_present)
+            _safe_print("main.prune.tile", {"kind": "legacy", "ident": ident.group(1) if ident else None, "keep": keep})
+            if not keep:
                 return ''
             return m.group(0)
 
@@ -776,13 +818,11 @@ def _prune_ghosts_in_main(repo_root: Path, main_rel: str) -> None:
             inner2,
         )
 
-        # skriv tillbaka
         src = src[:region.start(1)] + inner2 + src[region.end(1):]
 
-    # 3) Säkerställ index.css-import om filen finns
+    # 3) index.css-import
     css_path = (main_tsx.parent / "index.css")
     if css_path.exists() and 'import "./index.css"' not in src and "import './index.css'" not in src:
-        # lägg efter sista importblock
         insert_at = 0
         import_block = re.search(r'^(?:[ \t]*import\b[^\n]*\n)+', src, flags=re.M)
         if import_block:
@@ -790,125 +830,62 @@ def _prune_ghosts_in_main(repo_root: Path, main_rel: str) -> None:
         insert_text = ('\n' if insert_at and not src[:insert_at].endswith('\n') else '') + 'import "./index.css";\n'
         src = src[:insert_at] + insert_text + src[insert_at:]
 
-    # Normalisera ev. dubblettmarkörer
     src = _normalize_mount_markers(src)
     main_tsx.write_text(src, encoding="utf-8")
+    _safe_print("main.prune.done", {"path": str(main_tsx)})
 
-def _ast_inject_mount(repo_root: Path, mount: dict) -> None:
-    main_tsx = next(
-        (Path(repo_root, p) for p in ALLOW_PATCH if p.endswith("main.tsx")),
-        Path(repo_root, "frontendplay/src/main.tsx"),
-    )
-    if not main_tsx.exists():
-        raise HTTPException(500, f"Hittar inte main.tsx: {main_tsx}")
+# ─────────────────────────────────────────────────────────
+# Snapshot/logg av main.tsx AI-läge
+# ─────────────────────────────────────────────────────────
 
-    import_name = mount.get("import_name")
-    import_path = mount.get("import_path")
-    jsx = mount.get("jsx")
-    if not (import_name and import_path and jsx):
-        raise HTTPException(500, "Mount-objektet saknar obligatoriska fält.")
+_AI_IMPORT_RE = re.compile(r'^\s*import\s+[^;]*\s+from\s+[\'"](?P<spec>[^\'"]+)[\'"]\s*;?', re.M)
+_TILE_MARKED_RE = re.compile(r'\{\s*/\*\s*(AI-TILE:[^*]+):BEGIN\s*\*/\}')
+_TILE_LEGACY_IDENT_RE = re.compile(r'<\s*([A-Z]\w*)\b')
 
-    _ensure_anchor_in_main(main_tsx)
-
-    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".jsx.txt", encoding="utf-8") as tmp:
-        tmp.write(_sanitize_tailwind_conflicts(str(jsx)))
-        jsx_file_path = tmp.name
-
+def _snapshot_main(main_tsx: Path, stage: str) -> None:
     try:
-        base = main_tsx.parent
-        while base != base.parent and not (base / "package.json").exists():
-            base = base.parent
-        if not (base / "package.json").exists():
-            fp_pkg = repo_root / "frontendplay" / "package.json"
-            base = fp_pkg.parent if fp_pkg.exists() else repo_root
-
-        script_path = repo_root / "scripts" / "ai_inject_mount.ts"
-        if not script_path.exists():
-            raise HTTPException(500, f"Saknar scripts/ai_inject_mount.ts: {script_path}")
-
-        # ── DEBUG: aktivera injektorns console.log och logga kontext ─────────────────
-        # ── DEBUG: aktivera injektorns console.log och logga kontext ─────────────────
-        os.environ["AI_INJECT_DEBUG"] = "1"
-        os.environ["AI_INJECT_APPEND"] = "1"  # tillåt replace-läge
-        _safe_print("ai.inject.env", {
-    "AI_INJECT_DEBUG": os.environ.get("AI_INJECT_DEBUG"),
-    "AI_INJECT_APPEND": os.environ.get("AI_INJECT_APPEND"),
-    "node_cwd": str(base),
-    "script": str(script_path),
-    "main_tsx": str(main_tsx),
-    "import_name": import_name,
-    "import_path": import_path,
-    "jsx_tmp": str(jsx_file_path),
-})
-# ──────────────────────────────────────────────────────────────────────────────
-
-        # ─────────────────────────────────────────────────────────────────────────────
-
-        # Node med tsx ESM-import (append-läge)
-        cmd1 = [
-    "node", "--import", "tsx",
-    str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "replace",
-    ]
-
-
-        rc, out, err = _run(cmd1, cwd=base)
-        _safe_print("ai.inject.cmd1", {"rc": rc, "cmd": cmd1, "out": out, "err": err})
-        if rc == 0:
-            s = main_tsx.read_text(encoding="utf-8")
-            ns = _normalize_mount_markers(s)
-            if ns != s:
-                main_tsx.write_text(ns, encoding="utf-8")
+        if not main_tsx.exists():
+            _safe_print("ai.main.snapshot", {"stage": stage, "exists": False, "path": str(main_tsx)})
             return
+        code = main_tsx.read_text(encoding="utf-8")
+        imports = []
+        for m in _AI_IMPORT_RE.finditer(code):
+            spec = (m.group("spec") or "").replace("\\", "/")
+            if "/components/ai/" in spec or spec.startswith("./components/ai/") or spec.startswith("../components/ai/"):
+                imports.append(spec)
+        region = re.search(r'\{/\*\s*AI-INJECT-MOUNT:BEGIN\s*\*/\}([\s\S]*?)\{/\*\s*AI-INJECT-MOUNT:END\s*\*/\}', code)
+        marked = []
+        legacy_idents = []
+        if region:
+            inner = region.group(1)
+            marked = [m.group(1) for m in _TILE_MARKED_RE.finditer(inner)]
+            legacy_idents = [m.group(1) for m in _TILE_LEGACY_IDENT_RE.finditer(inner)]
+        _safe_print("ai.main.snapshot", {
+            "stage": stage,
+            "path": str(main_tsx),
+            "ai_imports": imports,
+            "tiles_marked": marked,
+            "tiles_legacy_idents": legacy_idents[:20],
+            "len": len(code),
+        })
+    except Exception as e:
+        _safe_print("ai.main.snapshot.error", {"stage": stage, "err": str(e), "path": str(main_tsx)})
 
-        # Node med --loader tsx (append-läge)
-        cmd1b = [
-    "node", "--loader", "tsx",
-    str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "replace",
-    ]
+# ─────────────────────────────────────────────────────────
+# NYA HJÄLPARE FÖR LOGG MOT importPath OCH ident
+# ─────────────────────────────────────────────────────────
 
+def _mount_inner_len(code: str) -> int:
+    m = re.search(r'\{/\*\s*AI-INJECT-MOUNT:BEGIN\s*\*/\}([\s\S]*?)\{/\*\s*AI-INJECT-MOUNT:END\s*\*/\}', code)
+    return len(m.group(1)) if m else -1
 
-        rc1b, out1b, err1b = _run(cmd1b, cwd=base)
-        _safe_print("ai.inject.cmd1b", {"rc": rc1b, "cmd": cmd1b, "out": out1b, "err": err1b})
-        if rc1b == 0:
-            s = main_tsx.read_text(encoding="utf-8")
-            ns = _normalize_mount_markers(s)
-            if ns != s:
-                main_tsx.write_text(ns, encoding="utf-8")
-            return
-
-        # Lokal .bin/tsx om den finns (append-läge)
-        local_tsx = base / "node_modules" / ".bin" / ("tsx.cmd" if os.name == "nt" else "tsx")
-        if local_tsx.exists():
-            cmd2 = [str(local_tsx), str(script_path), str(main_tsx), str(import_name), str(import_path), str(jsx_file_path), "replace"]
-            rc2, out2, err2 = _run(cmd2, cwd=base)
-            _safe_print("ai.inject.cmd2", {"rc": rc2, "cmd": cmd2, "out": out2, "err": err2})
-            if rc2 == 0:
-                s = main_tsx.read_text(encoding="utf-8")
-                ns = _normalize_mount_markers(s)
-                if ns != s:
-                    main_tsx.write_text(ns, encoding="utf-8")
-                return
-            else:
-                raise HTTPException(
-                    500,
-                    "AST-injektion misslyckades:\n"
-                    f"{' '.join(cmd1)}\n{err or out}\n\n"
-                    f"{' '.join(cmd1b)}\n{err1b or out1b}\n\n"
-                    f"{' '.join(cmd2)}\n{err2 or out2}"
-                )
-        else:
-            raise HTTPException(
-                500,
-                "AST-injektion misslyckades och lokal tsx saknas:\n"
-                f"{' '.join(cmd1)}\n{err or out}\n\n"
-                f"{' '.join(cmd1b)}\n{err1b or out1b}\n"
-                "Installera 'tsx' i devDependencies eller lägg till script."
-            )
-    finally:
-        try:
-            os.unlink(jsx_file_path)
-        except Exception:
-            pass
+def _tile_exists_spec_or_ident(src: str, import_path: str, import_name: str) -> bool:
+    spec = re.escape(import_path.replace("\\", "/"))
+    ident = re.escape(import_name)
+    return (
+        re.search(rf'\{{/\*\s*AI-TILE:{spec}:BEGIN\s*\*/\}}', src) is not None or
+        re.search(rf'\{{/\*\s*AI-TILE:{ident}:BEGIN\s*\*/\}}', src) is not None
+    )
 
 # ─────────────────────────────────────────────────────────
 # Typecheck/lint/visual
@@ -921,14 +898,14 @@ def _typecheck_and_lint(repo_root: Path, fix_only: List[str] | None = None) -> N
 
     if _has_script(base, "typecheck"):
         rc, out, err = _run_pm_script(base, "typecheck")
+        _safe_print("typecheck.run", {"rc": rc, "out": out[:2000], "err": err[:2000]})
         if rc != 0:
             raise HTTPException(500, f"Typecheck misslyckades:\n{err or out}")
 
     if _has_script(base, "lint:fix"):
         extra = fix_only or []
         rc, out, err = _run_pm_script(base, "lint:fix", extra)
-        # Ignorera ev. fel från lint:fix
-
+        _safe_print("lint.fix.run", {"rc": rc, "out": out[:2000], "err": err[:2000], "files": extra})
 
 def _visual_validate(repo_root: Path) -> Dict[str, Any] | None:
     if not ENABLE_VISUAL_VALIDATE:
@@ -942,6 +919,7 @@ def _visual_validate(repo_root: Path) -> Dict[str, Any] | None:
         return None
 
     rc, out, err = _run_pm_script(base, "test:visual", ["--reporter=line"])
+    _safe_print("visual.validate.run", {"rc": rc, "out": out[:2000], "err": err[:2000]})
     if rc != 0:
         raise HTTPException(500, f"Visuell validering misslyckades:\n{err or out}")
     return {"status": "ok"}
@@ -1006,10 +984,8 @@ def _compact_arbitrary_values(src: str) -> str:
         inner  = m.group('inner')
         suf    = m.group('suf') or ''
         if prefix == 'font':
-            # behåll blanks i font-namn
             cleaned = inner.replace('% ', '%')
             return f'{prefix}-[{cleaned}]{suf}'
-        # komprimera för övriga arbitrary-klasser
         inner2 = re.sub(r'\s+', '', inner).replace('% ', '%')
         return f'{prefix}-[{inner2}]{suf}'
     return _ARB_WITH_PREFIX.sub(repl, src)
@@ -1032,11 +1008,9 @@ def _fonts_in_ir(ir: Dict[str, Any]) -> set[str]:
 
 def _autofix_font_family(ir: Dict[str, Any], file_code: str) -> str:
     fams = _fonts_in_ir(ir)
-    # Only auto-fix when exactly one font-family exists in the IR
     if not fams or len(fams) != 1:
         return file_code
     fam = next(iter(fams))
-    # behåll blanks så fonten matchar den laddade webfonten
     fam_space = fam.replace("\\","\\\\").replace("'","\\'")
     def repl(m: re.Match) -> str:
         q = m.group("q"); val = m.group("val") or ""
@@ -1048,8 +1022,6 @@ def _autofix_font_family(ir: Dict[str, Any], file_code: str) -> str:
     return _CLS_RE.sub(repl, file_code, count=1)
 
 
-
-# Endast för <img>: ta bort left-/top-/absolute så ikoner inte placeras utanför vyn
 _IMG_WITH_CLASS = re.compile(
     r'(<img\b[^>]*\bclassName\s*=\s*)(?P<q>"|\')(?P<cls>.*?)(?P=q)(?P<tail>[^>]*>)',
     re.IGNORECASE | re.DOTALL,
@@ -1150,10 +1122,6 @@ def _px_s(x: Any | None) -> str | None:
         return None
 
 def _is_layout_only(n: Dict[str, Any]) -> bool:
-    """
-    True om noden inte bidrar visuellt: ingen fill/stroke/effect/text och ingen clipping.
-    Används för att undvika krav på w/h/pos som skapar “tomma block” i DOM.
-    """
     if n.get("type") == "TEXT":
         return False
     if n.get("clips_content"):
@@ -1162,7 +1130,7 @@ def _is_layout_only(n: Dict[str, Any]) -> bool:
         return False
     if any(_ for _ in (n.get("effects") or [])):
         return False
-    fills = n.get("fills") or []  # används endast för att bedöma visuellt bidrag, ej färg
+    fills = n.get("fills") or []
     def _has_visual_fill(f: Dict[str,Any]) -> bool:
         t = str(f.get("type") or "")
         if t == "SOLID":
@@ -1174,18 +1142,12 @@ def _is_layout_only(n: Dict[str, Any]) -> bool:
         return False
     has_visual_fill = any(_has_visual_fill(f) for f in fills)
     has_stroke = bool(n.get("strokes"))
-    # Om ny IR tillhandahåller n.bg, behandla det som visuellt
     if not has_visual_fill and not has_stroke:
         if isinstance(n.get("bg"), dict):
             return False
     return not has_visual_fill and not has_stroke
 
 def _assert_dims_positions(ir: Dict[str, Any], file_code: str, icon_asset_ids: set[str] | None = None) -> None:
-    """
-    Validerar att noder som faktiskt renderas i JSX har motsvarande Tailwind-klasser.
-    Ikon-subträd som exporteras som en enda <img> hoppas över.
-    Skipper även layout-only wrappers.
-    """
     classes = _gather_classes(file_code)
     icon_asset_ids = set(icon_asset_ids or set())
 
@@ -1209,7 +1171,6 @@ def _assert_dims_positions(ir: Dict[str, Any], file_code: str, icon_asset_ids: s
         return [] if not s else [f"top-[{s}]"]
 
     def rec(n: Dict[str,Any], clip: Dict[str, float] | None, skip: bool = False):
-        # Hoppa över ikon-subträdet
         if skip or (n.get("id") in icon_asset_ids):
             next_clip = _next_clip_ir(n, clip)
             for ch in n.get("children") or []:
@@ -1221,7 +1182,6 @@ def _assert_dims_positions(ir: Dict[str, Any], file_code: str, icon_asset_ids: s
         if not _effectively_visible_ir(n, clip):
             return
 
-        # Layout-only wrapper → ingen dims/pos-tvingning
         if _is_layout_only(n):
             next_clip = _next_clip_ir(n, clip)
             for ch in n.get("children") or []:
@@ -1232,7 +1192,6 @@ def _assert_dims_positions(ir: Dict[str, Any], file_code: str, icon_asset_ids: s
         nid = n.get("id"); nname = n.get("name"); ntype = n.get("type")
 
         w_tokens = _need_w(b.get("w"))
-        # TEXT-noder får använda auto i stället för px-bredd
         if n.get("type") == "TEXT":
             w_tokens = w_tokens + ["w-auto"]
         if w_tokens and not _any(w_tokens):
@@ -1242,7 +1201,6 @@ def _assert_dims_positions(ir: Dict[str, Any], file_code: str, icon_asset_ids: s
                 f"för node id={nid} name={nname} type={ntype} bounds={b}"
             )
         h_tokens = _need_h(b.get("h"))
-        # TEXT-noder får använda auto i stället för px-höjd
         if n.get("type") == "TEXT":
             h_tokens = h_tokens + ["h-auto"]
         if h_tokens and not _any(h_tokens):
@@ -1303,16 +1261,6 @@ def _assert_colors_shadows_and_gradients(
     file_code: str,
     icon_asset_ids: set[str] | None = None,
 ) -> None:
-    """
-    BG-validering:
-    - Använd endast n.bg (SOLID/GRADIENT). Kräv bg-* endast när n.bg finns.
-    - Skippa layout-only wrappers och ikon-subträd.
-    - Root-bg ignoreras när IGNORE_ROOT_FILL=1 för bakåtkompat.
-    Textfärg:
-    - För TEXT använder vi text.style.color om den finns (hex eller rgba).
-    Skuggor:
-    - Samma som tidigare via n.css.boxShadow.
-    """
     icon_asset_ids = set(icon_asset_ids or set())
 
     class_attrs = [m.group("val") or "" for m in _CLS_RE.finditer(file_code)]
@@ -1324,19 +1272,15 @@ def _assert_colors_shadows_and_gradients(
             if tt:
                 class_blob_tokens.add(tt)
 
-    # debug: lista ett urval av klasser som valideras mot
     _dbg_bg("class-scan", {"sample_classes": list(class_blob_tokens)[:40]})
 
     def _has_alpha_variants_bg(col_hex: str, a: float) -> bool:
         r,g,b = _rgba_triplet_from_hex(col_hex)
-        # rgba variant
         if _has_sub(class_blob_text, f"bg-[rgba({r},{g},{b},"):
             return True
-        # hex8 variant
         aa = f"{int(round(a*255)):02x}"
         if _has_sub(class_blob_text, f"bg-[#" + col_hex.lower().lstrip("#") + aa + "]"):
             return True
-        # slash opacity variant (tolerera valfritt /NN)
         if _has_sub(class_blob_text, f"bg-[#" + col_hex.lower().lstrip("#") + "]/"):
             return True
         return False
@@ -1353,7 +1297,6 @@ def _assert_colors_shadows_and_gradients(
             if not _has_token(class_blob_tokens, want):
                 raise HTTPException(500, f"Saknar textfärgklass {want}")
         else:
-            # rgba(...) prefixmatch
             if not _has_sub(class_blob_text, "text-[rgba("):
                 raise HTTPException(500, "Saknar semitransparent textfärgklass text-[rgba(...)]")
 
@@ -1363,7 +1306,6 @@ def _assert_colors_shadows_and_gradients(
         if not _effectively_visible_ir(n, clip):
             return
 
-        # debug: per-nod bg som kontrolleras
         if isinstance(n.get("bg"), dict):
             _dbg_bg("check", {
                 "id": n.get("id"),
@@ -1372,12 +1314,9 @@ def _assert_colors_shadows_and_gradients(
                 "bg": n.get("bg"),
             })
 
-        # TEXT-färg via text.style.color
         _assert_text_color(n)
 
-        # Ignorera root-bg om flaggad
         if not (IGNORE_ROOT_FILL and n.get("is_root")):
-            # BG via IR
             if not _is_layout_only(n):
                 bg = _bg_obj(n)
                 if bg:
@@ -1397,7 +1336,6 @@ def _assert_colors_shadows_and_gradients(
                                     raise HTTPException(500, f"Saknar semitransparent bakgrundsklass (rgba, #rrggbbaa eller /opacity) för node id={nid} name={nname!r} type={ntype} bounds={b}")
                     elif t == "GRADIENT":
                         css = str(bg.get("css") or "")
-                        # Kräv endast när IR säger gradient
                         if css.startswith("linear-gradient("):
                             if not _has_sub(class_blob_text, "bg-[linear-gradient("):
                                 nid = n.get("id"); nname = n.get("name"); ntype = n.get("type"); b = n.get("bounds")
@@ -1419,15 +1357,9 @@ def _assert_colors_shadows_and_gradients(
 # Bakgrunder: only-from-IR kontroll och purge
 # ─────────────────────────────────────────────────────────
 
-# Fångar bg-[ … ] med valfri frivillig slash-opacity efteråt, t.ex. bg-[#000]/20
 _BG_TOKEN = re.compile(r'\bbg-\[(?P<inner>[^\]]+)\](?P<suffix>/[0-9]{1,3})?')
 
 def _expected_bg_set(ir: Dict[str,Any]) -> set[str]:
-    """
-    Returnerar tillåtna BG-patterns från IR. Vi använder prefixmatch för
-    rgba(…) och linear-gradient(…). För hex lägger vi både #hex och #hex/ (för slash-opacity).
-    Root kan ignoreras via IGNORE_ROOT_FILL.
-    """
     exp: set[str] = set()
     def rec(n: Dict[str,Any]):
         if not bool(n.get("visible_effective", True)):
@@ -1442,48 +1374,37 @@ def _expected_bg_set(ir: Dict[str,Any]) -> set[str]:
                 if isinstance(col, str) and col.startswith("#") and len(col) >= 7:
                     hexlow = col.lower()
                     if a >= 0.999:
-                        exp.add(hexlow)        # exakt match: bg-[#hex]
+                        exp.add(hexlow)
                     else:
-                        # Tillåt tre sätt
                         r,g,b = _rgba_triplet_from_hex(hexlow)
-                        exp.add(f"rgba({r},{g},{b},")  # prefix
-                        exp.add(hexlow + "/")          # prefix för slash-opacity
+                        exp.add(f"rgba({r},{g},{b},")
+                        exp.add(hexlow + "/")
                         aa = f"{int(round(a*255)):02x}"
-                        exp.add(hexlow + aa)           # #rrggbbaa
+                        exp.add(hexlow + aa)
             elif t == "GRADIENT":
                 css = str(bg.get("css") or "")
                 if css.startswith("linear-gradient("):
-                    exp.add("linear-gradient(")  # prefix
+                    exp.add("linear-gradient(")
         for ch in n.get("children") or []:
             rec(ch)
     rec(ir["root"])
     return exp
 
 def _purge_unexpected_backgrounds(ir: Dict[str,Any], file_code: str) -> str:
-    """
-    Tar bort alla bg-* klasser som inte är i IR. Palettklasser tas alltid bort.
-    Behåller endast bg-[…] som matchar förväntat set/prefix.
-    """
     allowed = _expected_bg_set(ir)
 
     def keep_arbitrary(inner: str, suffix: str | None) -> bool:
         raw = (inner or "").strip().lower().replace(" ", "")
         suf = (suffix or "").strip().lower()
-        # rgba prefix
         if raw.startswith("rgba("):
             return any(raw.startswith(a) for a in allowed if a.startswith("rgba("))
-        # linear-gradient prefix
         if raw.startswith("linear-gradient("):
             return any(a == "linear-gradient(" for a in allowed)
-        # hex or hex8 or slash opacity
         if raw.startswith("#"):
-            # exact hex (no suffix)
             if suf == "":
                 return raw in allowed
-            # slash-opacity
             if suf.startswith("/"):
                 return (raw + "/") in allowed
-        # hex8 form: inner already contains #rrggbbaa
         if raw.startswith("#") and len(raw) in (9, 13):
             return any(raw.startswith(a) for a in allowed if a.startswith("#") and len(a) >= 9)
         return False
@@ -1499,10 +1420,8 @@ def _purge_unexpected_backgrounds(ir: Dict[str,Any], file_code: str) -> str:
             if not tl:
                 continue
             if tl.startswith("bg-"):
-                # Palettklass? dvs inte bg-[…] → släng
                 if not tl.startswith("bg-["):
                     removed.append(tl); continue
-                # bg-[…] ev /NN
                 m2 = _BG_TOKEN.match(tl)
                 if not m2:
                     removed.append(tl); continue
@@ -1522,25 +1441,17 @@ def _purge_unexpected_backgrounds(ir: Dict[str,Any], file_code: str) -> str:
     return _CLS_RE.sub(repl_class, file_code)
 
 def _assert_only_expected_backgrounds(ir: Dict[str,Any], file_code: str) -> None:
-    """
-    Säkerställ:
-    1) Inga palettklasser bg-* utan bg-[…].
-    2) Alla bg-[…] finns i IR:s tillåtna uppsättning/prefix.
-    3) Slash-opacity valideras (bg-[#hex]/NN).
-    """
     allowed = _expected_bg_set(ir)
     _dbg_bg("allowed", {"allowed": sorted(list(allowed))[:60]})
 
     bad: list[str] = []
     class_attrs = [m.group("val") or "" for m in _CLS_RE.finditer(file_code)]
 
-    # 1) Palettklasser
     for s in class_attrs:
         for tok in s.split():
             if tok.startswith("bg-") and not tok.startswith("bg-["):
                 bad.append(tok)
 
-    # 2) Arbitrary kontroller
     for s in class_attrs:
         for m in _BG_TOKEN.finditer(s):
             inner = (m.group("inner") or "").strip().lower().replace(" ", "")
@@ -1600,7 +1511,6 @@ def _assert_typography(ir: Dict[str, Any], file_code: str) -> None:
                 if want not in classes:
                     raise HTTPException(500, f"Saknar line-height klass {want}")
 
-            # FIX: tolerera nära-noll och acceptera tracking-normal
             ls = st.get("letterSpacing")
             if isinstance(ls, str) and ls.strip():
                 m = re.match(r"^\s*([+-]?\d+(?:\.\d+)?)\s*px\s*$", ls)
@@ -1666,7 +1576,6 @@ def _icon_filename(name_slug: str, node_id: str) -> str:
     safe = re.sub(r"[^a-z0-9\-]+", "-", (name_slug or "icon").lower()).strip("-") or "icon"
     return f"{safe}-{h}.svg"
 
-# Import- och <img>-regexar
 _IMG_IMPORT = re.compile(r"import\s+(\w+)\s+from\s+['\"]([^'\"]+\.svg(?:\?url)?)['\"]")
 _IMG_TAG = re.compile(r"<img\b[^>]*?>", re.IGNORECASE | re.DOTALL)
 _SRC_VAR = re.compile(r"src=\{(\w+)\}", re.IGNORECASE | re.DOTALL)
@@ -1701,15 +1610,9 @@ def _import_var_from_path(p: str, used: set[str]) -> str:
     return name
 
 def _autofix_missing_icons(file_code: str, icon_assets: List[Dict[str, Any]]) -> str:
-    """
-    Lägger automatiskt till saknade SVG-importer och <img>-taggar för alla förväntade ikoner.
-    - Importer placeras efter sista import-raden.
-    - <img>-taggar injiceras innan sista stängande taggen i return(...) JSX.
-    """
     if not icon_assets or not isinstance(file_code, str) or not file_code.strip():
         return file_code
 
-    # Befintliga imports och användningar
     imports = {m.group(1): m.group(2) for m in _IMG_IMPORT.finditer(file_code)}
     used_vars: set[str] = set()
     size_by_var: Dict[str, Tuple[int | None, int | None]] = {}
@@ -1730,7 +1633,6 @@ def _autofix_missing_icons(file_code: str, icon_assets: List[Dict[str, Any]]) ->
     used_paths = [imports[v] for v in used_vars if v in imports]
     expected = list(icon_assets)
 
-    # Hitta saknade
     missing_assets: List[Dict[str, Any]] = []
     for ia in expected:
         p = ia["import_path"]
@@ -1740,7 +1642,6 @@ def _autofix_missing_icons(file_code: str, icon_assets: List[Dict[str, Any]]) ->
     if not missing_assets:
         return file_code
 
-    # Bygg import-rader
     existing_import_vars = set(imports.keys())
     new_import_lines: List[str] = []
     new_img_snippets: List[str] = []
@@ -1749,7 +1650,6 @@ def _autofix_missing_icons(file_code: str, icon_assets: List[Dict[str, Any]]) ->
         p = str(ia["import_path"])
         if not p.lower().endswith(".svg") and not p.lower().endswith(".svg?url"):
             continue
-        # säkerställ ?url
         imp_path = p if p.endswith("?url") else (p + "?url")
         var = _import_var_from_path(p, existing_import_vars)
         existing_import_vars.add(var)
@@ -1766,7 +1666,6 @@ def _autofix_missing_icons(file_code: str, icon_assets: List[Dict[str, Any]]) ->
             f'className="inline-block align-middle w-[{w}px] h-[{h}px]" />'
         )
 
-    # Injicera importerna efter sista import
     insert_pos = 0
     import_iter = re.finditer(r"^(?:import\s.+?;)\s*$", file_code, flags=re.MULTILINE)
     for m in import_iter:
@@ -1777,7 +1676,6 @@ def _autofix_missing_icons(file_code: str, icon_assets: List[Dict[str, Any]]) ->
         add = ("\n" if not prefix.endswith("\n") else "") + "\n".join(new_import_lines) + "\n"
         file_code = prefix + add + suffix
 
-    # Hitta return(...) och sista stängande tagg däri
     ret = re.search(r"return\s*\(", file_code)
     if ret:
         start = ret.end()
@@ -1785,7 +1683,6 @@ def _autofix_missing_icons(file_code: str, icon_assets: List[Dict[str, Any]]) ->
         if end == -1:
             end = len(file_code)
         jsx_region = file_code[start:end]
-        # sista stängande tagg
         last_close = None
         for m in re.finditer(r"</[^>]+>", jsx_region):
             last_close = m
@@ -1911,7 +1808,6 @@ def _ir_root_summary(ir: Dict[str, Any]) -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────
 
 def _dump_json_file(tag: str, node_id: str, payload: Any) -> str:
-    """Skriv JSON till temp och returnera sökvägen. Fail-tolerant."""
     try:
         ts = int(time.time())
         p = Path(tempfile.gettempdir()) / f"{tag}-{node_id}-{ts}.json"
@@ -1923,7 +1819,6 @@ def _dump_json_file(tag: str, node_id: str, payload: Any) -> str:
         return ""
 
 def _dump_text_file(tag: str, node_id: str, text: str) -> str:
-    """Skriv text/TSX till temp och returnera sökvägen. Fail-tolerant."""
     try:
         ts = int(time.time())
         p = Path(tempfile.gettempdir()) / f"{tag}-{node_id}-{ts}.tsx"
@@ -2024,20 +1919,19 @@ def integrate_figma_node(
     *, file_key: str, node_id: str, placement: Dict[str, Any] | None = None
 ) -> Dict[str, Any]:
     t0 = time.time()
+    _safe_print("codegen.start", {"file_key": file_key, "node_id": node_id})
     figma_json = _fetch_figma_node(file_key, node_id)
     t1 = time.time()
 
     ir_full = FIR.figma_to_ir(figma_json, node_id)
     ir = FIR.filter_visible_ir(ir_full) if hasattr(FIR, "filter_visible_ir") else ir_full
 
-    # Endast önskad logg: vad figma_ir.py producerade
     if LOG_FIGMA_IR:
         try:
             _safe_print("figma_ir.output", _ir_root_summary(ir_full))
         except Exception:
             pass
 
-    # IR-dumpar och jämförelse (valfritt via flaggor)
     try:
         if LOG_IR_FULL:
             _dump_json_file("ir-full", node_id, ir_full)
@@ -2058,7 +1952,6 @@ def integrate_figma_node(
 
     t2 = time.time()
 
-    # Samla ikon-noder och filtrera bort orimliga/text-bärande SVG
     raw_icon_nodes = FIR.collect_icon_nodes(ir["root"])
 
     icon_nodes: List[Dict[str, Any]] = []
@@ -2077,8 +1970,8 @@ def integrate_figma_node(
 
     tmp_dir, repo = clone_repo()
     tmp_root = Path(tmp_dir)
+    _safe_print("repo.clone", {"root": tmp_dir})
 
-    # Skriv ut SVG:er till repo och bygg import_path
     for ic in icon_nodes:
         nid = ic["id"]
         svg = svg_by_id.get(nid)
@@ -2109,28 +2002,34 @@ def integrate_figma_node(
             "w": int(round(w)),
             "h": int(round(h)),
         })
+    _safe_print("icons.collected", {"count": len(icon_assets)})
 
     created_svg_types_rel = _ensure_svg_types(tmp_root)
+    if created_svg_types_rel:
+        _safe_print("icons.types.create", {"rel": created_svg_types_rel})
 
     _ensure_node_modules(tmp_root)
 
-    # Tillgängliga komponenter i reposet om det behövs för framtida logik
-    _ = list_components(str(tmp_root))
+    try:
+        comps = list_components(str(tmp_root))
+        _safe_print("repo.components", {"count": len(comps)})
+    except Exception as e:
+        _safe_print("repo.components.error", {"err": str(e)})
 
-    # === Deterministisk generering (ingen LLM) ===
     base_name = _derive_import_name(ir["root"].get("name") or "FigmaNode")
     suffix = hashlib.sha1(node_id.encode("utf-8")).hexdigest()[:6]
-    comp_name = f"{base_name}{suffix}"                                 # unik symbol
-    target_rel = (Path(TARGET_COMPONENT_DIR) / f"{base_name}-{suffix}.tsx").as_posix()  # unik fil
+    comp_name = f"{base_name}{suffix}"
+    target_rel = (Path(TARGET_COMPONENT_DIR) / f"{base_name}-{suffix}.tsx").as_posix()
 
     _gen_filename, file_code = generate_tsx_component(ir, icon_assets, comp_name)
+    _safe_print("codegen.generate", {"component": comp_name, "target_rel": target_rel, "ts_len": len(str(file_code))})
 
-    # Sätt upp mount
     mount = {"anchor": _ANCHOR_SINGLE, "import_name": comp_name}
-    out: Dict[str, Any] = {}
+    scratch: Dict[str, Any] = {}
 
     branch = unique_branch(node_id)
     repo.git.checkout("-b", branch)
+    _safe_print("git.branch", {"name": branch})
 
     name = Path(target_rel).name or f"{mount['import_name']}.tsx"
     target_rel = (Path(TARGET_COMPONENT_DIR) / name).as_posix()
@@ -2138,32 +2037,24 @@ def integrate_figma_node(
     target_path = _safe_join(tmp_root, target_rel)
     target_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Rensa otillåten text
     file_code = _purge_unexpected_text_nodes(str(file_code), _required_texts(ir))
-    # Auto-fixa saknade ikoner
     file_code = _autofix_missing_icons(file_code, icon_assets)
-    # Sanera <img>-positionering innan validering
     file_code = _sanitize_img_positions(file_code)
-    # Kompaktar arbitrary (tar bort blanks i bg-[rgba(...)] etc.)
     file_code = _compact_arbitrary_values(file_code)
 
-    # Debug: snapshot före purge
     if LOG_BG_DEBUG:
         _dbg_bg("before_purge_snapshot", {"len": len(file_code)})
         _dump_text_file("bg-before-purge", node_id, str(file_code))
 
-    # Purge oönskade bg-* innan validering (IR-källsanning)
     file_code = _purge_unexpected_backgrounds(ir, file_code)
 
-    # Debug: snapshot efter purge
     if LOG_BG_DEBUG:
         _dbg_bg("after_purge_snapshot", {"len": len(file_code)})
         _dump_text_file("bg-after-purge", node_id, str(file_code))
 
-    # AUTO-FIX font-family på första wrappern om IR har exakt en fontfamilj
     file_code = _autofix_font_family(ir, file_code)
 
-    # Valideringar (kör på oformatterad sträng)
+    _safe_print("validate.begin", {})
     _assert_icons_used(str(file_code), icon_assets)
     _assert_text_coverage(ir, str(file_code))
     _assert_no_extra_texts(ir, str(file_code))
@@ -2173,21 +2064,20 @@ def integrate_figma_node(
     _assert_only_expected_backgrounds(ir, str(file_code))
     _assert_layout_justify(ir, str(file_code))
     _assert_typography(ir, str(file_code))
+    _safe_print("validate.ok", {})
 
-    # Skriv fil och formatera
     cleaned = _sanitize_tailwind_conflicts(_compact_arbitrary_values(file_code))
     target_path.write_text(cleaned, encoding="utf-8")
     _format_tsx(tmp_root, target_path)
 
     returned_primary_path = target_rel
+    _safe_print("write.component", {"path": returned_primary_path})
 
-    # Relativ import till main.tsx och AST-injektion
     main_candidates = [p for p in ALLOW_PATCH if p.endswith("main.tsx")]
     main_rel = main_candidates[0] if main_candidates else "frontendplay/src/main.tsx"
     main_abs = _safe_join(tmp_root, main_rel)
     mount["import_path"] = _rel_import_from_main(main_abs, target_path)
 
-    # Procentbaserad placering för att matcha preview/dev-url
     px = placement or {}
     stage = px.get("projectBase") if isinstance(px, dict) else None
     ovl = px.get("overlayStage") if isinstance(px, dict) else None
@@ -2213,10 +2103,92 @@ def integrate_figma_node(
     else:
         mount["jsx"] = f"<{mount['import_name']} />"
 
-    _ast_inject_mount(tmp_root, mount)
+    # Säkerställ markörer och städa regionen helt före replace
+    _ensure_anchor_in_main(main_abs)
+    _clear_mount_region(main_abs)
+    _snapshot_main(main_abs, "before_inject")
 
-    # NYTT: Ghost-preflight innan typecheck/commit
+    # NY: Före injektion – extra logg mot importPath OCH ident
+    try:
+        src_before = main_abs.read_text(encoding="utf-8")
+    except Exception:
+        src_before = ""
+    scripts_ts_meta = (tmp_root / "scripts" / "ai_inject_mount.ts").resolve()
+    try:
+        scripts_sha_meta = hashlib.sha1(scripts_ts_meta.read_bytes()).hexdigest() if scripts_ts_meta.exists() else None
+    except Exception:
+        scripts_sha_meta = None
+    _safe_print("ai.inject.meta", {
+        "mode_arg": "replace",
+        "env_APPEND": os.environ.get("AI_INJECT_APPEND"),
+        "env_DEBUG": os.environ.get("AI_INJECT_DEBUG"),
+        "scripts_ts": str(scripts_ts_meta),
+        "scripts_sha1": scripts_sha_meta,
+        "mount_inner_len_before": _mount_inner_len(src_before),
+        "tiles_before": len(re.findall(r'\{/\*\s*AI-TILE:', src_before)),
+        "tile_exists_before": _tile_exists_spec_or_ident(src_before, mount["import_path"], mount["import_name"]),
+    })
+    _dump_text_file("main-before-inject", node_id, src_before)
+
+    # Absolut TS-injektor, replace-läge, ingen fallback
+    scripts_ts = (tmp_root / "scripts" / "ai_inject_mount.ts").resolve()
+    if not scripts_ts.exists():
+        raise HTTPException(500, f"TS-injektor saknas: {scripts_ts}")
+
+    node_cwd = _find_project_base(tmp_root, hint=main_abs.parent)  # typ .../frontendplay
+    os.environ["AI_INJECT_DEBUG"] = "1"
+    os.environ["AI_INJECT_APPEND"] = "0"
+
+    jsx_tmp = Path(tempfile.gettempdir()) / f"ai-mount-{hashlib.sha1((mount['import_name']+mount['import_path']).encode()).hexdigest()[:8]}.jsx"
+    jsx_tmp.write_text(mount["jsx"] + "\n", encoding="utf-8")
+
+    _safe_print("ai.inject.env", {
+        "AI_INJECT_DEBUG": os.environ.get("AI_INJECT_DEBUG"),
+        "AI_INJECT_APPEND": os.environ.get("AI_INJECT_APPEND"),
+        "mode_expected": "replace",
+        "node_cwd": str(node_cwd),
+        "main_tsx": str(main_abs),
+        "import_name": mount.get("import_name"),
+        "import_path": mount.get("import_path"),
+        "jsx_file": str(jsx_tmp),
+        "scripts_ts": str(scripts_ts),
+    })
+
+    cmd = [
+        "node", "--import", "tsx",
+        str(scripts_ts),
+        str(main_abs),
+        str(mount["import_name"]),
+        str(mount["import_path"]),
+        str(jsx_tmp),
+        "replace",
+    ]
+    rc, out_text, err = _run(cmd, cwd=node_cwd)
+    _safe_print("ai.inject.cmd", {"rc": rc, "out": out_text[:2000], "err": err[:2000]})
+    if rc != 0:
+        raise HTTPException(500, f"TS-injektorn misslyckades (rc={rc}): {err or out_text}")
+
+    # NY: Efter injektion – extra logg mot importPath OCH ident
+    try:
+        src_after = main_abs.read_text(encoding="utf-8")
+    except Exception:
+        src_after = ""
+    _safe_print("ai.inject.result", {
+        "mount_inner_len_after": _mount_inner_len(src_after),
+        "tiles_total_after": len(re.findall(r'\{/\*\s*AI-TILE:', src_after)),
+        "tile_exists_after": _tile_exists_spec_or_ident(src_after, mount["import_path"], mount["import_name"]),
+    })
+    _dump_text_file("main-after-inject", node_id, src_after)
+
+    # Aggressiv städning: ta bort ALLA andra ai-importer än vår
+    _prune_other_ai_imports(main_abs, mount["import_path"])
+
+    _snapshot_main(main_abs, "after_inject")
+
+    # Ghost-preflight efter injektion
+    _snapshot_main(main_abs, "before_prune")
     _prune_ghosts_in_main(tmp_root, main_rel)
+    _snapshot_main(main_abs, "after_prune")
 
     _typecheck_and_lint(tmp_root, [returned_primary_path])
 
@@ -2224,12 +2196,13 @@ def integrate_figma_node(
         _ = _visual_validate(tmp_root)
     except HTTPException:
         raise
-    except Exception:
-        pass
+    except Exception as e:
+        _safe_print("visual.validate.warn", {"err": str(e)})
 
     repo.git.add("--all")
     commit_msg = f"feat(ai): add {returned_primary_path}"
     repo.index.commit(commit_msg)
+    _safe_print("git.commit", {"msg": commit_msg})
 
     changed_paths: List[str] = []
     changed_paths.append(returned_primary_path)
@@ -2263,12 +2236,22 @@ def integrate_figma_node(
 
     primary = next((c for c in final_changes if c["path"] == returned_primary_path), final_changes[0])
 
+    t4 = time.time()
+    if CODEGEN_TIMING:
+        _safe_print("timing", {
+            "figma_fetch_s": round(t1 - t0, 3),
+            "ir_build_s": round(t2 - t1, 3),
+            "svg_fetch_s": round(t3 - t2, 3),
+            "total_s": round(t4 - t0, 3),
+        })
+
     result: Dict[str, Any] = {
         "status": "SUCCESS",
         "changes": final_changes,
         "path": primary["path"],
         "content": primary["content"],
     }
+    _safe_print("codegen.done", {"status": "SUCCESS", "changed": [c["path"] for c in final_changes]})
     return result
 
 

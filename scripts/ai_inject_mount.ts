@@ -1,21 +1,19 @@
 // scripts/ai_inject_mount.ts
 /**
- * Instrumented injector for mounting JSX at the AI-INJECT-MOUNT anchor in a TSX entry file.
+ * Robust injector for mounting JSX at the AI-INJECT-MOUNT anchor in a TSX entry file.
  *
  * Usage (from repo root):
  *   AI_INJECT_DEBUG=1 node --import tsx scripts/ai_inject_mount.ts <main.tsx> <importName> <importPath> <jsxFilePath> [replace]
  *   # fallback:
  *   AI_INJECT_DEBUG=1 node --loader tsx scripts/ai_inject_mount.ts <main.tsx> <importName> <importPath> <jsxFilePath> [replace]
  *
- * What’s new here:
- * - Verbose DEBUG logs that print EXACT reasons why imports stay or get pruned.
- * - Prunes dead relative imports (file missing). Robust for CRLF and side-effect imports.
- * - Keeps side-effect asset imports (e.g. "./index.css", images, fonts).
- * - Prunes unused AI component imports (under components/ai) even if file exists.
- * - In replace-mode, prunes all other AI imports except the current one.
- * - Marks legacy contents as a tile (__LEGACY__) on first grid wrap.
- * - Drops tiles whose component import no longer exists.
- * - Idempotent append: removes duplicate tiles with the same key before appending.
+ * Design goals:
+ * - Exactly one render per component tile.
+ * - Deterministic placement inside a single grid within the AI-INJECT-MOUNT region.
+ * - Idempotent: re-running with same args does not duplicate tiles or imports.
+ * - Backward compatible: dedupes old keys (e.g. AI-TILE:<Ident>) and stray tiles outside anchor.
+ * - Safe pruning of dead relative imports and unused AI imports. Keeps asset side-effects (e.g. "./index.css").
+ * - "replace" mode is authoritative regardless of env. "append" mode otherwise.
  */
 
 import fs from 'node:fs';
@@ -116,26 +114,22 @@ function resolveModuleFile(fromFile: string, importPath: string): string | null 
 function detectExportStyle(moduleFile: string, importName: string): ImportStyle | 'unknown' {
   if (!moduleFile || !fileExists(moduleFile)) return 'unknown';
   const code = readFileUtf8(moduleFile);
-
   if (/\bexport\s+default\b/.test(code)) return 'default';
-
   const namedPatterns = [
     new RegExp(String.raw`\bexport\s+(const|let|var|function|class)\s+${importName}\b`),
     new RegExp(String.raw`\bexport\s*\{[^}]*\b${importName}\b[^}]*\}`),
     new RegExp(String.raw`\bexport\s+type\s+${importName}\b`),
   ];
   if (namedPatterns.some((re) => re.test(code))) return 'named';
-
   return 'unknown';
 }
 
 function hasImportForLocal(code: string, localName: string, importPath: string): boolean {
   const spec = normalizeSpecifier(importPath);
-  const reFrom = new RegExp(String.raw`import\s+([^;]*?)\s+from\s+["\']${escapeRegex(spec)}["\']`, 'g');
-
+  const reFrom = new RegExp(String.raw`(^|\n)\s*import\s+([^;]*?)\s+from\s+["\']${escapeRegex(spec)}["\']`, 'g');
   let m: RegExpExecArray | null;
   while ((m = reFrom.exec(code))) {
-    const clause = m[1] || '';
+    const clause = m[2] || '';
     if (new RegExp(String.raw`(^|[,\s])${localName}(\s|,|$)`).test(clause)) return true;
     if (new RegExp(String.raw`\bas\s+${localName}(\s|,|$)`).test(clause)) return true;
   }
@@ -159,7 +153,7 @@ function hasIdentFromOtherSpec(code: string, ident: string, goodSpec: string): b
 
 function listImportedIdents(code: string): Set<string> {
   const ids = new Set<string>();
-  const re = /(^|\n)import\s+([^;]*?)\s+from\s+['"][^'"]+['"];?/g;
+  const re = /(^|\n)\s*import\s+([^;]*?)\s+from\s+['"][^'"]+['"];?/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(code))) {
     const clause = m[2] || '';
@@ -301,7 +295,7 @@ function findAnchor(code: string): Anchor | null {
         endStart: me.index,
         endEnd: me.index + me[0].length,
         indent,
-      };
+      } as AnchorPaired;
     }
   }
   const patterns = [
@@ -373,6 +367,7 @@ function findGridInsertionIndex(code: string, anchor: AnchorPaired): number {
   const m = openRe.exec(inner);
   if (!m) fail('Grid open tag not found inside anchor region.');
 
+  // place just before the matching closing </div>
   let i = m.index + m[0].length;
   let depth = 1;
 
@@ -388,7 +383,7 @@ function findGridInsertionIndex(code: string, anchor: AnchorPaired): number {
     } else {
       depth--;
       if (depth === 0) {
-        return anchor.beginEnd + nextClose;
+        return anchor.beginEnd + nextClose; // absolute index in full code
       }
       i = nextClose + 6;
     }
@@ -396,48 +391,93 @@ function findGridInsertionIndex(code: string, anchor: AnchorPaired): number {
   fail('Unbalanced <div> tags in grid region.');
 }
 
-function tileKeyFor(importPath: string, effectiveName: string): string {
+function tileKeyCanonical(importPath: string): string {
   const spec = normalizeSpecifier(importPath);
-  const base = spec || effectiveName;
-  return `AI-TILE:${base}`;
+  return `AI-TILE:${spec}`;
+}
+function tileKeyLegacy(effectiveName: string): string {
+  return `AI-TILE:${effectiveName}`;
+}
+function tileKeysFor(importPath: string, effectiveName: string): string[] {
+  // canonical first, then legacy
+  return [tileKeyCanonical(importPath), tileKeyLegacy(effectiveName)];
+}
+
+/** Log current tiles in mount region. */
+function logTileInventory(tag: string, code: string) {
+  const region = /\{\/\*\s*AI-INJECT-MOUNT:BEGIN\s*\*\/\}([\s\S]*?)\{\/\*\s*AI-INJECT-MOUNT:END\s*\*\/\}/.exec(code)?.[1] || '';
+  const marked = Array.from(region.matchAll(/\{\s*\/\*\s*(AI-TILE:[^*]+):BEGIN\s*\*\/\}/g)).map(m => m[1]);
+  const legacy = Array.from(region.matchAll(/<div className="relative [^>]+>[\s\S]*?<([A-Z]\w*)\b[\s\S]*?<\/div>/g)).map(m => m[1]);
+  console.log('[ai_inject_mount] tiles', { tag, marked, legacy });
+}
+
+/** Remove ALL marked tiles with any of the given keys inside the paired region. */
+function removeAllMarkedTiles(code: string, anchor: AnchorPaired, keys: string[]): string {
+  const inner = code.slice(anchor.beginEnd, anchor.endStart);
+  let cleanedInner = inner;
+  for (const key of keys) {
+    const allRe = new RegExp(
+      String.raw`\{\s*/\*\s*${escapeRegex(key)}\s*:\s*BEGIN\s*\*/\}[\s\S]*?\{\s*/\*\s*${escapeRegex(key)}\s*:\s*END\s*\*/\}`,
+      'gm',
+    );
+    const matches = inner.match(allRe)?.length || 0;
+    if (matches) console.log('[ai_inject_mount] DEDUPE removed tiles', { key, count: matches });
+    cleanedInner = cleanedInner.replace(allRe, '');
+  }
+  return code.slice(0, anchor.beginEnd) + cleanedInner + code.slice(anchor.endStart);
+}
+
+/** Remove any marked tiles with keys from `keys` that live OUTSIDE the paired region. */
+function purgeStrayMarkedTilesOutsideAnchor(code: string, anchor: AnchorPaired, keys: string[]): string {
+  let out = code;
+  for (const key of keys) {
+    const blockRe = new RegExp(
+      String.raw`\{\s*/\*\s*${escapeRegex(key)}\s*:\s*BEGIN\s*\*/\}[\s\S]*?\{\s*/\*\s*${escapeRegex(key)}\s*:\s*END\s*\*/\}`,
+      'gm',
+    );
+    out = out.replace(blockRe, (full, ...rest) => {
+      const idx = (rest.at(-1) as any)?.index ?? out.indexOf(full); // TSX runtime quirk; fallback
+      const absIndex = typeof idx === 'number' ? idx : out.indexOf(full);
+      if (absIndex < (anchor as AnchorPaired).beginEnd || absIndex > (anchor as AnchorPaired).endStart) {
+        console.log('[ai_inject_mount] PURGE stray marked tile outside anchor', { key });
+        return '';
+      }
+      return full;
+    });
+  }
+  return out;
 }
 
 /** Tolerant replace: match comments with flexible spacing, keep markers normalized. */
 function replaceMarkedTile(
   code: string,
   anchor: AnchorPaired,
-  key: string,
+  keys: string[], // try canonical then legacy
   newTileContent: string,
 ): { code: string; replaced: boolean } {
   const inner = code.slice(anchor.beginEnd, anchor.endStart);
-  const openRe = new RegExp(String.raw`\{\s*/\*\s*${escapeRegex(key)}\s*:\s*BEGIN\s*\*/\}`, 'm');
-  const closeRe = new RegExp(String.raw`\{\s*/\*\s*${escapeRegex(key)}\s*:\s*END\s*\*/\}`, 'm');
-  const mOpen = openRe.exec(inner);
-  if (!mOpen) return { code, replaced: false };
-  closeRe.lastIndex = mOpen.index;
-  const mClose = closeRe.exec(inner);
-  if (!mClose) return { code, replaced: false };
 
-  const absOpen = anchor.beginEnd + mOpen.index;
-  const absCloseEnd = anchor.beginEnd + mClose.index + mClose[0].length;
-  const openStr = `{/* ${key}:BEGIN */}`;
-  const closeStr = `{/* ${key}:END */}`;
+  for (const key of keys) {
+    const openRe = new RegExp(String.raw`\{\s*/\*\s*${escapeRegex(key)}\s*:\s*BEGIN\s*\*/\}`, 'm');
+    const closeRe = new RegExp(String.raw`\{\s*/\*\s*${escapeRegex(key)}\s*:\s*END\s*\*/\}`, 'm');
+    const mOpen = openRe.exec(inner);
+    if (!mOpen) continue;
+    closeRe.lastIndex = mOpen.index;
+    const mClose = closeRe.exec(inner);
+    if (!mClose) continue;
 
-  const updated =
-    code.slice(0, absOpen) + openStr + newTileContent + closeStr + code.slice(absCloseEnd);
+    const absOpen = anchor.beginEnd + mOpen.index;
+    const absCloseEnd = anchor.beginEnd + mClose.index + mClose[0].length;
+    const openStr = `{/* ${keys[0]}:BEGIN */}`; // normalize to canonical key
+    const closeStr = `{/* ${keys[0]}:END */}`;
 
-  return { code: updated, replaced: true };
-}
+    const updated =
+      code.slice(0, absOpen) + openStr + newTileContent + closeStr + code.slice(absCloseEnd);
 
-/** Dedupe: remove all tiles with the same key inside the paired region. */
-function removeAllMarkedTiles(code: string, anchor: AnchorPaired, key: string): string {
-  const inner = code.slice(anchor.beginEnd, anchor.endStart);
-  const allRe = new RegExp(
-    String.raw`\{\s*/\*\s*${escapeRegex(key)}\s*:\s*BEGIN\s*\*/\}[\s\S]*?\{\s*/\*\s*${escapeRegex(key)}\s*:\s*END\s*\*/\}`,
-    'gm',
-  );
-  const cleanedInner = inner.replace(allRe, '');
-  return code.slice(0, anchor.beginEnd) + cleanedInner + code.slice(anchor.endStart);
+    console.log('[ai_inject_mount] replace existing tile', { fromKey: key, toKey: keys[0] });
+    return { code: updated, replaced: true };
+  }
+  return { code, replaced: false };
 }
 
 function parseImportLocals(clause: string): string[] {
@@ -515,13 +555,15 @@ function pruneDeadRelativeImports(code: string, mainFile: string): string {
 
     if (isRelative) {
       if (isAsset) {
-        dbg('KEEP: side-effect asset import', spec);
+        console.log('[ai_inject_mount] KEEP side-effect asset import', { spec });
         drop = false;
       } else {
         const resolved = resolveModuleFile(mainFile, spec);
         if (!resolved) {
           drop = true;
-          dbg('PRUNE: dead relative import (file missing)', spec);
+          console.log('[ai_inject_mount] PRUNE dead relative import (file missing)', { spec });
+        } else {
+          console.log('[ai_inject_mount] KEEP relative import (file exists)', { spec, resolved });
         }
       }
     }
@@ -556,9 +598,9 @@ function pruneUnusedAiComponentImports(code: string): string {
       const used = locals.some((id) => new RegExp(String.raw`<\s*${id}\b|<\/\s*${id}\b`).test(code));
       if (!used) {
         drop = true;
-        dbg('PRUNE: unused AI component import', { spec, locals });
+        console.log('[ai_inject_mount] PRUNE unused AI import', { spec, locals });
       } else {
-        dbg('KEEP: AI import is used in JSX', { spec, locals });
+        console.log('[ai_inject_mount] KEEP AI import used in JSX', { spec, locals });
       }
     }
 
@@ -589,7 +631,7 @@ function pruneAiImportsExcept(code: string, keepSpec: string): string {
 
     out += code.slice(last, start);
     if (!drop) out += code.slice(start, end);
-    else dbg('PRUNE: AI import (except keep)', { spec, keep });
+    else console.log('[ai_inject_mount] PRUNE AI import due to replace-mode', { spec, keep });
     last = end;
   }
   out += code.slice(last);
@@ -618,9 +660,10 @@ function dropTilesWhoseImportMissing(code: string): string {
   regionOut = regionOut.replace(tileRe, (full, _key: string, body: string) => {
     const ident = /<\s*([A-Z]\w*)\b/.exec(body)?.[1];
     if (ident && !hasImport(ident)) {
-      dbg('DROP TILE: missing import for ident', ident);
+      console.log('[ai_inject_mount] DROP TILE: missing import for ident', { ident });
       return '';
     }
+    console.log('[ai_inject_mount] KEEP TILE: import present for ident', { ident });
     return full;
   });
 
@@ -628,9 +671,10 @@ function dropTilesWhoseImportMissing(code: string): string {
   const legacyRe = /(<div className="relative [^>]+>[\s\S]*?<([A-Z]\w*)\b[\s\S]*?<\/div>)/g;
   regionOut = regionOut.replace(legacyRe, (full, _tile: string, ident: string) => {
     if (ident && !hasImport(ident)) {
-      dbg('DROP LEGACY TILE: missing import for ident', ident);
+      console.log('[ai_inject_mount] DROP LEGACY TILE: missing import for ident', { ident });
       return '';
     }
+    console.log('[ai_inject_mount] KEEP LEGACY TILE: import present for ident', { ident });
     return full;
   });
 
@@ -641,8 +685,10 @@ function main(): void {
   const [, , mainFileArg, importNameArg, importPathArg, jsxFileArg] = process.argv;
   const modeArg = (process.argv[6] || '').toLowerCase();
 
-  const REPLACE_REQUESTED = modeArg === 'replace' && process.env.AI_INJECT_APPEND !== '1';
+  // "replace" mode is authoritative even if AI_INJECT_APPEND=1
+  const REPLACE_REQUESTED = modeArg === 'replace';
   const APPEND = !REPLACE_REQUESTED;
+  const mode = REPLACE_REQUESTED ? 'replace' : 'append';
 
   if (!mainFileArg || !importNameArg || !importPathArg || !jsxFileArg) {
     fail(
@@ -665,6 +711,9 @@ function main(): void {
     AI_INJECT_APPEND: process.env.AI_INJECT_APPEND ?? undefined,
     DEBUG,
   });
+  if (modeArg === 'replace' && process.env.AI_INJECT_APPEND === '1') {
+    console.warn('[ai_inject_mount] NOTE: replace requested; ignoring AI_INJECT_APPEND=1 (authoritative replace)');
+  }
 
   if (!fileExists(mainFile)) fail(`main file does not exist: ${mainFile}`);
   if (!fileExists(jsxFile)) fail(`jsx temp file does not exist: ${jsxFile}`);
@@ -672,7 +721,24 @@ function main(): void {
 
   // Load and pre-prune
   let originalCode = readFileUtf8(mainFile);
+  // direkt efter argv + originalCode
+  {
+    const src0 = readFileUtf8(mainFile);
+    console.error(JSON.stringify({
+      tag: "inject.start",
+      mode,
+      mainFile,
+      importName,
+      importPath,
+      hasBegin: /\{\s*\/\*\s*AI-INJECT-MOUNT:BEGIN\s*\*\/\s*\}/.test(src0),
+      hasEnd:   /\{\s*\/\*\s*AI-INJECT-MOUNT:END\s*\*\/\s*\}/.test(src0),
+      tilesBefore: (src0.match(/\{\/\*\s*AI-TILE:/g) || []).length,
+      APPEND,
+      REPLACE_REQUESTED,
+    }));
+  }
   snapshotImports('BEFORE', originalCode, mainFile);
+  logTileInventory('BEFORE', originalCode);
 
   // always: prune dead relative modules and unused AI imports, and drop orphan tiles
   originalCode = pruneDeadRelativeImports(originalCode, mainFile);
@@ -680,12 +746,13 @@ function main(): void {
   originalCode = pruneUnusedAiComponentImports(originalCode);
 
   snapshotImports('AFTER_PRE_PRUNE', originalCode, mainFile);
+  logTileInventory('AFTER_PRE_PRUNE', originalCode);
 
   let jsx = readFileUtf8(jsxFile).trim();
   if (!jsx) fail('jsx is empty');
 
   const resolvedModule = resolveModuleFile(mainFile, importPath);
-  dbg('resolvedModule', resolvedModule);
+  console.log('[ai_inject_mount] resolved module', { resolvedModule });
 
   if (resolvedModule && path.resolve(resolvedModule) === path.resolve(mainFile)) {
     fail('Refusing to import component from main.tsx');
@@ -723,6 +790,8 @@ function main(): void {
   if (!anchor) fail('Could not find AI-INJECT-MOUNT anchor or BEGIN/END markers in main file.');
 
   const jsxIndented = indentMultilineJsx(jsx, (anchor as any).indent);
+  const keys = tileKeysFor(importPath, effectiveName);
+  const tileContent = makeTile(jsxIndented, (anchor as any).indent);
 
   if (anchor.kind === 'paired') {
     if (!hasGrid(nextCode, (anchor as AnchorPaired).beginEnd, (anchor as AnchorPaired).endStart)) {
@@ -732,58 +801,85 @@ function main(): void {
       anchor = res.anchor;
     }
 
-    const key = tileKeyFor(importPath, effectiveName);
-    const tileContent = makeTile(jsxIndented, (anchor as AnchorPaired).indent);
     if (APPEND) {
-      // Idempotent append: dedupe by key, then insert once
-      nextCode = removeAllMarkedTiles(nextCode, anchor as AnchorPaired, key);
-      const replaced = replaceMarkedTile(nextCode, anchor as AnchorPaired, key, tileContent);
-      console.log('[ai_inject_mount] tile action', replaced.replaced ? 'update-existing' : 'append-new', { key });
+      // Idempotent append: dedupe both canonical and legacy keys, then replace-or-append once.
+      nextCode = removeAllMarkedTiles(nextCode, anchor as AnchorPaired, keys);
+      const replaced = replaceMarkedTile(nextCode, anchor as AnchorPaired, keys, tileContent);
+      console.log('[ai_inject_mount] tile action', replaced.replaced ? 'update-existing' : 'append-new', { keys });
       if (replaced.replaced) {
         nextCode = replaced.code;
       } else {
         const insertAt = findGridInsertionIndex(nextCode, anchor as AnchorPaired);
         nextCode =
           nextCode.slice(0, insertAt) +
-          `\n${(anchor as AnchorPaired).indent}<> {/* ${key}:BEGIN */}${tileContent} {/* ${key}:END */}</>` +
+          `\n${(anchor as AnchorPaired).indent}<> {/* ${keys[0]}:BEGIN */}${tileContent} {/* ${keys[0]}:END */}</>` +
           nextCode.slice(insertAt);
       }
     } else {
-      console.log('[ai_inject_mount] replace mode single tile', { key });
+      console.log('[ai_inject_mount] replace mode single tile', { key: keys[0] });
       const open = `\n${(anchor as AnchorPaired).indent}<div id="__AI_MOUNT_GRID__" className="flex flex-wrap gap-4 items-start">`;
       const close = `\n${(anchor as AnchorPaired).indent}</div>\n${(anchor as AnchorPaired).indent}`;
-      const single = open + tileContent + close;
+      const single = open + `\n${(anchor as AnchorPaired).indent}<> {/* ${keys[0]}:BEGIN */}${tileContent} {/* ${keys[0]}:END */}</>` + close;
       nextCode = nextCode.slice(0, (anchor as AnchorPaired).beginEnd) + single + nextCode.slice((anchor as AnchorPaired).endStart);
+      // In replace-mode keep only the chosen AI import
+      nextCode = pruneAiImportsExcept(nextCode, importPath);
     }
   } else {
     const before = nextCode.slice(0, (anchor as AnchorSingle).start);
     const after = nextCode.slice((anchor as AnchorSingle).end);
-    const key = tileKeyFor(importPath, effectiveName);
-    console.log('[ai_inject_mount] upgrade single anchor → paired grid', { key });
-    const tileContent = makeTile(jsxIndented, (anchor as AnchorSingle).indent);
+    console.log('[ai_inject_mount] upgrade single anchor → paired grid', { keys });
     const block =
       `{/* AI-INJECT-MOUNT:BEGIN */}\n${(anchor as AnchorSingle).indent}<div id="__AI_MOUNT_GRID__" className="flex flex-wrap gap-4 items-start">` +
-      `\n${(anchor as AnchorSingle).indent}<> {/* ${key}:BEGIN */}${tileContent} {/* ${key}:END */}</>` +
+      `\n${(anchor as AnchorSingle).indent}<> {/* ${keys[0]}:BEGIN */}${tileContent} {/* ${keys[0]}:END */}</>` +
       `\n${(anchor as AnchorSingle).indent}</div>\n${(anchor as AnchorSingle).indent}{/* AI-INJECT-MOUNT:END */}`;
     nextCode = before + block + after;
+    if (!APPEND) nextCode = pruneAiImportsExcept(nextCode, importPath);
   }
 
-  // Final pruning
+  // Safety: purge stray marked tiles that might sit outside the anchor due to legacy state
+  const paired = findAnchor(nextCode);
+  if (paired && paired.kind === 'paired') {
+    nextCode = purgeStrayMarkedTilesOutsideAnchor(nextCode, paired as AnchorPaired, keys);
+  }
+
+  logTileInventory('BEFORE_FINAL_PRUNE', nextCode);
+
+  // Final pruning and cleanup
   nextCode = pruneDeadRelativeImports(nextCode, mainFile);
   nextCode = dropTilesWhoseImportMissing(nextCode);
   nextCode = pruneUnusedAiComponentImports(nextCode);
-  if (REPLACE_REQUESTED) {
-    nextCode = pruneAiImportsExcept(nextCode, importPath);
-  }
 
   snapshotImports('AFTER_FINAL', nextCode, mainFile);
+  logTileInventory('AFTER_FINAL', nextCode);
 
-  if (nextCode === originalCode) {
+  // precis innan writeFileUtf8(mainFile, nextCode)
+  {
+    const innerMatch = nextCode.match(/\{\/\*\s*AI-INJECT-MOUNT:BEGIN\s*\*\/\}([\s\S]*?)\{\/\*\s*AI-INJECT-MOUNT:END\s*\*\/\}/);
+    console.error(JSON.stringify({
+      tag: "inject.apply",
+      mode,
+      mountInnerLenBefore: innerMatch ? innerMatch[1].length : -1,
+    }));
+  }
+
+  if (nextCode === readFileUtf8(mainFile)) {
     console.log('[ai_inject_mount] No changes needed.');
     process.exit(0);
   }
 
   writeFileUtf8(mainFile, nextCode);
+
+  // direkt efter skrivning
+  {
+    const out = readFileUtf8(mainFile);
+    console.error(JSON.stringify({
+      tag: "inject.done",
+      mode,
+      tilesAfter: (out.match(/\{\/\*\s*AI-TILE:/g) || []).length,
+      mountInnerLenAfter: ((out.match(/\{\/\*\s*AI-INJECT-MOUNT:BEGIN\s*\*\/\}([\s\S]*?)\{\/\*\s*AI-INJECT-MOUNT:END\s*\*\/\}/) || [,""])[1] as string).length,
+    }));
+  }
+
   console.log('[ai_inject_mount] Injection complete.');
 }
 
