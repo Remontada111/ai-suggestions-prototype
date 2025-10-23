@@ -18,39 +18,25 @@ services:
   # ─────────────── Bas-bild (Python + deps) byggs en gång ─────────────────── #
   backend:
     build:
-      context: ./backend           # Dockerfile ligger i ./backend
+      context: ./backend
       dockerfile: Dockerfile
     image: ai-backend:latest
     command: sleep infinity
     env_file:
-      - ./backend/.env             # gemensamma secrets/nycklar
+      - ./backend/.env
     volumes:
-      - ./backend:/app/backend     # hot-reload kod under utveckling
+      - ./backend:/app/backend
     restart: unless-stopped
     depends_on:
       - redis
 
   # ────────────────────────── FastAPI gateway ─────────────────────────────── #
   api:
-    image: ai-backend:latest       # samma lager som "backend"
+    image: ai-backend:latest
     command: >
       uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
       - "8000:8000"
-    env_file:
-      - ./backend/.env
-    volumes:
-      - ./backend:/app/backend     # live-kod i containern
-    restart: unless-stopped
-    depends_on:
-      - redis
-      - backend                    # säkerställ att bas-imagen finns
-
-  # ───────────────────────── Celery-worker ────────────────────────────────── #
-  worker:
-    image: ai-backend:latest
-    command: >
-      python -m celery -A backend.tasks.codegen:celery_app worker -l info -I backend.tasks.analyze
     env_file:
       - ./backend/.env
     volumes:
@@ -60,22 +46,40 @@ services:
       - redis
       - backend
 
+  # ───────────────────────── Celery-worker ────────────────────────────────── #
+  worker:
+    image: ai-backend:latest
+    command: >
+      python -m celery -A backend.tasks.codegen:celery_app worker -l info -I backend.tasks.analyze
+    env_file:
+      - ./backend/.env
+    environment:
+      TARGET_COMPONENT_DIR: /workspace/frontendplay/src/components/ai
+      ALLOW_PATCH: /workspace/frontendplay/src/main.tsx
+      AI_INJECT_APPEND: "1"
+      AI_MOUNT_MODE: "append"
+    volumes:
+      - ./backend:/app/backend              # Python-koden
+      - ./:/workspace                       # Persistenta frontendfiler och scripts
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - backend
+
   # ───────────── VS Code Dev Container (Node + TS + PNPM/NPM) ─────────────── #
   devcontainer:
     image: mcr.microsoft.com/devcontainers/typescript-node:20
-    command: sleep infinity         # håll processen vid liv för VS Code
+    command: sleep infinity
     volumes:
-      # 1️⃣  Extension-koden mountas så allt du sparar på värden syns direkt
       - ./:/workspaces/ai-codegen-extension:cached
-      # 2️⃣  Node-moduler cachas per-container
       - node_modules:/workspaces/ai-codegen-extension/node_modules
     working_dir: /workspaces/ai-codegen-extension
     ports:
-      - "3000:3000"                 # exempelport, ta bort om onödig
+      - "3000:3000"
     environment:
       - TZ=Europe/Stockholm
     depends_on:
-      - api                         # om din React-dev-server behöver API:t
+      - api
 
 # ───────────────────────────── Volymer ───────────────────────────────────── #
 volumes:

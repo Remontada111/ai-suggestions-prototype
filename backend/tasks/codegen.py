@@ -9,7 +9,7 @@ Uppdateringar:
 - Spärr för palettklasser: alla bg- som inte är bg-[…] blockeras.
 - Pre-purge: oönskade bg-* som inte finns i IR strippas innan validering.
 - Gradients valideras enbart mot IR (n.bg.css), inte mot Figma-fills.
-- Stabil multi-node: komponentnamn och filväg är unika per node-id; main.tsx injicerar i replace-läge.
+- Stabil multi-node: komponentnamn och filväg är unika per node-id; main.tsx injicerar i valt läge (append default).
 
 Övrigt:
 - Endast synlig text (visible_effective=True) byggs till textkrav.
@@ -25,7 +25,7 @@ Uppdateringar:
 - Dims/pos-validering hoppar över ikon-subträd (leafs i exporterad ikon kontrolleras inte separat).
 - Färgvalidering hoppar över ikon-subträd och är case-/format-tålig (hex och rgba).
 - Prettier kör endast lokal bin om den finns, annars lätt fallback-formattering (ingen npx).
-- AST-injektion kör via scripts/ai_inject_mount.ts med ABSOLUT väg i REPLACE-läge. Ingen fallback.
+- AST-injektion kör via scripts/ai_inject_mount.ts med ABSOLUT väg. Läge styrs via AI_MOUNT_MODE.
 - Figma SVG-hämtning parallelliseras med kortare timeouts.
 - GPT-5: hoppa direkt till strikt=False schema, därefter json_object.
 - Systemprompten ber modellen att lämna mount.import_path tomt.
@@ -2116,7 +2116,7 @@ def integrate_figma_node(
         _clear_mount_region(main_abs)
     _snapshot_main(main_abs, "before_inject")
 
-    # NY: Före injektion – extra logg mot importPath OCH ident
+    # Före injektion – extra logg
     try:
         src_before = main_abs.read_text(encoding="utf-8")
     except Exception:
@@ -2178,7 +2178,7 @@ def integrate_figma_node(
     if rc != 0:
         raise HTTPException(500, f"TS-injektorn misslyckades (rc={rc}): {err or out_text}")
 
-    # NY: Efter injektion – extra logg mot importPath OCH ident
+    # Efter injektion – extra logg
     try:
         src_after = main_abs.read_text(encoding="utf-8")
     except Exception:
