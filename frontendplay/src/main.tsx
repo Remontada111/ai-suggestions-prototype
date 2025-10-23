@@ -26,8 +26,7 @@ function App() {
           overflow: "hidden",
         }}
       >
-        {/* Lägg din iframe/devUrl-overlay här om du vill */}
-          {/* AI-INJECT-MOUNT:BEGIN */}
+        {/* AI-INJECT-MOUNT:BEGIN */}
         {/* AI-INJECT-MOUNT:END */}</div>
     </div>
   );
