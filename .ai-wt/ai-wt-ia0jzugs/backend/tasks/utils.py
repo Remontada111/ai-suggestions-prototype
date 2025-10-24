@@ -3,7 +3,7 @@
 Gemensamma hjälpfunktioner för Celery-workern:
 
 * Läser miljövariabler och räknar ut Git-URL:er
-* Klonar mål-repositoriet eller skapar isolerad git worktree i LOCAL_MODE
+* Klonar mål-repositoriet till en temporär katalog
 * Skapar unika branch-namn
 * Öppnar Pull Requests via GitHub REST-API
 * Skannar projektet efter befintliga React-komponenter (default-exports)
@@ -12,7 +12,6 @@ Gemensamma hjälpfunktioner för Celery-workern:
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import tempfile
 from datetime import datetime
@@ -30,100 +29,30 @@ GH_TOKEN: str | None = os.getenv("GH_TOKEN")
 TARGET_REPO: str | None = os.getenv("TARGET_REPO")  # "user/repo"
 BASE_BRANCH: str = os.getenv("BASE_BRANCH", "main")
 
-# LOCAL_MODE: använd en isolerad git worktree under WORKSPACE_DIR i stället för temp-klon.
-LOCAL_MODE: bool = os.getenv("LOCAL_MODE", "1").lower() in ("1", "true", "yes")
-WORKSPACE_DIR: Path = Path(os.getenv("WORKSPACE_DIR", "/workspace")).resolve()
-
-# Endast i remote-läge krävs GH_TOKEN/TARGET_REPO
-if not LOCAL_MODE and not (GH_TOKEN and TARGET_REPO):
+if not (GH_TOKEN and TARGET_REPO):
     raise RuntimeError(
         "Både GH_TOKEN och TARGET_REPO måste finnas i .env "
-        "för att kodgenererings-pipen ska fungera i remote-läge."
+        "för att kodgenererings-pipen ska fungera."
     )
 
-REMOTE_URL: str | None = (
-    f"https://{GH_TOKEN}:x-oauth-basic@github.com/{TARGET_REPO}.git"
-    if GH_TOKEN and TARGET_REPO
-    else None
-)
+REMOTE_URL = f"https://{GH_TOKEN}:x-oauth-basic@github.com/{TARGET_REPO}.git"
 
 
 def unique_branch(node_id: str) -> str:
     """
-    Returnerar ett kollisionståligt branch-namn.
-    Exempel: ai/figma-429-783-20250715T101233123456-a1b2c3
-    - Mikrosekund-upplöst timestamp
-    - Slump-salt för samtidiga jobb
-    - Saniterar node_id till [A-Za-z0-9._-]
+    Returnerar ett garanterat unikt branch-namn.
+    Exempel: ai/figma-429-783-20250715T101233
     """
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")  # µs
-    safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", node_id).strip("-")
-    salt = os.urandom(3).hex()  # 6 hextecken
-    return f"ai/figma-{safe_id}-{ts}-{salt}"
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    safe_id = node_id.replace(":", "-")
+    return f"ai/figma-{safe_id}-{ts}"
 
 
 def clone_repo() -> Tuple[str, Repo]:
     """
-    LOCAL_MODE=1:
-      - Skapa en isolerad git worktree under <WORKSPACE_DIR>/.ai-wt/<unik>
-      - Returnera (worktree_dir, Repo(worktree_dir))
-      - Fördel: egen index/HEAD → inga .git/index.lock-krockar mellan jobb
-    LOCAL_MODE=0:
-      - Klona TARGET_REPO till temporär katalog (depth=1), som tidigare
+    Klonar `TARGET_REPO` till en temporär katalog (depth=1).
+    Returnerar (temp_dir_path, Repo-objekt).
     """
-    if LOCAL_MODE:
-        base = WORKSPACE_DIR
-        ws_git = base / ".git"
-        if not ws_git.exists():
-            raise HTTPException(
-                500,
-                f"LOCAL_MODE=1 men .git saknas i {base}. "
-                "Montera rätt workspace i containern eller stäng av LOCAL_MODE.",
-            )
-
-        try:
-            root = Repo(str(base))
-        except Exception as e:
-            raise HTTPException(500, f"Kunde inte öppna git-repo i {base}: {e}") from e
-
-        wt_root = base / ".ai-wt"
-        wt_root.mkdir(parents=True, exist_ok=True)
-        # Unik katalog per jobb
-        wt_dir = Path(tempfile.mkdtemp(prefix="ai-wt-", dir=str(wt_root)))
-
-        # Säkerställ att basbranch finns lokalt, försök fetcha om inte
-        try:
-            root.git.rev_parse("--verify", BASE_BRANCH)
-        except GitCommandError:
-            try:
-                root.remotes.origin.fetch(BASE_BRANCH)
-            except Exception:
-                # tolerera om origin saknas i lokal dev
-                pass
-
-        try:
-            # Egen checkout med detached HEAD på BASE_BRANCH
-            root.git.worktree("add", "--detach", str(wt_dir), BASE_BRANCH)
-        except GitCommandError as e:
-            shutil.rmtree(wt_dir, ignore_errors=True)
-            raise HTTPException(500, f"Git worktree error: {e.stderr or e}") from e
-
-        try:
-            repo = Repo(str(wt_dir))
-        except Exception as e:
-            # Försök städa worktree-registret om Repo() misslyckas
-            try:
-                root.git.worktree("remove", "--force", str(wt_dir))
-            except Exception:
-                pass
-            shutil.rmtree(wt_dir, ignore_errors=True)
-            raise HTTPException(500, f"Kunde inte öppna worktree-repo: {e}") from e
-
-        return str(wt_dir), repo
-
-    # Remote-läge: klona från GitHub
-    if not REMOTE_URL:
-        raise HTTPException(500, "REMOTE_URL saknas; sätt GH_TOKEN och TARGET_REPO eller slå på LOCAL_MODE=1.")
     tmp_dir = tempfile.mkdtemp(prefix="ai-pr-bot-")
     try:
         repo = Repo.clone_from(
@@ -142,15 +71,7 @@ def clone_repo() -> Tuple[str, Repo]:
 def create_pr(repo: Repo, branch: str, title: str, body: str | None = None) -> str:
     """
     Pushar `branch` och öppnar en Pull Request. Returnerar PR-länken.
-    OBS: Kräver GH_TOKEN och TARGET_REPO. I LOCAL_MODE är PR inte aktivt.
     """
-    if not (GH_TOKEN and TARGET_REPO):
-        raise HTTPException(
-            400,
-            "PR är inte aktiverad: GH_TOKEN/TARGET_REPO saknas eller LOCAL_MODE=1. "
-            "Stäng av LOCAL_MODE och sätt env-variabler för att öppna PR.",
-        )
-
     # Push
     try:
         repo.remote("origin").push(refspec=f"{branch}:{branch}")

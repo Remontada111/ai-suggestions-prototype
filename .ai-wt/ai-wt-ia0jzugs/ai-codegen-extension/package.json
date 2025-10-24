@@ -1,0 +1,152 @@
+{
+  "name": "ai-figma-codegen",
+  "displayName": "AI Figma Codegen",
+  "publisher": "crnolic",
+  "version": "0.0.3",
+  "description": "Förhandsvisa och importera Figma-komponenter direkt i VS Code.",
+  "engines": {
+    "vscode": "^1.102.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onUri"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "ai-figma-codegen.openPanel",
+        "title": "AI Figma Codegen: Open Panel"
+      },
+      {
+        "command": "ai-figma-codegen.scanAndPreview",
+        "title": "AI Figma Codegen: Scan & Preview"
+      },
+      {
+        "command": "ai-figma-codegen.chooseProject",
+        "title": "AI Figma Codegen: Choose Project"
+      },
+      {
+        "command": "ai-figma-codegen.exportFrontendDetectorDataset",
+        "title": "AI Figma Codegen: Export Frontend Detector Dataset"
+      },
+      {
+        "command": "ai-figma-codegen.forgetProject",
+        "title": "AI Figma Codegen: Glöm valt projekt"
+      },
+      {
+        "command": "ai-figma-codegen.sendPlacement",
+        "title": "AI Figma Codegen: Send Placement to Backend"
+      }
+    ],
+    "configuration": {
+      "title": "AI Figma Codegen",
+      "properties": {
+        "aiFigmaCodegen.figmaToken": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Din Figma Personal Access Token (Account → Settings → Developer tokens)."
+        },
+        "aiFigmaCodegen.backendBaseUrl": {
+          "type": "string",
+          "default": "http://localhost:8000",
+          "description": "Bas-URL till backend-proxy som returnerar sRGB-PNG."
+        },
+        "aiFigmaCodegen.autoFullView": {
+          "type": "boolean",
+          "default": true,
+          "description": "Öppna förhandsvisningen i 'Full View' (stänger side- och bottenpanel, enkel editorlayout) när flödet startar."
+        },
+        "aiFigmaCodegen.autoWindowFullScreen": {
+          "type": "boolean",
+          "default": false,
+          "description": "Växla VS Codes OS-helskärm (F11) vid start. Av som standard. Aktivera endast om du vill dölja aktivitetsfältet."
+        },
+        "aiFigmaCodegen.autoZenMode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Växla VS Codes Zen Mode automatiskt när flödet startar (toggle) för maximal editor-yta utan OS-helskärm."
+        },
+        "aiFigmaCodegen.autoStartOnImport": {
+          "type": "boolean",
+          "default": true,
+          "description": "Starta automatiskt det senast valda (ihågkomna) projektet vid import av valfri Figma-URI (oavsett fileKey/node)."
+        },
+        "aiFigmaCodegen.autoCloseSidebar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Stäng sidofältet automatiskt vid preview/import."
+        },
+        "aiFigmaCodegen.persistPlacements": {
+          "type": "boolean",
+          "default": true,
+          "description": "Spara senaste placerings-/analysdata i workspaceState."
+        },
+        "aiFigmaCodegen.preferredPreviewPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolut eller workspace-relativ sökväg till mappen som alltid ska användas för preview. Exempel: \"frontendplay\" eller \"apps/frontendplay\"."
+        },
+        "aiFigmaCodegen.preferredPreviewDirName": {
+          "type": "string",
+          "default": "frontendplay",
+          "markdownDescription": "Fallback: välj kandidat vars mappnamn matchar detta om preferredPreviewPath inte är satt."
+        }
+      }
+    }
+  },
+  "files": [
+    "dist/**",
+    "dist-webview/**",
+    "ml_artifacts/**",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -p . -w",
+    "dev:webview": "vite build --watch --config vite.webview.config.ts",
+    "build:webview": "vite build --config vite.webview.config.ts",
+    "dev": "npm-run-all --parallel watch dev:webview",
+    "prepackage": "npm run compile && npm run build:webview",
+    "package": "vsce package --no-dependencies",
+    "tw": "tailwindcss",
+    "tw:dev": "tailwindcss -i ./src/index.css -o ./dist/style.css --watch",
+    "ml:dump-features": "npm run compile && node dist/ml/dump_feature_order.js",
+    "ml:train": "python ml/train_gbdt.py --dataset ml_artifacts/dataset.jsonl --feature-order ml_artifacts/feature_order.json --out ml_artifacts/frontend-detector-gbdt.json --rounds 300 --early 30 --seed 42"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.1.11",
+    "@types/node": "^24.0.14",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@types/vscode": "^1.102.0",
+    "@vitejs/plugin-react": "^4.6.0",
+    "@vscode/vsce": "^3.6.0",
+    "autoprefixer": "^10.4.21",
+    "npm-run-all": "^4.1.5",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.1.11",
+    "typescript": "^5.5.0",
+    "vite": "^5.2.0"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.83.0",
+    "clsx": "^2.1.1",
+    "dotenv": "^17.2.0",
+    "fast-glob": "^3.3.2",
+    "lucide-react": "^0.542.0",
+    "node-fetch": "^3.3.2",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "strip-ansi": "^7.1.0",
+    "styled-components": "^6.1.19",
+    "unidiff": "^1.0.4",
+    "yaml": "^2.8.1",
+    "zustand": "^5.0.6"
+  }
+}

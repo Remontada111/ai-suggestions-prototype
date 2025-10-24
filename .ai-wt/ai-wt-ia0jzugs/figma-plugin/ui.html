@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8" />
+<style>
+  html,body { margin:0; padding:0; width:100%; height:100%; display:flex;
+              align-items:center; justify-content:center; font:13px/1 monospace }
+</style>
+
+<script>
+/**
+ * Tar emot { uri } från plugin-workern och försöker öppna länken.
+ * Fungerar i både Figma Desktop och webbläsaren.
+ */
+window.onmessage = ({ data }) => {
+  const uri = data?.pluginMessage?.uri;
+  if (!uri) return;
+
+  // 1) Auto-öppna i ett nytt fönster/flik
+  try { window.open(uri, "_blank"); } catch (_) {/* tyst */}
+
+  // 2) Fallback: visa klickbar länk
+  document.body.innerHTML =
+    'Klicka om inget hände:<br><a href="'+uri+'">'+uri+'</a>';
+};
+</script>

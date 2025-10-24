@@ -1,0 +1,58 @@
+# --- Python / venv ---
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+.Python
+.python-version
+/.ai-cache/
+
+
+# --- Bygg- & paket-artefakter ---
+dist/
+build/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# --- Test / coverage ---
+.pytest_cache/
+.tox/
+.nox/
+.coverage*
+htmlcov/
+
+# --- Typkontroll / linters / cache ---
+.mypy_cache/
+.pytype/
+.ruff_cache/
+.cache/
+
+# --- Lokala secrets/konfig ---
+.env
+.env.*
+!.env.example
+*.local
+
+# --- Databaser och körfiler ---
+*.db
+*.sqlite3
+instance/
+media/
+uploads/
+
+# --- Node (om något körs i backend) ---
+node_modules/
+
+# --- IDE/editor ---
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+
+# --- OS-brus ---
+.DS_Store
+Thumbs.db

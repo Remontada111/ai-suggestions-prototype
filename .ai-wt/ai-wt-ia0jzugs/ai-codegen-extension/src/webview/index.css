@@ -1,0 +1,237 @@
+/* ai-codegen-extension/webview/index.css
+   --------------------------------------------------------------------------
+   Fullscreen-stabil CSS för VS Code-webview på Windows.
+   - Undviker 100vh-glitch (vi fyller viewport via TSX: position:fixed; inset:0)
+   - Säker bakgrund (inte transparent) för att slippa svart ruta i helskärm
+   - Preview-iframe är klick-igenom via TSX (pointer-events:none)
+   -------------------------------------------------------------------------- */
+
+@import "tailwindcss/preflight";
+@tailwind utilities;
+
+/* ───────────────────────────────────────────────
+   Tema (drar färger från VS Code där det passar)
+   ─────────────────────────────────────────────── */
+:root {
+  color-scheme: light dark;
+  --background: var(--vscode-editor-background);
+  /* stabil bakgrund i fullscreen */
+  --foreground: var(--vscode-foreground);
+  --border: color-mix(in srgb, var(--vscode-foreground) 14%, var(--vscode-sideBar-background) 86%);
+  --accent: var(--vscode-focusBorder);
+}
+
+/* Säker helskärm: fyll och undvik transparens som kan bli svart i vissa GPU-lägen */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: var(--background) !important;
+}
+
+.text-foreground {
+  color: var(--foreground) !important;
+}
+
+/* När vi drar/rezisar overlayn: hindra textmarkering och visa “grabbing” */
+.dragging,
+.dragging * {
+  user-select: none !important;
+  cursor: grabbing !important;
+}
+
+/* Skärmläsare-klass */
+.sr-only {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Fokus (snävare: inte på alla länkar/iframes globalt) */
+:where(button, [role="button"], .input):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+
+/* ───────────────────────────────────────────────
+   Layout
+   ─────────────────────────────────────────────── */
+.panel-root {
+  display: grid;
+  grid-auto-rows: min-content;
+  row-gap: .75rem;
+  /* panelen positioneras via TSX (position:fixed; inset:0) */
+}
+
+/* Verktygs-klasser (fallback om Tailwind utilities inte packas) */
+.px-4 { padding-left: 16px; padding-right: 16px; }
+.pt-3 { padding-top: 12px; }
+.flex { display: flex; }
+.items-center { align-items: center; }
+.justify-end { justify-content: flex-end; }
+.gap-2 { gap: 8px; }
+
+/* Två kolumner – dimensioner sätts via inline-style från TSX */
+.pane-grid {
+  display: grid;
+  gap: 12px;
+  align-items: start;
+  overflow-x: hidden;   /* ingen sidscroll */
+  overflow-y: visible;  /* tillåt höjd-innehåll (fokusgloria, popovers) */
+}
+
+/* ───────────────────────────────────────────────
+   “Laptop screen” / preview-container
+   ─────────────────────────────────────────────── */
+.laptop-shell {
+  position: relative;
+  background: #fff; /* ser ut som localhost */
+  border-radius: 12px;
+  overflow: hidden;
+  /* ersätter iframens outline med container-ring vid fokus */
+  border: 1px solid color-mix(in srgb, var(--vscode-foreground) 14%, transparent);
+}
+
+.laptop-shell:focus-within {
+  outline: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--foreground) 12%, transparent);
+}
+
+/* Preview-iframe: skalar via transform i TSX; bakgrunden vit */
+.mini-preview__iframe,
+.laptop-shell iframe {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  display: block;
+  background: #fff;
+  will-change: transform; /* microoptimering */
+}
+
+/* Skeleton-laddare */
+.skeleton {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(90deg,
+      color-mix(in srgb, rgba(0, 0, 0, 0) 82%, var(--foreground) 5%) 0%,
+      color-mix(in srgb, rgba(0, 0, 0, 0) 70%, var(--foreground) 7%) 50%,
+      color-mix(in srgb, rgba(0, 0, 0, 0) 82%, var(--foreground) 5%) 100%);
+  background-size: 200% 100%;
+  animation: shimmer 1.25s infinite;
+}
+
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* ───────────────────────────────────────────────
+   Figma-bild
+   ─────────────────────────────────────────────── */
+.figma-img {
+  display: block;
+  height: 100%;
+  width: auto; /* bevara aspect ratio */
+  user-select: none;
+  image-rendering: auto;
+}
+
+/* ───────────────────────────────────────────────
+   Fullscreen overlay (används ej just nu men kvar som util)
+   ─────────────────────────────────────────────── */
+.fs-overlay { position: fixed; inset: 0; z-index: 1000; }
+.fs-backdrop {
+  position: absolute; inset: 0;
+  background: rgba(0, 0, 0, .45);
+  backdrop-filter: saturate(0.9) blur(1px);
+}
+.fs-stage { position: absolute; inset: 0; display: grid; place-items: center; padding: 16px; }
+.fs-shell {
+  border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, .35);
+  border: 1px solid color-mix(in srgb, var(--vscode-foreground) 18%, transparent);
+}
+
+/* Overlay/handles */
+.overlay-box { position: absolute; }
+
+.resize-handle {
+  position: absolute;
+  width: 12px; height: 12px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(0, 0, 0, .35);
+  border-radius: 50%;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .25);
+  cursor: pointer;
+  z-index: 3;
+}
+.handle-nw { left: -6px; top: -6px; cursor: nwse-resize; }
+.handle-ne { right: -6px; top: -6px; cursor: nesw-resize; }
+.handle-se { right: -6px; bottom: -6px; cursor: nwse-resize; }
+.handle-sw { left: -6px; bottom: -6px; cursor: nesw-resize; }
+
+/* ───────────────────────────────────────────────
+   Global "Accept"-knapp (alltid synlig vid actions)
+   ─────────────────────────────────────────────── */
+.fx-accept-btn {
+  position: absolute; /* placering styrs via inline-style från TSX */
+  cursor: pointer;
+  padding: 8px 14px;
+  font-size: 14px;
+  font-weight: 700;
+  border-radius: 9999px;
+  border: 1px solid var(--border);
+  background: var(--vscode-editorWidget-background);
+  color: var(--vscode-foreground);
+  transition: transform .12s ease, box-shadow .2s ease, color .2s ease, border-color .2s ease;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.fx-accept-btn::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 50px;
+  height: 50px;
+  border-radius: inherit;
+  transform: scale(0);
+  z-index: -1;
+  background: #22c55e; /* grön våg på hover */
+  transition: transform .35s cubic-bezier(.23,1,.32,1);
+}
+
+.fx-accept-btn:hover::before { transform: scale(3); }
+
+.fx-accept-btn:hover {
+  color: #0b1d10;
+  border-color: transparent;
+  box-shadow: 0 6px 16px rgba(34, 197, 94, .35);
+  transform: translateY(-1px);
+}
+
+.fx-accept-btn:active { transform: translateY(0) scale(0.99); }
+
+.fx-accept-btn[disabled] {
+  opacity: .6;
+  cursor: default;
+  box-shadow: none;
+}
+
+.fx-accept-btn[disabled]::before { transform: none; display: none; }
+
+.fx-accept-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 9999px;
+}
