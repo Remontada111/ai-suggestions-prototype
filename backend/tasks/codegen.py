@@ -53,6 +53,7 @@ import os
 import re
 import subprocess
 import tempfile
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, cast
 
@@ -277,6 +278,52 @@ def _read_rel(repo_root: Path, rel: str) -> Dict[str, str]:
 
 
 def _ensure_node_modules(repo_root: Path) -> None:
+    """
+    Ser till att node_modules finns och matchar aktuell plattform.
+    Upptäcker esbuild-plattforms-mismatch och triggar reinstall.
+    """
+    def _platform_tag() -> str:
+        # Use os.uname() only if available to satisfy static checkers; otherwise fall back to env vars.
+        uname_fn = getattr(os, "uname", None)
+        if callable(uname_fn):
+            try:
+                info = uname_fn()
+                sysname = (getattr(info, "sysname", "") or "").lower()
+                machine = (getattr(info, "machine", "") or "").lower()
+            except Exception:
+                # Fallback för miljöer där uname() kan existera men ändå misslyckas
+                sysname = (os.getenv("OS") or "").lower()
+                machine = (os.getenv("PROCESSOR_ARCHITECTURE") or "").lower()
+        else:
+            # Fallback för miljöer utan os.uname()
+            sysname = (os.getenv("OS") or "").lower()
+            machine = (os.getenv("PROCESSOR_ARCHITECTURE") or "").lower()
+
+        arch = {
+            "x86_64": "x64",
+            "amd64": "x64",
+            "aarch64": "arm64",
+            "arm64": "arm64",
+        }.get(machine, "x64")
+
+        if "linux" in sysname:
+            osname = "linux"
+        elif "darwin" in sysname or "mac" in sysname:
+            osname = "darwin"
+        else:
+            osname = "win32"
+        return f"{osname}-{arch}"
+
+    def _esbuild_ok(workdir: Path) -> bool:
+        base = workdir / "node_modules" / "@esbuild"
+        if not base.exists():
+            return True  # inget att validera
+        try:
+            tags = {p.name for p in base.iterdir() if p.is_dir()}
+        except Exception:
+            return True  # var tolerant
+        return _platform_tag() in tags
+
     candidates: List[Path] = []
     root_pkg = repo_root / "package.json"
     fp_pkg = repo_root / "frontendplay" / "package.json"
@@ -291,9 +338,12 @@ def _ensure_node_modules(repo_root: Path) -> None:
 
     for workdir in candidates:
         nm = workdir / "node_modules"
-        if nm.exists():
-            continue
-        _run_install(workdir)
+        # Om node_modules finns men esbuild har fel plattform → rensa och reinstall
+        if nm.exists() and not _esbuild_ok(workdir):
+            _safe_print("node.reinstall", {"workdir": str(workdir), "reason": "esbuild platform mismatch"})
+            shutil.rmtree(nm, ignore_errors=True)
+        if not nm.exists():
+            _run_install(workdir)
 
 
 def _package_scripts(repo_root: Path) -> Dict[str, str]:

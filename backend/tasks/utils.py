@@ -3,7 +3,7 @@
 Gemensamma hjälpfunktioner för Celery-workern:
 
 * Läser miljövariabler och räknar ut Git-URL:er
-* Klonar mål-repositoriet till en temporär katalog
+* Klonar mål-repositoriet eller arbetar direkt mot lokal workspace
 * Skapar unika branch-namn
 * Öppnar Pull Requests via GitHub REST-API
 * Skannar projektet efter befintliga React-komponenter (default-exports)
@@ -12,6 +12,7 @@ Gemensamma hjälpfunktioner för Celery-workern:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import tempfile
 from datetime import datetime
@@ -29,30 +30,66 @@ GH_TOKEN: str | None = os.getenv("GH_TOKEN")
 TARGET_REPO: str | None = os.getenv("TARGET_REPO")  # "user/repo"
 BASE_BRANCH: str = os.getenv("BASE_BRANCH", "main")
 
-if not (GH_TOKEN and TARGET_REPO):
+# LOCAL_MODE: arbeta direkt mot WORKSPACE_DIR istället för en ny /tmp-klon.
+LOCAL_MODE: bool = os.getenv("LOCAL_MODE", "1").lower() in ("1", "true", "yes")
+WORKSPACE_DIR: Path = Path(os.getenv("WORKSPACE_DIR", "/workspace")).resolve()
+
+# Endast i remote-läge krävs GH_TOKEN/TARGET_REPO
+if not LOCAL_MODE and not (GH_TOKEN and TARGET_REPO):
     raise RuntimeError(
         "Både GH_TOKEN och TARGET_REPO måste finnas i .env "
-        "för att kodgenererings-pipen ska fungera."
+        "för att kodgenererings-pipen ska fungera i remote-läge."
     )
 
-REMOTE_URL = f"https://{GH_TOKEN}:x-oauth-basic@github.com/{TARGET_REPO}.git"
+REMOTE_URL: str | None = (
+    f"https://{GH_TOKEN}:x-oauth-basic@github.com/{TARGET_REPO}.git"
+    if GH_TOKEN and TARGET_REPO
+    else None
+)
 
 
 def unique_branch(node_id: str) -> str:
     """
-    Returnerar ett garanterat unikt branch-namn.
-    Exempel: ai/figma-429-783-20250715T101233
+    Returnerar ett kollisionståligt branch-namn.
+    Exempel: ai/figma-429-783-20250715T101233123456-a1b2c3
+    - Mikrosekund-upplöst timestamp
+    - Slump-salt för samtidiga jobb
+    - Saniterar node_id till [A-Za-z0-9._-]
     """
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-    safe_id = node_id.replace(":", "-")
-    return f"ai/figma-{safe_id}-{ts}"
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")  # µs
+    safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", node_id).strip("-")
+    salt = os.urandom(3).hex()  # 6 hextecken
+    return f"ai/figma-{safe_id}-{ts}-{salt}"
 
 
 def clone_repo() -> Tuple[str, Repo]:
     """
-    Klonar `TARGET_REPO` till en temporär katalog (depth=1).
-    Returnerar (temp_dir_path, Repo-objekt).
+    LOCAL_MODE=1:
+      - Arbeta direkt mot host-workspace (bevarar existerande main.tsx och tidigare tiles).
+    LOCAL_MODE=0:
+      - Klona TARGET_REPO till temporär katalog (depth=1), som tidigare.
+    Returnerar (repo_root_path, Repo-objekt).
     """
+    if LOCAL_MODE:
+        ws_git = WORKSPACE_DIR / ".git"
+        if not ws_git.exists():
+            raise HTTPException(
+                500,
+                f"LOCAL_MODE=1 men .git saknas i {WORKSPACE_DIR}. "
+                "Montera rätt workspace i containern eller stäng av LOCAL_MODE.",
+            )
+        repo = Repo(str(WORKSPACE_DIR))
+        # Försök säkerställa basbranch, men var tolerant om den saknas
+        try:
+            if repo.active_branch.name != BASE_BRANCH:
+                repo.git.checkout(BASE_BRANCH)
+        except Exception:
+            pass
+        return str(WORKSPACE_DIR), repo
+
+    # Remote-läge: klona från GitHub
+    if not REMOTE_URL:
+        raise HTTPException(500, "REMOTE_URL saknas; sätt GH_TOKEN och TARGET_REPO eller slå på LOCAL_MODE=1.")
     tmp_dir = tempfile.mkdtemp(prefix="ai-pr-bot-")
     try:
         repo = Repo.clone_from(
@@ -71,7 +108,15 @@ def clone_repo() -> Tuple[str, Repo]:
 def create_pr(repo: Repo, branch: str, title: str, body: str | None = None) -> str:
     """
     Pushar `branch` och öppnar en Pull Request. Returnerar PR-länken.
+    OBS: Kräver GH_TOKEN och TARGET_REPO. I LOCAL_MODE är PR inte aktivt.
     """
+    if not (GH_TOKEN and TARGET_REPO):
+        raise HTTPException(
+            400,
+            "PR är inte aktiverad: GH_TOKEN/TARGET_REPO saknas eller LOCAL_MODE=1. "
+            "Stäng av LOCAL_MODE och sätt env-variabler för att öppna PR.",
+        )
+
     # Push
     try:
         repo.remote("origin").push(refspec=f"{branch}:{branch}")

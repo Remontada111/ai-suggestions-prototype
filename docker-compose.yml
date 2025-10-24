@@ -54,13 +54,18 @@ services:
     env_file:
       - ./backend/.env
     environment:
-      TARGET_COMPONENT_DIR: /workspace/frontendplay/src/components/ai
-      ALLOW_PATCH: /workspace/frontendplay/src/main.tsx
+      TARGET_COMPONENT_DIR: frontendplay/src/components/ai
+      ALLOW_PATCH: frontendplay/src/main.tsx
+      ICON_DIR: frontendplay/src/assets/icons
       AI_INJECT_APPEND: "1"
       AI_MOUNT_MODE: "append"
+      LOCAL_MODE: "1"
+      WORKSPACE_DIR: /workspace
     volumes:
       - ./backend:/app/backend              # Python-koden
       - ./:/workspace                       # Persistenta frontendfiler och scripts
+      - node_modules_root:/workspace/node_modules                 # Maskera hostens node_modules
+      - node_modules_fp:/workspace/frontendplay/node_modules      # Maskera hostens node_modules
     restart: unless-stopped
     depends_on:
       - redis
@@ -84,3 +89,5 @@ services:
 # ───────────────────────────── Volymer ───────────────────────────────────── #
 volumes:
   node_modules: {}
+  node_modules_root: {}
+  node_modules_fp: {}
