@@ -50,7 +50,7 @@ services:
   worker:
     image: ai-backend:latest
     command: >
-      python -m celery -A backend.tasks.codegen:celery_app worker -l info -I backend.tasks.analyze
+     python -m celery -A backend.tasks.codegen:celery_app worker -l info -I backend.tasks.analyze --concurrency=1
     env_file:
       - ./backend/.env
     environment:
