@@ -4,10 +4,10 @@ Celery-worker: Figma-node → IR → deterministisk TSX → (AST-mount + file) �
 
 Uppdateringar i denna version:
 - Alltid arbete på fast arbetsbranch AI_WORK_BRANCH (default: ai/figma-work). Ingen per-node-branch.
-- Vid start: fetch → checkout → pull --ff-only; om branchen saknas skapas den och pushas upstream.
-- Efter commit: push alltid till origin/AI_WORK_BRANCH. AUTO_PR kan skapa PR automatiskt.
-- Fortsatt append-beteende: AI_MOUNT_MODE=append lämnar mount-regionen orörd (ingen clear), replace rensar.
-- Sökvägar bör vara relativa till repo-roten (TARGET_COMPONENT_DIR, ALLOW_PATCH).
+- Start: fetch → checkout -B till exakt remote-tip om den finns, annars BASE_BRANCH → första push.
+- Push: ingen rebase i worker. Vid non-fast-forward görs fetch + reset --hard origin/<branch> → applicera igen → push.
+- Append-läge: AI_MOUNT_MODE=append lämnar mount-regionen orörd (ingen clear), replace rensar.
+- Idempotens: hoppa injektion om samma tile redan finns.
 - Övriga förbättringar från tidigare version kvarstår (bg/ikon/typografi/dims validering, autofixer m.m.).
 """
 
@@ -71,10 +71,10 @@ ENABLE_VISUAL_VALIDATE = (
     os.getenv("ENABLE_VISUAL_VALIDATE", "false").lower() in ("1", "true", "yes")
 )
 
-# NY: Läge för montering – default append för att inte ersätta tidigare tiles
+# Läge för montering – default append för att inte ersätta tidigare tiles
 AI_MOUNT_MODE = os.getenv("AI_MOUNT_MODE", "append").strip().lower()  # 'append' | 'replace'
 
-# NY: Arbetsbranch och auto-PR
+# Arbetsbranch och auto-PR
 AI_WORK_BRANCH = os.getenv("AI_WORK_BRANCH", "ai/figma-work").strip()
 AUTO_PR = os.getenv("AUTO_PR", "0").lower() in ("1", "true", "yes")
 
@@ -91,6 +91,8 @@ IR_COMPARE_LIMIT = int(os.getenv("IR_COMPARE_LIMIT", "200") or "200")
 
 # BG-debug
 LOG_BG_DEBUG = os.getenv("LOG_BG_DEBUG", "0").lower() in ("1", "true", "yes")
+
+BASE_BRANCH = os.getenv("BASE_BRANCH", "main").strip()
 
 # ─────────────────────────────────────────────────────────
 # Celery-app
@@ -202,6 +204,25 @@ def _dbg_bg(event: str, payload: dict) -> None:
     if LOG_BG_DEBUG:
         _safe_print(f"bg.{event}", payload)
 
+# NY: säkerställ git-identitet i repo (lokal config)
+def _ensure_git_identity(repo) -> None:
+    name = (
+        os.getenv("GIT_AUTHOR_NAME")
+        or os.getenv("GIT_COMMITTER_NAME")
+        or "AI Codegen"
+    )
+    email = (
+        os.getenv("GIT_AUTHOR_EMAIL")
+        or os.getenv("GIT_COMMITTER_EMAIL")
+        or os.getenv("GIT_EMAIL")
+        or "ai-codegen@local"
+    )
+    try:
+        repo.git.config("user.name", name)
+        repo.git.config("user.email", email)
+        _safe_print("git.identity", {"name": name, "email": email})
+    except Exception as e:
+        _safe_print("git.identity.error", {"err": str(e)})
 
 def _fetch_figma_node(file_key: str, node_id: str) -> Dict[str, Any]:
     url = f"https://api.figma.com/v1/files/{file_key}/nodes"
@@ -1177,10 +1198,10 @@ def _assert_dims_positions(ir: Dict[str, Any], file_code: str, icon_asset_ids: s
         h_tokens = _need_h(b.get("h"))
         if n.get("type") == "TEXT":
             h_tokens = h_tokens + ["h-auto"]
-        if h_tokens and not _any(h_tokens):
+        if h_tokens and not _any(w_tokens := h_tokens):
             raise HTTPException(
                 500,
-                f"Saknar höjdklass {h_tokens[0]} (alternativ: {', '.join(h_tokens)}) "
+                f"Saknar höjdklass {w_tokens[0]} (alternativ: {', '.join(h_tokens)}) "
                 f"för node id={nid} name={nname} type={ntype} bounds={b}"
             )
 
@@ -1885,6 +1906,27 @@ def _compare_figma_vs_ir(figma_doc: Dict[str, Any], ir_visible: Dict[str, Any], 
     }
 
 # ─────────────────────────────────────────────────────────
+# Push-hjälpare utan rebase + retry via hard reset
+# ─────────────────────────────────────────────────────────
+
+def _push_ff_with_retry(repo, work_branch: str, apply_again_fn) -> None:
+    _ensure_git_identity(repo)
+    origin = repo.remotes.origin
+    try:
+        repo.git.push("--set-upstream", "origin", work_branch)
+        return
+    except GitCommandError as e:
+        msg = (e.stderr or e.stdout or str(e))
+        if "non-fast-forward" not in msg:
+            raise HTTPException(500, f"Git push error: {e.stderr or e}")
+    # Remote uppdaterad: resync och applicera igen
+    origin.fetch(work_branch)
+    repo.git.reset("--hard", f"origin/{work_branch}")
+    _safe_print("git.reset", {"branch": work_branch, "to": f"origin/{work_branch}"})
+    apply_again_fn()
+    repo.git.push("--set-upstream", "origin", work_branch)
+
+# ─────────────────────────────────────────────────────────
 # Celery-task
 # ─────────────────────────────────────────────────────────
 
@@ -1943,23 +1985,29 @@ def integrate_figma_node(
     icon_assets: List[Dict[str, Any]] = []
 
     tmp_dir, repo = clone_repo()
+    _ensure_git_identity(repo)  # NY
     tmp_root = Path(tmp_dir)
     _safe_print("repo.clone", {"root": tmp_dir})
 
-    # NY: arbeta på fast arbetsbranch
+    # NY: arbeta på fast arbetsbranch utan rebase: basera på exakt remote-tip om den finns
     work_branch = AI_WORK_BRANCH
+    origin = repo.remotes.origin
+    origin.fetch()
+    remote_heads = {r.remote_head for r in origin.refs}
     try:
-        repo.git.fetch("origin", work_branch, depth=1)
-        repo.git.checkout(work_branch)
-        repo.git.pull("origin", work_branch, "--ff-only")
-    except GitCommandError:
-        # Skapa från nuvarande HEAD (klonad BASE_BRANCH) och sätt upstream
-        repo.git.checkout("-b", work_branch)
-        try:
-            repo.git.push("--set-upstream", "origin", work_branch)
-        except GitCommandError as e:
-            raise HTTPException(500, f"Git push error vid branch-init: {e.stderr or e}")
-    _safe_print("git.branch", {"name": work_branch})
+        if work_branch in remote_heads:
+            repo.git.checkout("-B", work_branch, f"origin/{work_branch}")
+            mode = "from-remote"
+        else:
+            repo.git.checkout("-B", work_branch, BASE_BRANCH)
+            mode = "from-base"
+            try:
+                repo.git.push("--set-upstream", "origin", work_branch)
+            except GitCommandError as e:
+                raise HTTPException(500, f"Git push error vid branch-init: {e.stderr or e}")
+    except GitCommandError as e:
+        raise HTTPException(500, f"Git checkout error: {e.stderr or e}")
+    _safe_print("git.branch", {"name": work_branch, "mode": mode})
 
     for ic in icon_nodes:
         nid = ic["id"]
@@ -2052,11 +2100,9 @@ def integrate_figma_node(
     _safe_print("validate.ok", {})
 
     cleaned = _sanitize_tailwind_conflicts(_compact_arbitrary_values(file_code))
-    target_path.write_text(cleaned, encoding="utf-8")
-    _format_tsx(tmp_root, target_path)
 
     returned_primary_path = target_rel
-    _safe_print("write.component", {"path": returned_primary_path})
+    _safe_print("write.component.plan", {"path": returned_primary_path})
 
     main_candidates = [p for p in ALLOW_PATCH if p.endswith("main.tsx")]
     main_rel = main_candidates[0] if main_candidates else "frontendplay/src/main.tsx"
@@ -2088,116 +2134,126 @@ def integrate_figma_node(
     else:
         mount["jsx"] = f"<{mount['import_name']} />"
 
-    # Säkerställ markörer. Töm endast i replace-läge.
-    _ensure_anchor_in_main(main_abs)
-    if AI_MOUNT_MODE == "replace":
-        _clear_mount_region(main_abs)
-    _snapshot_main(main_abs, "before_inject")
+    # ── Applicering + commit som funktion för retry-scenariot ──
+    def _apply_and_commit() -> None:
+        # Skriv komponentfil
+        target_path.write_text(cleaned, encoding="utf-8")
+        _format_tsx(tmp_root, target_path)
+        _safe_print("write.component", {"path": returned_primary_path})
 
-    # Före injektion – extra logg
-    try:
-        src_before = main_abs.read_text(encoding="utf-8")
-    except Exception:
-        src_before = ""
-    scripts_ts_meta = (tmp_root / "scripts" / "ai_inject_mount.ts").resolve()
-    try:
-        scripts_sha_meta = hashlib.sha1(scripts_ts_meta.read_bytes()).hexdigest() if scripts_ts_meta.exists() else None
-    except Exception:
-        scripts_sha_meta = None
-    _safe_print("ai.inject.meta", {
-        "mode_arg": ("replace" if AI_MOUNT_MODE == "replace" else "append"),
-        "env_APPEND": os.environ.get("AI_INJECT_APPEND"),
-        "env_DEBUG": os.environ.get("AI_INJECT_DEBUG"),
-        "scripts_ts": str(scripts_ts_meta),
-        "scripts_sha1": scripts_sha_meta,
-        "mount_inner_len_before": _mount_inner_len(src_before),
-        "tiles_before": len(re.findall(r'\{/\*\s*AI-TILE:', src_before)),
-        "tile_exists_before": _tile_exists_spec_or_ident(src_before, mount["import_path"], mount["import_name"]),
-    })
-    _dump_text_file("main-before-inject", node_id, src_before)
+        # Säkerställ markörer. Töm endast i replace-läge.
+        _ensure_anchor_in_main(main_abs)
+        if AI_MOUNT_MODE == "replace":
+            _clear_mount_region(main_abs)
+        _snapshot_main(main_abs, "before_inject")
 
-    # Absolut TS-injektor, läge styrt av AI_MOUNT_MODE. Ingen fallback.
-    scripts_ts = (tmp_root / "scripts" / "ai_inject_mount.ts").resolve()
-    if not scripts_ts.exists():
-        raise HTTPException(500, f"TS-injektor saknas: {scripts_ts}")
+        # Före injektion – extra logg
+        try:
+            src_before = main_abs.read_text(encoding="utf-8")
+        except Exception:
+            src_before = ""
+        scripts_ts_meta = (tmp_root / "scripts" / "ai_inject_mount.ts").resolve()
+        try:
+            scripts_sha_meta = hashlib.sha1(scripts_ts_meta.read_bytes()).hexdigest() if scripts_ts_meta.exists() else None
+        except Exception:
+            scripts_sha_meta = None
+        _safe_print("ai.inject.meta", {
+            "mode_arg": ("replace" if AI_MOUNT_MODE == "replace" else "append"),
+            "env_APPEND": os.environ.get("AI_INJECT_APPEND"),
+            "env_DEBUG": os.environ.get("AI_INJECT_DEBUG"),
+            "scripts_ts": str(scripts_ts_meta),
+            "scripts_sha1": scripts_sha_meta,
+            "mount_inner_len_before": _mount_inner_len(src_before),
+            "tiles_before": len(re.findall(r'\{/\*\s*AI-TILE:', src_before)),
+            "tile_exists_before": _tile_exists_spec_or_ident(src_before, mount["import_path"], mount["import_name"]),
+        })
+        _dump_text_file("main-before-inject", node_id, src_before)
 
-    node_cwd = _find_project_base(tmp_root, hint=main_abs.parent)  # typ .../frontendplay
-    os.environ["AI_INJECT_DEBUG"] = "1"
-    os.environ["AI_INJECT_APPEND"] = "1" if AI_MOUNT_MODE != "replace" else "0"
+        # Absolut TS-injektor, läge styrt av AI_MOUNT_MODE. Hoppa om ident/spec redan finns.
+        scripts_ts = (tmp_root / "scripts" / "ai_inject_mount.ts").resolve()
+        if not scripts_ts.exists():
+            raise HTTPException(500, f"TS-injektor saknas: {scripts_ts}")
 
-    jsx_tmp = Path(tempfile.gettempdir()) / f"ai-mount-{hashlib.sha1((mount['import_name']+mount['import_path']).encode()).hexdigest()[:8]}.jsx"
-    jsx_tmp.write_text(mount["jsx"] + "\n", encoding="utf-8")
+        node_cwd = _find_project_base(tmp_root, hint=main_abs.parent)  # typ .../frontendplay
+        os.environ["AI_INJECT_DEBUG"] = "1"
+        os.environ["AI_INJECT_APPEND"] = "1" if AI_MOUNT_MODE != "replace" else "0"
 
-    _safe_print("ai.inject.env", {
-        "AI_INJECT_DEBUG": os.environ.get("AI_INJECT_DEBUG"),
-        "AI_INJECT_APPEND": os.environ.get("AI_INJECT_APPEND"),
-        "mode_expected": ("replace" if AI_MOUNT_MODE == "replace" else "append"),
-        "node_cwd": str(node_cwd),
-        "main_tsx": str(main_abs),
-        "import_name": mount.get("import_name"),
-        "import_path": mount.get("import_path"),
-        "jsx_file": str(jsx_tmp),
-        "scripts_ts": str(scripts_ts),
-    })
+        if not _tile_exists_spec_or_ident(src_before, mount["import_path"], mount["import_name"]):
+            jsx_tmp = Path(tempfile.gettempdir()) / f"ai-mount-{hashlib.sha1((mount['import_name']+mount['import_path']).encode()).hexdigest()[:8]}.jsx"
+            jsx_tmp.write_text(mount["jsx"] + "\n", encoding="utf-8")
+            _safe_print("ai.inject.env", {
+                "AI_INJECT_DEBUG": os.environ.get("AI_INJECT_DEBUG"),
+                "AI_INJECT_APPEND": os.environ.get("AI_INJECT_APPEND"),
+                "mode_expected": ("replace" if AI_MOUNT_MODE == "replace" else "append"),
+                "node_cwd": str(node_cwd),
+                "main_tsx": str(main_abs),
+                "import_name": mount.get("import_name"),
+                "import_path": mount.get("import_path"),
+                "jsx_file": str(jsx_tmp),
+                "scripts_ts": str(scripts_ts),
+            })
 
-    cmd = [
-        "node", "--import", "tsx",
-        str(scripts_ts),
-        str(main_abs),
-        str(mount["import_name"]),
-        str(mount["import_path"]),
-        str(jsx_tmp),
-    ]
-    if AI_MOUNT_MODE == "replace":
-        cmd.append("replace")
+            cmd = [
+                "node", "--import", "tsx",
+                str(scripts_ts),
+                str(main_abs),
+                str(mount["import_name"]),
+                str(mount["import_path"]),
+                str(jsx_tmp),
+            ]
+            if AI_MOUNT_MODE == "replace":
+                cmd.append("replace")
 
-    rc, out_text, err = _run(cmd, cwd=node_cwd)
-    _safe_print("ai.inject.cmd", {"rc": rc, "out": out_text[:2000], "err": err[:2000]})
-    if rc != 0:
-        raise HTTPException(500, f"TS-injektorn misslyckades (rc={rc}): {err or out_text}")
+            rc, out_text, err = _run(cmd, cwd=node_cwd)
+            _safe_print("ai.inject.cmd", {"rc": rc, "out": out_text[:2000], "err": err[:2000]})
+            if rc != 0:
+                raise HTTPException(500, f"TS-injektorn misslyckades (rc={rc}): {err or out_text}")
+        else:
+            _safe_print("ai.inject.skip", {"reason": "tile exists"})
 
-    # Efter injektion – extra logg
-    try:
-        src_after = main_abs.read_text(encoding="utf-8")
-    except Exception:
-        src_after = ""
-    _safe_print("ai.inject.result", {
-        "mount_inner_len_after": _mount_inner_len(src_after),
-        "tiles_total_after": len(re.findall(r'\{/\*\s*AI-TILE:', src_after)),
-        "tile_exists_after": _tile_exists_spec_or_ident(src_after, mount["import_path"], mount["import_name"]),
-    })
-    _dump_text_file("main-after-inject", node_id, src_after)
+        # Efter injektion – extra logg
+        try:
+            src_after = main_abs.read_text(encoding="utf-8")
+        except Exception:
+            src_after = ""
+        _safe_print("ai.inject.result", {
+            "mount_inner_len_after": _mount_inner_len(src_after),
+            "tiles_total_after": len(re.findall(r'\{/\*\s*AI-TILE:', src_after)),
+            "tile_exists_after": _tile_exists_spec_or_ident(src_after, mount["import_path"], mount["import_name"]),
+        })
+        _dump_text_file("main-after-inject", node_id, src_after)
 
-    # I replace-läge: ta bort ALLA andra ai-importer än vår. I append-läge: behåll.
-    if AI_MOUNT_MODE == "replace":
-        _prune_other_ai_imports(main_abs, mount["import_path"])
+        # I replace-läge: ta bort ALLA andra ai-importer än vår. I append-läge: behåll.
+        if AI_MOUNT_MODE == "replace":
+            _prune_other_ai_imports(main_abs, mount["import_path"])
 
-    _snapshot_main(main_abs, "after_inject")
+        _snapshot_main(main_abs, "after_inject")
 
-    # Ghost-preflight efter injektion
-    _snapshot_main(main_abs, "before_prune")
-    _prune_ghosts_in_main(tmp_root, main_rel)
-    _snapshot_main(main_abs, "after_prune")
+        # Ghost-preflight efter injektion
+        _snapshot_main(main_abs, "before_prune")
+        _prune_ghosts_in_main(tmp_root, main_rel)
+        _snapshot_main(main_abs, "after_prune")
 
-    _typecheck_and_lint(tmp_root, [returned_primary_path])
+        _typecheck_and_lint(tmp_root, [returned_primary_path])
 
-    try:
-        _ = _visual_validate(tmp_root)
-    except HTTPException:
-        raise
-    except Exception as e:
-        _safe_print("visual.validate.warn", {"err": str(e)})
+        try:
+            _ = _visual_validate(tmp_root)
+        except HTTPException:
+            raise
+        except Exception as e:
+            _safe_print("visual.validate.warn", {"err": str(e)})
 
-    # Commit + PUSH ALLTID på arbetsbranch
-    repo.git.add("--all")
-    commit_msg = f"feat(ai): add {returned_primary_path}"
-    repo.index.commit(commit_msg)
-    _safe_print("git.commit", {"msg": commit_msg})
+        # Commit
+        repo.git.add("--all")
+        commit_msg = f"feat(ai): add {returned_primary_path}"
+        repo.index.commit(commit_msg)
+        _safe_print("git.commit", {"msg": commit_msg})
 
-    try:
-        repo.git.push("--set-upstream", "origin", work_branch)
-    except GitCommandError as e:
-        raise HTTPException(500, f"Git push error: {e.stderr or e}")
+    # Första appliceringen
+    _apply_and_commit()
+
+    # Push utan rebase. Vid non-ff: reset till origin och applicera igen → push.
+    _push_ff_with_retry(repo, work_branch, _apply_and_commit)
 
     # Valfri PR
     if AUTO_PR:
