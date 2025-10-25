@@ -1,50 +1,14 @@
 from __future__ import annotations
 """
-Celery-worker: Figma-node → IR → deterministisk TSX → (AST-mount + file) → validering → commit → returnera ändringar
+Celery-worker: Figma-node → IR → deterministisk TSX → (AST-mount + file) → validering → commit → push → ev. PR → returnera ändringar
 
-Uppdateringar:
-- ENDAST IR-fält används för bakgrund: läs n.bg, aldrig n.fills för bakgrund.
-- Validatorn kräver bg-* endast om n.bg finns. Skipper layout-only wrappers.
-- Slash-opacity bg-[#hex]/NN stöds i både purge och validering.
-- Spärr för palettklasser: alla bg- som inte är bg-[…] blockeras.
-- Pre-purge: oönskade bg-* som inte finns i IR strippas innan validering.
-- Gradients valideras enbart mot IR (n.bg.css), inte mot Figma-fills.
-- Stabil multi-node: komponentnamn och filväg är unika per node-id; main.tsx injicerar i valt läge (append default).
-
-Övrigt:
-- Endast synlig text (visible_effective=True) byggs till textkrav.
-- Tailwind-hints (tw_map) skickas till modellen.
-- Tolerant men informativ validering för mått/position.
-- Ikonexporten filtrerar bort containers och SVG:er som innehåller <text>/<tspan> eller orimliga mått/aspekt.
-- Dims/pos-validering körs mot klippkedja och respekterar effektiv synlighet.
-- Validering kräver font-family-klass i JSX enligt Figma (arbitrary value), inkl. korrekt escaping.
-- Ikonprompten kräver import av varje ikon och exakt en <img> per ikon, utan absoluta left/top.
-- Ikonvalideringen accepterar både absoluta (/src/...) och relativa imports, validerar storlek och exakt en användning, men ignorerar position.
-- Sanering tar bort felaktiga left-/top-/absolute-klasser på <img> så ikoner inte hamnar utanför vyn.
-- AUTO-FIX: Saknade ikon-importer och <img>-taggar injiceras automatiskt i file_code innan validering.
-- Dims/pos-validering hoppar över ikon-subträd (leafs i exporterad ikon kontrolleras inte separat).
-- Färgvalidering hoppar över ikon-subträd och är case-/format-tålig (hex och rgba).
-- Prettier kör endast lokal bin om den finns, annars lätt fallback-formattering (ingen npx).
-- AST-injektion kör via scripts/ai_inject_mount.ts med ABSOLUT väg. Läge styrs via AI_MOUNT_MODE.
-- Figma SVG-hämtning parallelliseras med kortare timeouts.
-- GPT-5: hoppa direkt till strikt=False schema, därefter json_object.
-- Systemprompten ber modellen att lämna mount.import_path tomt.
-- AUTO-FIX: injicera font-['Open_Sans'] på första JSX-wrappern när IR har exakt en fontfamilj.
-- Kompaktar ALLA Tailwind arbitrary values (bg-[rgba(0,0,0,0.2)] etc.) så blanks aldrig bryter klasser.
-- Förbjuder bakgrunder som inte finns i IR. Stoppar spök-`bg-[#000]` på wrapper-noder.
-- Tillåter semitransparent färg via rgba, #rrggbbaa eller slash-opacity.
-- Skipper dims/pos-krav för layout-only wrappers (ingen fill/stroke/effects/text).
-- Hindrar oönskat `justify-between` om IR inte kräver det.
-- Monterar med root-offset-wrapper så komponenten inte “krokar” i appens kant.
-
-GPT-5-kompatibilitet:
-- Skicka aldrig 'temperature' till GPT-5-modeller. De accepterar endast default. Robust fallback-kedja:
-  gpt-5 → json_schema strict=False → json_object
-  övriga → strict=True → strict=False → json_object
-
-Ny konfiguration:
-- AI_MOUNT_MODE ('append' | 'replace'), default 'append'.
-  Styr om injektorn ska lägga till nya tiles i grid (append) eller ersätta (replace).
+Uppdateringar i denna version:
+- Alltid arbete på fast arbetsbranch AI_WORK_BRANCH (default: ai/figma-work). Ingen per-node-branch.
+- Vid start: fetch → checkout → pull --ff-only; om branchen saknas skapas den och pushas upstream.
+- Efter commit: push alltid till origin/AI_WORK_BRANCH. AUTO_PR kan skapa PR automatiskt.
+- Fortsatt append-beteende: AI_MOUNT_MODE=append lämnar mount-regionen orörd (ingen clear), replace rensar.
+- Sökvägar bör vara relativa till repo-roten (TARGET_COMPONENT_DIR, ALLOW_PATCH).
+- Övriga förbättringar från tidigare version kvarstår (bg/ikon/typografi/dims validering, autofixer m.m.).
 """
 
 import hashlib
@@ -64,10 +28,11 @@ import requests
 from celery import Celery
 from dotenv import load_dotenv
 from fastapi import HTTPException
+from git.exc import GitCommandError  # NY: för branch/push-fel
 
 from . import figma_ir as FIR
 from .det_codegen import generate_tsx_component
-from .utils import clone_repo, list_components, unique_branch
+from .utils import clone_repo, list_components, create_pr  # NY: create_pr, tar bort unique_branch
 
 # ─────────────────────────────────────────────────────────
 # Miljö & konfiguration
@@ -108,6 +73,10 @@ ENABLE_VISUAL_VALIDATE = (
 
 # NY: Läge för montering – default append för att inte ersätta tidigare tiles
 AI_MOUNT_MODE = os.getenv("AI_MOUNT_MODE", "append").strip().lower()  # 'append' | 'replace'
+
+# NY: Arbetsbranch och auto-PR
+AI_WORK_BRANCH = os.getenv("AI_WORK_BRANCH", "ai/figma-work").strip()
+AUTO_PR = os.getenv("AUTO_PR", "0").lower() in ("1", "true", "yes")
 
 CODEGEN_TIMING = os.getenv("CODEGEN_TIMING", "0").lower() in ("1", "true", "yes")
 
@@ -662,8 +631,7 @@ def _ensure_anchor_in_main(main_tsx: Path) -> None:
 
 # ─────────────────────────────────────────────────────────
 # Ghost-preflight för main.tsx (robust och icke-invasiv)
-# + NY: pruna ALLA andra ai-importer än den vi just injicerar
-# + NY: rensa mount-regionen före körning i replace-läge
+# + rensa bara i replace-läge
 # ─────────────────────────────────────────────────────────
 
 _ASSET_EXT_RE = re.compile(r'\.(css|scss|sass|less|pcss|styl|svg(?:\?url)?|png|jpe?g|gif|webp|ico|bmp|avif|woff2?|ttf|otf)(?:\?.*)?$', re.I)
@@ -691,7 +659,6 @@ def _resolve_ts_module(main_tsx: Path, spec: str) -> Path | None:
 def _prune_other_ai_imports(main_tsx: Path, keep_spec: str) -> None:
     """
     Tar bort alla import-rader som pekar på components/ai UTOM den som motsvarar keep_spec.
-    Använder faktisk modulresolution för att jämföra målfil.
     """
     src = main_tsx.read_text(encoding="utf-8")
     keep_abs = _resolve_ts_module(main_tsx, keep_spec) or Path("__nope__")
@@ -708,7 +675,6 @@ def _prune_other_ai_imports(main_tsx: Path, keep_spec: str) -> None:
         if "/components/ai/" in spec or spec.startswith("./components/ai/") or spec.startswith("../components/ai/"):
             tgt = _resolve_ts_module(main_tsx, spec)
             if tgt and tgt != keep_abs:
-                # drop
                 changed = True
                 last = m.end()
                 continue
@@ -722,6 +688,7 @@ def _prune_other_ai_imports(main_tsx: Path, keep_spec: str) -> None:
 def _clear_mount_region(main_tsx: Path) -> None:
     """
     Töm innehållet mellan AI-INJECT-MOUNT:BEGIN/END. Behåller markörerna.
+    Används endast i replace-läge.
     """
     src = main_tsx.read_text(encoding="utf-8")
     region = re.search(
@@ -1979,6 +1946,21 @@ def integrate_figma_node(
     tmp_root = Path(tmp_dir)
     _safe_print("repo.clone", {"root": tmp_dir})
 
+    # NY: arbeta på fast arbetsbranch
+    work_branch = AI_WORK_BRANCH
+    try:
+        repo.git.fetch("origin", work_branch, depth=1)
+        repo.git.checkout(work_branch)
+        repo.git.pull("origin", work_branch, "--ff-only")
+    except GitCommandError:
+        # Skapa från nuvarande HEAD (klonad BASE_BRANCH) och sätt upstream
+        repo.git.checkout("-b", work_branch)
+        try:
+            repo.git.push("--set-upstream", "origin", work_branch)
+        except GitCommandError as e:
+            raise HTTPException(500, f"Git push error vid branch-init: {e.stderr or e}")
+    _safe_print("git.branch", {"name": work_branch})
+
     for ic in icon_nodes:
         nid = ic["id"]
         svg = svg_by_id.get(nid)
@@ -2033,10 +2015,6 @@ def integrate_figma_node(
 
     mount = {"anchor": _ANCHOR_SINGLE, "import_name": comp_name}
     scratch: Dict[str, Any] = {}
-
-    branch = unique_branch(node_id)
-    repo.git.checkout("-b", branch)
-    _safe_print("git.branch", {"name": branch})
 
     name = Path(target_rel).name or f"{mount['import_name']}.tsx"
     target_rel = (Path(TARGET_COMPONENT_DIR) / name).as_posix()
@@ -2210,10 +2188,24 @@ def integrate_figma_node(
     except Exception as e:
         _safe_print("visual.validate.warn", {"err": str(e)})
 
+    # Commit + PUSH ALLTID på arbetsbranch
     repo.git.add("--all")
     commit_msg = f"feat(ai): add {returned_primary_path}"
     repo.index.commit(commit_msg)
     _safe_print("git.commit", {"msg": commit_msg})
+
+    try:
+        repo.git.push("--set-upstream", "origin", work_branch)
+    except GitCommandError as e:
+        raise HTTPException(500, f"Git push error: {e.stderr or e}")
+
+    # Valfri PR
+    if AUTO_PR:
+        try:
+            pr_url = create_pr(repo, work_branch, f"feat(ai): tiles update for {node_id}")
+            _safe_print("git.pr", {"url": pr_url})
+        except Exception as e:
+            _safe_print("git.pr.error", {"err": str(e)})
 
     changed_paths: List[str] = []
     changed_paths.append(returned_primary_path)

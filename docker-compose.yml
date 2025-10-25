@@ -1,10 +1,6 @@
 ###############################################################################
-#  AI Codegen – full utvecklings-stack
-#  • Redis                   –  Celery broker + result-backend
-#  • ai-backend (base)       –  Byggs en gång, återanvänds av API & Worker
-#  • api                     –  FastAPI gateway (Uvicorn, reload på)
-#  • worker                  –  Celery-worker för genererings-jobb
-#  • devcontainer            –  Node/TypeScript-miljö för VS Code Dev Container
+# docker.yml – AI Codegen stack
+# Redis (broker), backend base image, FastAPI API, Celery worker, Dev Container
 ###############################################################################
 
 services:
@@ -54,13 +50,22 @@ services:
     env_file:
       - ./backend/.env
     environment:
-      TARGET_COMPONENT_DIR: /workspace/frontendplay/src/components/ai
-      ALLOW_PATCH: /workspace/frontendplay/src/main.tsx
-      AI_INJECT_APPEND: "1"
+      # Viktigt: håll dessa relativa till repo-roten i mål-repot
+      TARGET_COMPONENT_DIR: frontendplay/src/components/ai
+      ALLOW_PATCH: frontendplay/src/main.tsx
+
+      # Append-läge så vi lägger till nya tiles
       AI_MOUNT_MODE: "append"
+
+      # Stabil arbetsbranch + auto-push. PR skapas manuellt tills vidare.
+      AI_WORK_BRANCH: ai/figma-work
+      AUTO_PUSH: "1"
+      AUTO_PR: "0"
+
+      TZ: Europe/Stockholm
     volumes:
       - ./backend:/app/backend              # Python-koden
-      - ./:/workspace                       # Persistenta frontendfiler och scripts
+      - ./:/workspace                       # Valfritt: lokal workspace om du behöver den
     restart: unless-stopped
     depends_on:
       - redis
