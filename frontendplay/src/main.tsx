@@ -34,7 +34,7 @@ function App() {
         <> </>
         <> {/* AI-TILE:./components/ai/Menu-d96dc2:BEGIN */}
         <div className="relative w-[1280px] h-[800px] overflow-hidden rounded-md ring-1 ring-black/10 bg-white">
-        <Menud96dc2 />
+        <div className="absolute inset-0 w-full h-full pointer-events-none">  <div className="absolute left-[37.5%] top-[4.375%] w-[20.2344%] h-[94.875%] overflow-hidden pointer-events-auto">    <Menud96dc2 />  </div></div>
         </div> {/* AI-TILE:./components/ai/Menu-d96dc2:END */}</></div>
         {/* AI-INJECT-MOUNT:END */}</div>
     </div>
