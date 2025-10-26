@@ -1,6 +1,6 @@
 ###############################################################################
 # docker.yml – AI Codegen stack
-# Redis (broker), backend base image, FastAPI API, Celery worker, Dev Container
+# Redis (broker), backend-bild, FastAPI API, Celery worker, Dev Container
 ###############################################################################
 
 services:
@@ -25,6 +25,7 @@ services:
     restart: unless-stopped
     depends_on:
       - redis
+    init: true
 
   # ────────────────────────── FastAPI gateway ─────────────────────────────── #
   api:
@@ -41,6 +42,7 @@ services:
     depends_on:
       - redis
       - backend
+    init: true
 
   # ───────────────────────── Celery-worker ────────────────────────────────── #
   worker:
@@ -57,10 +59,16 @@ services:
       # Append-läge så vi lägger till nya tiles
       AI_MOUNT_MODE: "append"
 
-      # Stabil arbetsbranch + auto-push. PR skapas manuellt tills vidare.
+      # Fast arbetsbranch + push/PR-styrning (PR kan vara av)
       AI_WORK_BRANCH: ai/figma-work
       AUTO_PUSH: "1"
       AUTO_PR: "0"
+
+      # Git-identitet för commits i containern
+      GIT_AUTHOR_NAME: AI Codegen
+      GIT_AUTHOR_EMAIL: ai-codegen@local
+      GIT_COMMITTER_NAME: AI Codegen
+      GIT_COMMITTER_EMAIL: ai-codegen@local
 
       TZ: Europe/Stockholm
     volumes:
@@ -70,6 +78,7 @@ services:
     depends_on:
       - redis
       - backend
+    init: true
 
   # ───────────── VS Code Dev Container (Node + TS + PNPM/NPM) ─────────────── #
   devcontainer:
@@ -85,6 +94,7 @@ services:
       - TZ=Europe/Stockholm
     depends_on:
       - api
+    init: true
 
 # ───────────────────────────── Volymer ───────────────────────────────────── #
 volumes:

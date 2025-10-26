@@ -5,9 +5,10 @@ Celery-worker: Figma-node → IR → deterministisk TSX → (AST-mount + file) �
 Uppdateringar i denna version:
 - Alltid arbete på fast arbetsbranch AI_WORK_BRANCH (default: ai/figma-work). Ingen per-node-branch.
 - Start: fetch → checkout -B till exakt remote-tip om den finns, annars BASE_BRANCH → första push.
-- Push: ingen rebase i worker. Vid non-fast-forward görs fetch + reset --hard origin/<branch> → applicera igen → push.
+- Push: ingen rebase i worker. Vid non-fast-forward görs fetch + reset --hard origin/<branch> → applicera igen → push. NYTT: loopad retry med backoff.
 - Append-läge: AI_MOUNT_MODE=append lämnar mount-regionen orörd (ingen clear), replace rensar.
 - Idempotens: hoppa injektion om samma tile redan finns.
+- Branch-lås: seriell åtkomst till AI_WORK_BRANCH via Redis-lås runt apply+commit+push.
 - Övriga förbättringar från tidigare version kvarstår (bg/ikon/typografi/dims validering, autofixer m.m.).
 """
 
@@ -23,8 +24,10 @@ from typing import Any, Dict, List, Tuple, cast
 import functools
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 
 import requests
+import redis  # NY: för branch-lås
 from celery import Celery
 from dotenv import load_dotenv
 from fastapi import HTTPException
@@ -1906,25 +1909,100 @@ def _compare_figma_vs_ir(figma_doc: Dict[str, Any], ir_visible: Dict[str, Any], 
     }
 
 # ─────────────────────────────────────────────────────────
-# Push-hjälpare utan rebase + retry via hard reset
+# Branch-lås för seriell push (NY)
 # ─────────────────────────────────────────────────────────
 
-def _push_ff_with_retry(repo, work_branch: str, apply_again_fn) -> None:
+def _redis_client():
+    try:
+        return redis.Redis.from_url(BROKER_URL)
+    except Exception as e:
+        _safe_print("redis.init.error", {"err": str(e), "url": BROKER_URL})
+        raise
+
+@contextmanager
+def branch_lock(name: str, ttl: int = 180):
+    """
+    Enkel distribuerad låsning per branch. Blockerar tills lås erhålls.
+    """
+    r = _redis_client()
+    key = f"lock:git:{name}"
+    acquired = False
+    try:
+        while not r.set(key, "1", nx=True, ex=ttl):
+            time.sleep(0.5)
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            try:
+                r.delete(key)
+            except Exception as e:
+                _safe_print("redis.unlock.error", {"err": str(e), "key": key})
+
+# ─────────────────────────────────────────────────────────
+# Push-hjälpare utan rebase + robust retry (NY)
+# ─────────────────────────────────────────────────────────
+
+def _push_ff_with_retry(repo, work_branch: str, apply_again_fn, tries: int = 5, sleep_max: int = 5) -> None:
+    """
+    Försök pusha fast-forward. Vid non-ff:
+      fetch --all --prune → reset --hard till origin/<work_branch> om finns annars origin/<BASE_BRANCH>
+      → applicera igen → backoff → försök igen.
+    Avbryt på icke-retriabla fel.
+    """
     _ensure_git_identity(repo)
     origin = repo.remotes.origin
-    try:
-        repo.git.push("--set-upstream", "origin", work_branch)
-        return
-    except GitCommandError as e:
-        msg = (e.stderr or e.stdout or str(e))
-        if "non-fast-forward" not in msg:
-            raise HTTPException(500, f"Git push error: {e.stderr or e}")
-    # Remote uppdaterad: resync och applicera igen
-    origin.fetch(work_branch)
-    repo.git.reset("--hard", f"origin/{work_branch}")
-    _safe_print("git.reset", {"branch": work_branch, "to": f"origin/{work_branch}"})
-    apply_again_fn()
-    repo.git.push("--set-upstream", "origin", work_branch)
+
+    for i in range(tries):
+        try:
+            repo.git.push("--set-upstream", "origin", work_branch)
+            _safe_print("git.push.ok", {"try": i + 1})
+            return
+        except GitCommandError as e:
+            msg = ((e.stderr or "") + "\n" + (e.stdout or "")).strip()
+            low = msg.lower()
+            retriable = any(
+                k in low
+                for k in [
+                    "non-fast-forward",
+                    "fetch first",
+                    "updates were rejected",
+                    "tip of your current branch is behind",
+                    "! [rejected]",
+                ]
+            )
+            if not retriable:
+                raise HTTPException(500, f"Git push error: {msg or e}")
+
+            _safe_print("git.push.retry", {"try": i + 1, "reason": "non-ff", "msg": msg[:300]})
+
+        # Synca mot remote och reapplicera
+        try:
+            origin.fetch("--all", "--prune")
+        except Exception:
+            origin.fetch()
+
+        reset_target = None
+        for ref in (f"origin/{work_branch}", f"origin/{BASE_BRANCH}"):
+            try:
+                repo.git.rev_parse("--verify", f"refs/remotes/{ref}")
+                reset_target = ref
+                break
+            except GitCommandError:
+                pass
+
+        if reset_target:
+            repo.git.reset("--hard", reset_target)
+            _safe_print("git.reset", {"branch": work_branch, "to": reset_target})
+        else:
+            _safe_print("git.reset.skip", {"branch": work_branch, "reason": "no remote ref found"})
+
+        apply_again_fn()
+
+        # Exponentiell backoff
+        time.sleep(min(2 ** i, sleep_max))
+
+    raise HTTPException(500, "Push misslyckades efter flera försök")
 
 # ─────────────────────────────────────────────────────────
 # Celery-task
@@ -1989,22 +2067,23 @@ def integrate_figma_node(
     tmp_root = Path(tmp_dir)
     _safe_print("repo.clone", {"root": tmp_dir})
 
-    # NY: arbeta på fast arbetsbranch utan rebase: basera på exakt remote-tip om den finns
+    # NY: arbeta på fast arbetsbranch utan init-push
     work_branch = AI_WORK_BRANCH
     origin = repo.remotes.origin
     origin.fetch()
-    remote_heads = {r.remote_head for r in origin.refs}
+    # Finns remote-branch?
     try:
-        if work_branch in remote_heads:
+        repo.git.rev_parse("--verify", f"origin/{work_branch}")
+        exists_remote = True
+    except GitCommandError:
+        exists_remote = False
+    try:
+        if exists_remote:
             repo.git.checkout("-B", work_branch, f"origin/{work_branch}")
             mode = "from-remote"
         else:
             repo.git.checkout("-B", work_branch, BASE_BRANCH)
             mode = "from-base"
-            try:
-                repo.git.push("--set-upstream", "origin", work_branch)
-            except GitCommandError as e:
-                raise HTTPException(500, f"Git push error vid branch-init: {e.stderr or e}")
     except GitCommandError as e:
         raise HTTPException(500, f"Git checkout error: {e.stderr or e}")
     _safe_print("git.branch", {"name": work_branch, "mode": mode})
@@ -2249,11 +2328,13 @@ def integrate_figma_node(
         repo.index.commit(commit_msg)
         _safe_print("git.commit", {"msg": commit_msg})
 
-    # Första appliceringen
-    _apply_and_commit()
+    # ── Kritisk sektion: serialisera apply+push med branch-lås ──
+    with branch_lock(AI_WORK_BRANCH, ttl=180):
+        # Första appliceringen i den lokala klonen
+        _apply_and_commit()
 
-    # Push utan rebase. Vid non-ff: reset till origin och applicera igen → push.
-    _push_ff_with_retry(repo, work_branch, _apply_and_commit)
+        # Push utan rebase. Vid non-ff: reset till origin och applicera igen → push. Robust retry.
+        _push_ff_with_retry(repo, work_branch, _apply_and_commit)
 
     # Valfri PR
     if AUTO_PR:
