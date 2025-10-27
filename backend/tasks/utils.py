@@ -35,7 +35,7 @@ if not (GH_TOKEN and TARGET_REPO):
         "för att kodgenererings-pipen ska fungera."
     )
 
-REMOTE_URL = f"https://{GH_TOKEN}:x-oauth-basic@github.com/{TARGET_REPO}.git"
+REMOTE_URL = f"https://x-access-token:{GH_TOKEN}@github.com/{TARGET_REPO}.git"
 
 
 def unique_branch(node_id: str) -> str:

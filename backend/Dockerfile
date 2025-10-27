@@ -8,30 +8,31 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# OS deps + Node.js 20 + pnpm (corepack) + tsx
+# OS-deps: git, ps, curl, certs + Node 20 + tsx
 RUN apt-get update -y \
-    && apt-get install -y --no-install-recommends git build-essential curl ca-certificates \
+    && apt-get install -y --no-install-recommends git build-essential procps curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get update -y \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
-# enable pnpm and pin version
+
+# pnpm (valfritt) + tsx/ts för injektorn
 RUN corepack enable && corepack prepare pnpm@9.6.0 --activate
-# loader för AST-injektionen
 RUN npm i -g tsx typescript
 
-# Python venv
+# Venv
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 
-# Python deps
-COPY requirements.txt ./requirements.txt
-RUN pip install -U pip && pip install -r requirements.txt
+# Python-deps
+COPY requirements.txt /app/requirements.txt
+RUN pip install -U pip && pip install -r /app/requirements.txt
 
-# App-kod
+# App-kod (bygg-kontekst är ./backend)
 COPY . /app/backend
 
-# Python import path
+# PYTHONPATH så "backend.*" importeras från /app/backend
 ENV PYTHONPATH="/app:${PYTHONPATH}"
 WORKDIR /app
