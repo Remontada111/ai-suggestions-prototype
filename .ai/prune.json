@@ -1,0 +1,8 @@
+{
+  "remove": [
+    "frontendplay/src/components/ai/Menu-d96dc2.tsx",
+    "frontendplay/src/components/ai/SomeOldTile-abc123.tsx",
+    "frontendplay/src/assets/icons/menu-d96dc2.svg",
+    "frontendplay/src/types/svg.d.ts"
+  ]
+}
