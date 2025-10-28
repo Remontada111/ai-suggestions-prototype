@@ -5,22 +5,23 @@ Celery-worker: Figma-node → IR → deterministisk TSX → (AST-mount + file) �
 Uppdateringar i denna version:
 - Alltid arbete på fast arbetsbranch AI_WORK_BRANCH (default: ai/figma-work). Ingen per-node-branch.
 - Start: fetch → checkout -B till exakt remote-tip om den finns, annars BASE_BRANCH → första push.
-- Push: ingen rebase i worker. Vid non-fast-forward görs fetch + reset --hard origin/<branch> → applicera igen → push. NYTT: loopad retry med backoff.
+- Push: ingen rebase i worker. Vid non-fast-forward görs explicit ls-remote + fetch av exakt ref + reset --hard origin/<AI_WORK_BRANCH> om den finns, annars origin/<BASE_BRANCH> → applicera igen → push. Loopad retry med backoff.
 - Append-läge: AI_MOUNT_MODE=append lämnar mount-regionen orörd (ingen clear), replace rensar.
 - Idempotens: hoppa injektion om samma tile redan finns.
 - Branch-lås: seriell åtkomst till AI_WORK_BRANCH via Redis-lås runt apply+commit+push.
-- Övriga förbättringar från tidigare version kvarstår (bg/ikon/typografi/dims validering, autofixer m.m.).
+- Bas-prune och GC: läser raderingslista från origin/<BASE_BRANCH>:.ai/prune.json, tar bort motsv. imports/tiles/filer, samt städar orefererade AI-komponenter (och ev. oanvända SVG).
 """
 
+# + högst upp
+import os
+import threading
 import hashlib
 import json
-import os
 import re
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, cast
-
 import functools
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,6 +31,7 @@ import requests
 import redis  # NY: för branch-lås
 from celery import Celery
 from dotenv import load_dotenv
+from kombu import Queue
 from fastapi import HTTPException
 from git.exc import GitCommandError  # NY: för branch/push-fel
 
@@ -83,6 +85,10 @@ AUTO_PR = os.getenv("AUTO_PR", "0").lower() in ("1", "true", "yes")
 
 CODEGEN_TIMING = os.getenv("CODEGEN_TIMING", "0").lower() in ("1", "true", "yes")
 
+# NY: Syncpolicy och ikon-GC
+AI_SYNC_POLICY = os.getenv("AI_SYNC_POLICY", "branch").strip()  # branch | base_mirror
+ICON_GC = os.getenv("ICON_GC", "0").lower() in ("1", "true", "yes")
+
 # Endast önskade loggar
 LOG_FIGMA_JSON = os.getenv("LOG_FIGMA_JSON", "0").lower() in ("1", "true", "yes")
 LOG_FIGMA_IR = os.getenv("LOG_FIGMA_IR", "0").lower() in ("1", "true", "yes")
@@ -102,9 +108,20 @@ BASE_BRANCH = os.getenv("BASE_BRANCH", "main").strip()
 # ─────────────────────────────────────────────────────────
 
 app = Celery("codegen", broker=BROKER_URL, backend=RESULT_BACKEND)
-app.conf.broker_connection_retry_on_startup = True
-app.conf.broker_connection_timeout = 3
-app.conf.redis_socket_timeout = 3
+app.conf.update(
+    broker_connection_retry_on_startup=True,
+    broker_connection_timeout=3,
+    redis_socket_timeout=3,
+    # Viktigt: standardkö ska vara "write"
+    task_default_queue="write",
+    task_queues=(Queue("write", routing_key="write"),),
+    task_routes={
+        "backend.tasks.codegen.integrate_figma_node": {
+            "queue": "write",
+            "routing_key": "write",
+        },
+    },
+)
 celery_app: Celery = app
 
 # ─────────────────────────────────────────────────────────
@@ -128,17 +145,25 @@ def _detect_pm(workdir: Path) -> str:
         if pkg.exists():
             data = json.loads(pkg.read_text(encoding="utf-8"))
             pm_field = str(data.get("packageManager") or "").lower()
-            if     pm_field.startswith("npm@"):  return "npm"
-            if     pm_field.startswith("pnpm@"): return "pnpm"
-            if     pm_field.startswith("yarn@"): return "yarn"
-            if     pm_field.startswith("bun@"):  return "bun"
+            if pm_field.startswith("npm@"):
+                return "npm"
+            if pm_field.startswith("pnpm@"):
+                return "pnpm"
+            if pm_field.startswith("yarn@"):
+                return "yarn"
+            if pm_field.startswith("bun@"):
+                return "bun"
     except Exception:
         pass
 
-    if   (workdir / "package-lock.json").exists(): return "npm"
-    if   (workdir / "pnpm-lock.yaml").exists():    return "pnpm"
-    if   (workdir / "yarn.lock").exists():         return "yarn"
-    if   (workdir / "bun.lockb").exists():         return "bun"
+    if (workdir / "package-lock.json").exists():
+        return "npm"
+    if (workdir / "pnpm-lock.yaml").exists():
+        return "pnpm"
+    if (workdir / "yarn.lock").exists():
+        return "yarn"
+    if (workdir / "bun.lockb").exists():
+        return "bun"
     return "npm"
 
 
@@ -417,20 +442,25 @@ def _fetch_svgs(file_key: str, ids: List[str]) -> Dict[str, str]:
         resp.raise_for_status()
         return nid, resp.text
 
+    futures: List[Any] = []
+    fut2nid: Dict[Any, str] = {}
     with requests.Session() as s, ThreadPoolExecutor(max_workers=8) as ex:
-        futs = []
         for nid, presigned in images.items():
             if presigned:
-                futs.append(ex.submit(functools.partial(_fetch_one, s, str(nid), presigned)))
-        for f in as_completed(futs):
+                fut = ex.submit(functools.partial(_fetch_one, s, str(nid), presigned))
+                futures.append(fut)
+                fut2nid[fut] = str(nid)
+
+        for fut in as_completed(futures):
+            nid = fut2nid.get(fut)  # Optional[str]
+            if nid is None:
+                continue
             try:
-                nid, svg_text = f.result()
+                _, svg_text = fut.result()
                 if svg_text:
                     out[nid] = svg_text
             except Exception as e:
-                # Ignorera enskilda fel
                 _safe_print("svg.fetch.warn", {"id": nid, "err": str(e)})
-                pass
 
     return out
 
@@ -886,6 +916,118 @@ def _tile_exists_spec_or_ident(src: str, import_path: str, import_name: str) -> 
     )
 
 # ─────────────────────────────────────────────────────────
+# SYNC/PRUNE-hjälpare (NY)
+# ─────────────────────────────────────────────────────────
+
+_AI_IMPORT_SPEC_RE = re.compile(r'^\s*import\s+[^;]*\s+from\s+[\'"](?P<spec>[^\'"]+)[\'"]\s*;?', re.M)
+
+def _is_ai_spec(spec: str) -> bool:
+    s = (spec or "").replace("\\", "/")
+    return ("/components/ai/" in s) or s.startswith("./components/ai/") or s.startswith("../components/ai/")
+
+def _ai_specs_from_code(code: str) -> set[str]:
+    out: set[str] = set()
+    for m in _AI_IMPORT_SPEC_RE.finditer(code or ""):
+        spec = (m.group("spec") or "").replace("\\", "/")
+        if _is_ai_spec(spec):
+            out.add(spec)
+    return out
+
+def _prune_ai_imports_by_abs_paths(main_tsx: Path, remove_abs: set[Path]) -> None:
+    src = main_tsx.read_text(encoding="utf-8")
+    out, last, changed = [], 0, False
+    imp_re = re.compile(r'(^|\r?\n)([ \t]*)import\s+(?:([^;]*?)\s+from\s+[\'"]([^\'"]+)[\'"]|[\'"]([^\'"]+)[\'"])\s*;?', re.M)
+    for m in imp_re.finditer(src):
+        out.append(src[last:m.start()])
+        spec = (m.group(4) or m.group(5) or "").replace("\\", "/")
+        keep = True
+        if _is_ai_spec(spec):
+            tgt = _resolve_ts_module(main_tsx, spec)
+            if tgt and tgt.resolve() in remove_abs:
+                keep = False; changed = True
+        if keep:
+            out.append(m.group(0))
+        last = m.end()
+    out.append(src[last:])
+    if changed:
+        main_tsx.write_text(_normalize_mount_markers("".join(out)), encoding="utf-8")
+
+def _read_prune_list(repo, rel: str = ".ai/prune.json") -> list[str]:
+    try:
+        raw = repo.git.show(f"origin/{BASE_BRANCH}:{rel}")
+    except Exception:
+        return []
+    try:
+        j = json.loads(raw)
+        arr = j.get("remove") or []
+        return [str(p).replace("\\", "/").strip() for p in arr if isinstance(p, str) and p.strip()]
+    except Exception:
+        return []
+
+def _unlink_many(repo_root: Path, rels: list[str]) -> list[str]:
+    deleted = []
+    for rel in rels:
+        try:
+            p = _safe_join(repo_root, rel)
+            if p.exists():
+                p.unlink()
+                deleted.append(rel)
+        except Exception:
+            pass
+    return deleted
+
+def _prune_unreferenced_ai_tsx(repo_root: Path, main_rel: str, target_dir: str, keep_extra: set[str] | None = None) -> None:
+    keep_extra = keep_extra or set()
+    main_tsx = (repo_root / main_rel).resolve()
+    if not main_tsx.exists():
+        return
+    code = main_tsx.read_text(encoding="utf-8")
+    specs = _ai_specs_from_code(code)
+    keep_paths: set[Path] = set()
+    for s in specs:
+        p = _resolve_ts_module(main_tsx, s)
+        if p and p.suffix in (".tsx", ".ts", ".jsx", ".js"):
+            keep_paths.add(p.resolve())
+    for k in list(keep_extra):
+        try:
+            keep_paths.add((repo_root / k).resolve())
+        except Exception:
+            pass
+    td = (repo_root / target_dir).resolve()
+    if not td.exists():
+        return
+    for p in td.rglob("*.tsx"):
+        try:
+            if p.resolve() not in keep_paths:
+                p.unlink()
+        except Exception:
+            pass
+
+def _gc_unused_svgs(repo_root: Path, icon_dir: str) -> list[str]:
+    base = (repo_root / icon_dir).resolve()
+    if not base.exists():
+        return []
+    hay = []
+    for ext in (".tsx", ".ts", ".jsx", ".js", ".css", ".scss", ".md"):
+        for f in repo_root.rglob(f"*{ext}"):
+            try:
+                hay.append(f.read_text(encoding="utf-8", errors="ignore"))
+            except Exception:
+                pass
+    big = "\n".join(hay)
+    deleted = []
+    for svg in base.rglob("*.svg"):
+        if svg.name not in big:
+            try:
+                svg.unlink()
+                deleted.append(str(svg.relative_to(repo_root)))
+            except Exception:
+                pass
+    if deleted:
+        _safe_print("icons.gc", {"count": len(deleted)})
+    return deleted
+
+# ─────────────────────────────────────────────────────────
 # Typecheck/lint/visual
 # ─────────────────────────────────────────────────────────
 
@@ -930,7 +1072,7 @@ _TRIPLE_BACKTICKS = re.compile(r"```")
 _CLS_RE = re.compile(r'className\s*=\s*(?P<q>"|\')(?P<val>.*?)(?P=q)', re.DOTALL)
 
 _TEXT_NODE_ANY = re.compile(
-    r">\s*(?:\{\s*(?:`([^`]+)`|\"([^\"]+)\"|'([^']+)')\s*\}|([^<>{}][^<>{}]*))\s*<",
+    r">\s*(?:\{\s*(?:`([^`]+)`|\"([^\"]+)\"|'([^']+)' )\s*\}|([^<>{}][^<>{}]*))\s*<",
     re.DOTALL,
 )
 _TEXT_NODE_ANY_BETWEEN = _TEXT_NODE_ANY
@@ -1046,7 +1188,7 @@ _ATTR_PATTERNS = [
     r'placeholder\s*=\s*"([^"]+)"',
     r"placeholder\s*=\s*'([^']+)'",
     r'placeholder\s*=\s*\{\s*"([^"]+)"\s*\}',
-    r"placeholder\s*=\s*\{\s*'([^']+)" r"'\s*\}",
+    r"placeholder\s*=\s*\{\s*'([^']+)'",
     r'aria-label\s*=\s*"([^"]+)"',
     r"aria-label\s*=\s*'([^']+)'",
     r'aria-label\s*=\s*\{\s*"([^"]+)"\s*\}',
@@ -1909,7 +2051,7 @@ def _compare_figma_vs_ir(figma_doc: Dict[str, Any], ir_visible: Dict[str, Any], 
     }
 
 # ─────────────────────────────────────────────────────────
-# Branch-lås för seriell push (NY)
+# Branch-lås för seriell push: token + heartbeat (NY)
 # ─────────────────────────────────────────────────────────
 
 def _redis_client():
@@ -1919,34 +2061,63 @@ def _redis_client():
         _safe_print("redis.init.error", {"err": str(e), "url": BROKER_URL})
         raise
 
+
+
 @contextmanager
-def branch_lock(name: str, ttl: int = 180):
+def branch_lock(name: str, ttl: int = 300, refresh: int = 60):
     """
-    Enkel distribuerad låsning per branch. Blockerar tills lås erhålls.
+    Distribuerat lås med ägartoken + heartbeat-förlängning.
+    Endast ägare får förnya/ta bort låset.
     """
     r = _redis_client()
     key = f"lock:git:{name}"
-    acquired = False
+    token = os.urandom(8).hex()
+
+    while not r.set(key, token, nx=True, ex=ttl):
+        time.sleep(0.5)
+
+    stop = False
+    def renew():
+        lua = """
+        if redis.call('get', KEYS[1]) == ARGV[1]
+        then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end
+        """
+        while not stop:
+            try:
+                r.eval(lua, 1, key, token, str(int(ttl * 1000)))
+            except Exception:
+                pass
+            time.sleep(refresh)
+
+    t = threading.Thread(target=renew, daemon=True); t.start()
     try:
-        while not r.set(key, "1", nx=True, ex=ttl):
-            time.sleep(0.5)
-        acquired = True
         yield
     finally:
-        if acquired:
-            try:
-                r.delete(key)
-            except Exception as e:
-                _safe_print("redis.unlock.error", {"err": str(e), "key": key})
+        # Avsluta heartbeat-tråd och släpp lås om vi fortfarande äger
+        stop = True
+        try:
+            t.join(timeout=1)
+        except Exception:
+            pass
+        lua_del = """
+        if redis.call('get', KEYS[1]) == ARGV[1]
+        then return redis.call('del', KEYS[1]) else return 0 end
+        """
+        try:
+            r.eval(lua_del, 1, key, token)
+        except Exception:
+            pass
 
 # ─────────────────────────────────────────────────────────
-# Push-hjälpare utan rebase + robust retry (NY)
+# Push-hjälpare utan rebase + robust retry (UPPDATERAD)
 # ─────────────────────────────────────────────────────────
 
 def _push_ff_with_retry(repo, work_branch: str, apply_again_fn, tries: int = 5, sleep_max: int = 5) -> None:
     """
     Försök pusha fast-forward. Vid non-ff:
-      fetch --all --prune → reset --hard till origin/<work_branch> om finns annars origin/<BASE_BRANCH>
+      ls-remote för existens → explicit fetch av exakt ref → deterministisk reset:
+        - om origin/<work_branch> finns: reset --hard origin/<work_branch>
+        - annars: reset --hard origin/<BASE_BRANCH>
       → applicera igen → backoff → försök igen.
     Avbryt på icke-retriabla fel.
     """
@@ -1976,26 +2147,25 @@ def _push_ff_with_retry(repo, work_branch: str, apply_again_fn, tries: int = 5, 
 
             _safe_print("git.push.retry", {"try": i + 1, "reason": "non-ff", "msg": msg[:300]})
 
-        # Synca mot remote och reapplicera
+        # Synca mot fjärren och reapplicera – refspec-oberoende
         try:
-            origin.fetch("--all", "--prune")
-        except Exception:
-            origin.fetch()
+            has_remote_work = bool(repo.git.ls_remote("--heads", "origin", work_branch).strip())
+        except GitCommandError:
+            has_remote_work = False
 
-        reset_target = None
-        for ref in (f"origin/{work_branch}", f"origin/{BASE_BRANCH}"):
+        if has_remote_work:
+            # Hämta exakt arbetsgrenen och resetta till dess tip
             try:
-                repo.git.rev_parse("--verify", f"refs/remotes/{ref}")
-                reset_target = ref
-                break
-            except GitCommandError:
+                origin.fetch(f"+refs/heads/{work_branch}:refs/remotes/origin/{work_branch}", "--prune")
+            except Exception:
                 pass
-
-        if reset_target:
-            repo.git.reset("--hard", reset_target)
-            _safe_print("git.reset", {"branch": work_branch, "to": reset_target})
+            repo.git.reset("--hard", f"origin/{work_branch}")
+            _safe_print("git.reset", {"branch": work_branch, "to": f"origin/{work_branch}"})
         else:
-            _safe_print("git.reset.skip", {"branch": work_branch, "reason": "no remote ref found"})
+            # Grenen finns inte på fjärren (första gången) → bygg från bas
+            origin.fetch(f"+refs/heads/{BASE_BRANCH}:refs/remotes/origin/{BASE_BRANCH}", "--prune")
+            repo.git.reset("--hard", f"origin/{BASE_BRANCH}")
+            _safe_print("git.reset", {"branch": work_branch, "to": f"origin/{BASE_BRANCH}"})
 
         apply_again_fn()
 
@@ -2008,7 +2178,7 @@ def _push_ff_with_retry(repo, work_branch: str, apply_again_fn, tries: int = 5, 
 # Celery-task
 # ─────────────────────────────────────────────────────────
 
-@app.task(name="backend.tasks.codegen.integrate_figma_node")
+@app.task(name="backend.tasks.codegen.integrate_figma_node", queue="write")
 def integrate_figma_node(
     *, file_key: str, node_id: str, placement: Dict[str, Any] | None = None
 ) -> Dict[str, Any]:
@@ -2067,23 +2237,37 @@ def integrate_figma_node(
     tmp_root = Path(tmp_dir)
     _safe_print("repo.clone", {"root": tmp_dir})
 
-    # NY: arbeta på fast arbetsbranch utan init-push
+    # Start/checkout: fjärrsanning via ls-remote, explicit fetch av exakta refs, checkout korrekt bas
     work_branch = AI_WORK_BRANCH
     origin = repo.remotes.origin
-    origin.fetch()
-    # Finns remote-branch?
+
+    # 1) Kolla mot fjärren om arbetsgrenen finns (sanningen från GitHub)
     try:
-        repo.git.rev_parse("--verify", f"origin/{work_branch}")
-        exists_remote = True
+        has_remote_work = bool(repo.git.ls_remote("--heads", "origin", work_branch).strip())
     except GitCommandError:
-        exists_remote = False
+        has_remote_work = False
+
+    # 2) Hämta explicit de ref:ar vi behöver, oavsett refspec i klonen
+    try:
+        origin.fetch(f"+refs/heads/{work_branch}:refs/remotes/origin/{work_branch}", prune=True)
+    except Exception:
+        pass
+        origin.fetch(f"+refs/heads/{BASE_BRANCH}:refs/remotes/origin/{BASE_BRANCH}", prune=True)
+
+    # 3) Checka ut korrekt bas
+    exists_remote = has_remote_work
     try:
         if exists_remote:
             repo.git.checkout("-B", work_branch, f"origin/{work_branch}")
             mode = "from-remote"
         else:
-            repo.git.checkout("-B", work_branch, BASE_BRANCH)
-            mode = "from-base"
+            try:
+                repo.git.rev_parse("--verify", f"refs/remotes/origin/{BASE_BRANCH}")
+                repo.git.checkout("-B", work_branch, f"origin/{BASE_BRANCH}")
+                mode = "from-base-remote"
+            except GitCommandError:
+                repo.git.checkout("-B", work_branch, BASE_BRANCH)
+                mode = "from-base-local"
     except GitCommandError as e:
         raise HTTPException(500, f"Git checkout error: {e.stderr or e}")
     _safe_print("git.branch", {"name": work_branch, "mode": mode})
@@ -2215,6 +2399,34 @@ def integrate_figma_node(
 
     # ── Applicering + commit som funktion för retry-scenariot ──
     def _apply_and_commit() -> None:
+        # Preemptiv synk mot fjärren om work-branch finns och vi ligger bakom
+        try:
+            has_remote_work = bool(repo.git.ls_remote("--heads", "origin", work_branch).strip())
+        except GitCommandError:
+            has_remote_work = False
+        if has_remote_work:
+            try:
+                origin.fetch(f"+refs/heads/{work_branch}:refs/remotes/origin/{work_branch}", prune=True)
+            except Exception:
+                pass
+            try:
+                diff_counts = repo.git.rev_list("--left-right", "--count", f"{work_branch}...origin/{work_branch}").strip()
+                left, right = [int(x) for x in diff_counts.split()]
+                if right > 0:
+                    repo.git.reset("--hard", f"origin/{work_branch}")
+                    _safe_print("git.reset", {"branch": work_branch, "to": f"origin/{work_branch}", "pre_commit_guard": True})
+            except Exception as _:
+                pass
+
+        # NY: Engångs-reset från BASE om AI_SYNC_POLICY=base_mirror
+        if AI_SYNC_POLICY == "base_mirror":
+            try:
+                origin.fetch(f"+refs/heads/{BASE_BRANCH}:refs/remotes/origin/{BASE_BRANCH}", prune=True)
+            except Exception:
+                pass
+            repo.git.checkout("-B", work_branch, f"origin/{BASE_BRANCH}")
+            _safe_print("ai.reset", {"from": f"origin/{BASE_BRANCH}"})
+
         # Skriv komponentfil
         target_path.write_text(cleaned, encoding="utf-8")
         _format_tsx(tmp_root, target_path)
@@ -2225,6 +2437,18 @@ def integrate_figma_node(
         if AI_MOUNT_MODE == "replace":
             _clear_mount_region(main_abs)
         _snapshot_main(main_abs, "before_inject")
+
+        # Bas-prune: respektera raderingslista från origin/<BASE_BRANCH>:.ai/prune.json
+        try:
+            to_remove_rel = _read_prune_list(repo)
+        except Exception:
+            to_remove_rel = []
+        to_remove_abs = {(_safe_join(tmp_root, r)).resolve() for r in to_remove_rel}
+        if to_remove_abs:
+            _prune_ai_imports_by_abs_paths(main_abs, to_remove_abs)
+            _prune_ghosts_in_main(tmp_root, main_rel)
+        if to_remove_rel:
+            _unlink_many(tmp_root, to_remove_rel)
 
         # Före injektion – extra logg
         try:
@@ -2311,6 +2535,12 @@ def integrate_figma_node(
         # Ghost-preflight efter injektion
         _snapshot_main(main_abs, "before_prune")
         _prune_ghosts_in_main(tmp_root, main_rel)
+
+        # NY: städa orefererade AI-filer och ev. oanvända SVG före typecheck
+        _prune_unreferenced_ai_tsx(tmp_root, main_rel, TARGET_COMPONENT_DIR, keep_extra={returned_primary_path})
+        if ICON_GC:
+            _gc_unused_svgs(tmp_root, ICON_DIR)
+
         _snapshot_main(main_abs, "after_prune")
 
         _typecheck_and_lint(tmp_root, [returned_primary_path])
@@ -2329,12 +2559,15 @@ def integrate_figma_node(
         _safe_print("git.commit", {"msg": commit_msg})
 
     # ── Kritisk sektion: serialisera apply+push med branch-lås ──
-    with branch_lock(AI_WORK_BRANCH, ttl=180):
+    LOCK_TTL = int(os.getenv("AI_WORK_BRANCH_LOCK_TTL", "300"))
+    with branch_lock(AI_WORK_BRANCH, ttl=LOCK_TTL):
         # Första appliceringen i den lokala klonen
         _apply_and_commit()
 
         # Push utan rebase. Vid non-ff: reset till origin och applicera igen → push. Robust retry.
-        _push_ff_with_retry(repo, work_branch, _apply_and_commit)
+        TRIES = int(os.getenv("AI_PUSH_TRIES", "8"))
+        SLEEP_MAX = int(os.getenv("AI_PUSH_SLEEP_MAX", "10"))
+        _push_ff_with_retry(repo, work_branch, _apply_and_commit, tries=TRIES, sleep_max=SLEEP_MAX)
 
     # Valfri PR
     if AUTO_PR:

@@ -55,7 +55,8 @@ services:
       # Viktigt: håll dessa relativa till repo-roten i mål-repot
       TARGET_COMPONENT_DIR: frontendplay/src/components/ai
       ALLOW_PATCH: frontendplay/src/main.tsx
-
+      AI_SYNC_POLICY: "branch"   # standard. Sätt "base_mirror" endast vid engångs-reset
+      ICON_GC: "1"   
       # Append-läge så vi lägger till nya tiles
       AI_MOUNT_MODE: "append"
 
