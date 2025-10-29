@@ -48,24 +48,28 @@ services:
   worker:
     image: ai-backend:latest
     command: >
-      python -m celery -A backend.tasks.codegen:celery_app worker -l info -I backend.tasks.analyze
+      sh -lc 'set -e;
+              install -d -m 700 /app/ssh;
+              install -D -m 600 /app/ssh/bot_key_src /app/ssh/bot_key;
+              # (valfritt) skapa tom known_hosts för tydlighet
+              : > /app/ssh/known_hosts;
+              exec /opt/venv/bin/python -m celery -A backend.tasks.codegen:celery_app worker
+              -l info --concurrency=1 --prefetch-multiplier=1 -Q write'
     env_file:
       - ./backend/.env
     environment:
-      # Viktigt: håll dessa relativa till repo-roten i mål-repot
       TARGET_COMPONENT_DIR: frontendplay/src/components/ai
       ALLOW_PATCH: frontendplay/src/main.tsx
-      AI_SYNC_POLICY: "branch"   # standard. Sätt "base_mirror" endast vid engångs-reset
-      ICON_GC: "1"   
-      # Append-läge så vi lägger till nya tiles
       AI_MOUNT_MODE: "append"
 
-      # Fast arbetsbranch + push/PR-styrning (PR kan vara av)
       AI_WORK_BRANCH: ai/figma-work
       AUTO_PUSH: "1"
       AUTO_PR: "0"
 
-      # Git-identitet för commits i containern
+      # Viktigt: använd SSH-URL och styr ssh-klienten till vår nyckel
+      GIT_REMOTE_URL: git@github.com:Remontada111/ai-suggestions-prototype.git
+      GIT_SSH_COMMAND: ssh -i /app/ssh/bot_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+
       GIT_AUTHOR_NAME: AI Codegen
       GIT_AUTHOR_EMAIL: ai-codegen@local
       GIT_COMMITTER_NAME: AI Codegen
@@ -73,13 +77,16 @@ services:
 
       TZ: Europe/Stockholm
     volumes:
-      - ./backend:/app/backend              # Python-koden
-      - ./:/workspace                       # Valfritt: lokal workspace om du behöver den
+      - ./backend:/app/backend
+      - ./:/workspace
+      - ./secrets/deploy_key:/app/ssh/bot_key_src:ro   # <-- PRIVAT DEPLOY-KEY MÅSTE FINNAS HÄR
     restart: unless-stopped
     depends_on:
       - redis
       - backend
     init: true
+
+
 
   # ───────────── VS Code Dev Container (Node + TS + PNPM/NPM) ─────────────── #
   devcontainer:
