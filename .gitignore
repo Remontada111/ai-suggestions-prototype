@@ -16,8 +16,7 @@ build/
 # IDE
 .vscode/
 .idea/
-
-# Logs & secrets
+secrets/
 *.log
 .env
 .env.*
