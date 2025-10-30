@@ -2121,6 +2121,8 @@ def _push_ff_with_retry(repo, work_branch: str, apply_again_fn, tries: int = 5, 
       → applicera igen → backoff → försök igen.
     Avbryt på icke-retriabla fel.
     """
+    _safe_print("git.remote.pre_push", {"origin": repo.remotes.origin.url, "branch": work_branch})
+
     _ensure_git_identity(repo)
     origin = repo.remotes.origin
 
