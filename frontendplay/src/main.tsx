@@ -1,7 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
-import Menufc7725 from './components/ai/Menu-fc7725';
+
 
 
 
@@ -31,15 +31,6 @@ function App() {
         }}
       >
         {/* AI-INJECT-MOUNT:BEGIN */}
-        <div id="__AI_MOUNT_GRID__" className="flex flex-wrap gap-4 items-start">
-        
-        <> </>
-        <> {/* AI-TILE:./components/ai/Menu-fc7725:BEGIN */}
-        <div className="relative w-[1280px] h-[800px] overflow-hidden rounded-md ring-1 ring-black/10 bg-white">
-        <Menufc7725 />
-        </div> {/* AI-TILE:./components/ai/Menu-fc7725:END */}</>
-        <> </>
-        <> </></div>
         {/* AI-INJECT-MOUNT:END */}</div>
     </div>
   );
