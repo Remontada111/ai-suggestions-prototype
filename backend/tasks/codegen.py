@@ -89,6 +89,10 @@ CODEGEN_TIMING = os.getenv("CODEGEN_TIMING", "0").lower() in ("1", "true", "yes"
 AI_SYNC_POLICY = os.getenv("AI_SYNC_POLICY", "branch").strip()  # branch | base_mirror
 ICON_GC = os.getenv("ICON_GC", "0").lower() in ("1", "true", "yes")
 
+# NY: Force-push och TSX-GC
+AI_FORCE_PUSH = os.getenv("AI_FORCE_PUSH", "0").lower() in ("1", "true", "yes")
+AI_TSX_GC = os.getenv("AI_TSX_GC", "0").lower() in ("1", "true", "yes")
+
 # Endast önskade loggar
 LOG_FIGMA_JSON = os.getenv("LOG_FIGMA_JSON", "0").lower() in ("1", "true", "yes")
 LOG_FIGMA_IR = os.getenv("LOG_FIGMA_IR", "0").lower() in ("1", "true", "yes")
@@ -1015,9 +1019,21 @@ def _gc_unused_svgs(repo_root: Path, icon_dir: str) -> list[str]:
             except Exception:
                 pass
     big = "\n".join(hay)
+
     deleted = []
     for svg in base.rglob("*.svg"):
-        if svg.name not in big:
+        name = svg.name
+        tail1 = f"/assets/icons/{name}"
+        tail2 = f"/src/assets/icons/{name}"
+        # matcha även ?url-varianten
+        used = (
+            (name in big) or
+            (tail1 in big) or
+            (tail2 in big) or
+            (f"{tail1}?url" in big) or
+            (f"{tail2}?url" in big)
+        )
+        if not used:
             try:
                 svg.unlink()
                 deleted.append(str(svg.relative_to(repo_root)))
@@ -2498,6 +2514,7 @@ def integrate_figma_node(
                 "scripts_ts": str(scripts_ts),
             })
 
+            mode_arg = "replace" if AI_MOUNT_MODE == "replace" else "append"
             cmd = [
                 "node", "--import", "tsx",
                 str(scripts_ts),
@@ -2505,9 +2522,9 @@ def integrate_figma_node(
                 str(mount["import_name"]),
                 str(mount["import_path"]),
                 str(jsx_tmp),
+                mode_arg,  # explicit läge som sista arg
             ]
-            if AI_MOUNT_MODE == "replace":
-                cmd.append("replace")
+            _safe_print("ai.inject.cmd.mode", {"mode": mode_arg})
 
             rc, out_text, err = _run(cmd, cwd=node_cwd)
             _safe_print("ai.inject.cmd", {"rc": rc, "out": out_text[:2000], "err": err[:2000]})
@@ -2538,8 +2555,9 @@ def integrate_figma_node(
         _snapshot_main(main_abs, "before_prune")
         _prune_ghosts_in_main(tmp_root, main_rel)
 
-        # NY: städa orefererade AI-filer och ev. oanvända SVG före typecheck
-        _prune_unreferenced_ai_tsx(tmp_root, main_rel, TARGET_COMPONENT_DIR, keep_extra={returned_primary_path})
+        # Valfri AI-TSX-GC och ikon-GC
+        if AI_TSX_GC:
+            _prune_unreferenced_ai_tsx(tmp_root, main_rel, TARGET_COMPONENT_DIR, keep_extra={returned_primary_path})
         if ICON_GC:
             _gc_unused_svgs(tmp_root, ICON_DIR)
 
@@ -2566,10 +2584,20 @@ def integrate_figma_node(
         # Första appliceringen i den lokala klonen
         _apply_and_commit()
 
-        # Push utan rebase. Vid non-ff: reset till origin och applicera igen → push. Robust retry.
+        # Push-strategi
         TRIES = int(os.getenv("AI_PUSH_TRIES", "8"))
         SLEEP_MAX = int(os.getenv("AI_PUSH_SLEEP_MAX", "10"))
-        _push_ff_with_retry(repo, work_branch, _apply_and_commit, tries=TRIES, sleep_max=SLEEP_MAX)
+
+        if AI_FORCE_PUSH:
+            try:
+                repo.git.push("--force-with-lease", "--set-upstream", "origin", work_branch)
+                _safe_print("git.push.ok", {"force": True})
+            except GitCommandError as e:
+                msg = ((e.stderr or "") + "\n" + (e.stdout or "")).strip()
+                raise HTTPException(500, f"Git push error (force): {msg or e}")
+        else:
+            _push_ff_with_retry(repo, work_branch, _apply_and_commit, tries=TRIES, sleep_max=SLEEP_MAX)
+            _safe_print("git.push.ok", {"force": False})
 
     # Valfri PR
     if AUTO_PR:

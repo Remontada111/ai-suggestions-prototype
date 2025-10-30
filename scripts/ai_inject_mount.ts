@@ -13,7 +13,7 @@
  * - Idempotent: re-running with same args does not duplicate tiles or imports.
  * - Backward compatible: dedupes old keys (e.g. AI-TILE:<Ident>) and stray tiles outside anchor.
  * - Safe pruning of dead relative imports and unused AI imports. Keeps asset side-effects (e.g. "./index.css").
- * - "replace" mode is authoritative regardless of env. "append" mode otherwise.
+ * - Append-only: "replace" requests are ignored to prevent destructive behavior.
  */
 
 import fs from "node:fs";
@@ -741,10 +741,17 @@ function main(): void {
   const [, , mainFileArg, importNameArg, importPathArg, jsxFileArg] = process.argv;
   const modeArg = (process.argv[6] || "").toLowerCase();
 
-  // "replace" mode is authoritative even if AI_INJECT_APPEND=1
+  // ────────────────────────────────────────────────────────────────
+  // APPEND-ONLY: ignore any "replace" requests to prevent destructive behavior
+  // ────────────────────────────────────────────────────────────────
   const REPLACE_REQUESTED = modeArg === "replace";
-  const APPEND = !REPLACE_REQUESTED;
-  const mode = REPLACE_REQUESTED ? "replace" : "append";
+  if (REPLACE_REQUESTED) {
+    console.warn(
+      "[ai_inject_mount] NOTE: 'replace' mode was requested but is DISABLED. Running in append-only mode.",
+    );
+  }
+  const APPEND = true;
+  const mode = "append";
 
   if (!mainFileArg || !importNameArg || !importPathArg || !jsxFileArg) {
     fail(
@@ -767,9 +774,9 @@ function main(): void {
     AI_INJECT_APPEND: process.env.AI_INJECT_APPEND ?? undefined,
     DEBUG,
   });
-  if (modeArg === "replace" && process.env.AI_INJECT_APPEND === "1") {
+  if (modeArg === "replace") {
     console.warn(
-      "[ai_inject_mount] NOTE: replace requested; ignoring AI_INJECT_APPEND=1 (authoritative replace)",
+      "[ai_inject_mount] NOTE: replace requested; ignored (append-only).",
     );
   }
 
@@ -813,6 +820,17 @@ function main(): void {
 
   const resolvedModule = resolveModuleFile(mainFile, importPath);
   console.log("[ai_inject_mount] resolved module", { resolvedModule });
+
+  // ────────────────────────────────────────────────────────────────
+  // HARD GUARD: refuse to inject if the target component file does not exist
+  // This prevents ghost imports/tiles when upstream file write failed.
+  // ────────────────────────────────────────────────────────────────
+  if (!resolvedModule) {
+    fail(
+      `Component module not found on disk for importPath='${importPath}'. ` +
+        `Append-only injector refuses to inject without a real file.`,
+    );
+  }
 
   if (resolvedModule && path.resolve(resolvedModule) === path.resolve(mainFile)) {
     fail("Refusing to import component from main.tsx");
@@ -861,44 +879,26 @@ function main(): void {
       anchor = res.anchor;
     }
 
-    if (APPEND) {
-      // Idempotent append: dedupe both canonical and legacy keys, then replace-or-append once.
-      nextCode = removeAllMarkedTiles(nextCode, anchor as AnchorPaired, keys);
-      const replaced = replaceMarkedTile(nextCode, anchor as AnchorPaired, keys, tileContent);
-      console.log(
-        "[ai_inject_mount] tile action",
-        replaced.replaced ? "update-existing" : "append-new",
-        { keys },
-      );
-      if (replaced.replaced) {
-        nextCode = replaced.code;
-      } else {
-        const insertAt = findGridInsertionIndex(nextCode, anchor as AnchorPaired);
-        nextCode =
-          nextCode.slice(0, insertAt) +
-          `\n${(anchor as AnchorPaired).indent}<> {/* ${keys[0]}:BEGIN */}${tileContent} {/* ${keys[0]}:END */}</>` +
-          nextCode.slice(insertAt);
-      }
-      // NEW: dedupe inside anchor to ensure single occurrence
-      nextCode = dedupeMarkedTilesInsideAnchor(nextCode, anchor as AnchorPaired, keys[0]);
+    // Append-only path (always)
+    // Idempotent append: dedupe both canonical and legacy keys, then replace-or-append once.
+    nextCode = removeAllMarkedTiles(nextCode, anchor as AnchorPaired, keys);
+    const replaced = replaceMarkedTile(nextCode, anchor as AnchorPaired, keys, tileContent);
+    console.log(
+      "[ai_inject_mount] tile action",
+      replaced.replaced ? "update-existing" : "append-new",
+      { keys },
+    );
+    if (replaced.replaced) {
+      nextCode = replaced.code;
     } else {
-      // replace-mode single tile
-      console.log("[ai_inject_mount] replace mode single tile", { key: keys[0] });
-      const open = `\n${(anchor as AnchorPaired).indent}<div id="__AI_MOUNT_GRID__" className="flex flex-wrap gap-4 items-start">`;
-      const close = `\n${(anchor as AnchorPaired).indent}</div>\n${(anchor as AnchorPaired).indent}`;
-      const single =
-        open +
-        `\n${(anchor as AnchorPaired).indent}<> {/* ${keys[0]}:BEGIN */}${tileContent} {/* ${keys[0]}:END */}</>` +
-        close;
+      const insertAt = findGridInsertionIndex(nextCode, anchor as AnchorPaired);
       nextCode =
-        nextCode.slice(0, (anchor as AnchorPaired).beginEnd) +
-        single +
-        nextCode.slice((anchor as AnchorPaired).endStart);
-      // In replace-mode keep only the chosen AI import
-      nextCode = pruneAiImportsExcept(nextCode, importPath);
-      // Safety no-op but consistent
-      nextCode = dedupeMarkedTilesInsideAnchor(nextCode, anchor as AnchorPaired, keys[0]);
+        nextCode.slice(0, insertAt) +
+        `\n${(anchor as AnchorPaired).indent}<> {/* ${keys[0]}:BEGIN */}${tileContent} {/* ${keys[0]}:END */}</>` +
+        nextCode.slice(insertAt);
     }
+    // Ensure single occurrence for this key
+    nextCode = dedupeMarkedTilesInsideAnchor(nextCode, anchor as AnchorPaired, keys[0]);
   } else {
     // Upgrade single anchor → paired with grid
     const before = nextCode.slice(0, (anchor as AnchorSingle).start);
@@ -909,7 +909,6 @@ function main(): void {
       `\n${(anchor as AnchorSingle).indent}<> {/* ${keys[0]}:BEGIN */}${tileContent} {/* ${keys[0]}:END */}</>` +
       `\n${(anchor as AnchorSingle).indent}</div>\n${(anchor as AnchorSingle).indent}{/* AI-INJECT-MOUNT:END */}`;
     nextCode = before + block + after;
-    if (!APPEND) nextCode = pruneAiImportsExcept(nextCode, importPath);
   }
 
   // Safety: purge stray marked tiles that might sit outside the anchor due to legacy state
