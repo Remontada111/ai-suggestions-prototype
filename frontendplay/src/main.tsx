@@ -11,6 +11,7 @@ import Menufc7725 from './components/ai/Menu-fc7725';
 
 
 
+
 const VP = { w: 1280, h: 800 };
 
 function App() {
@@ -38,6 +39,7 @@ function App() {
         <div className="relative w-[1280px] h-[800px] overflow-hidden rounded-md ring-1 ring-black/10 bg-white">
         <Menufc7725 />
         </div> {/* AI-TILE:./components/ai/Menu-fc7725:END */}</>
+        <> </>
         <> </>
         <> </></div>
         {/* AI-INJECT-MOUNT:END */}</div>
