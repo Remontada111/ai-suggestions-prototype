@@ -52,48 +52,23 @@ services:
               install -d -m 700 /app/ssh;
               install -D -m 600 /app/ssh/bot_key_src /app/ssh/bot_key;
               : > /app/ssh/known_hosts;
-              exec /opt/venv/bin/python -m celery -A backend.tasks.codegen:celery_app worker
-              -l info --concurrency=1 --prefetch-multiplier=1 -Q write'
+              exec /opt/venv/bin/celery -A backend.tasks.codegen:celery_app worker
+              -l info -P solo --concurrency=1 --prefetch-multiplier=1 -Q write'
     env_file:
       - ./backend/.env
     environment:
-      TARGET_COMPONENT_DIR: frontendplay/src/components/ai
-      ALLOW_PATCH: frontendplay/src/main.tsx
-
-      # Viktigt: kör alltid append och spegla från main
-      AI_MOUNT_MODE: "append"
-      AI_SYNC_POLICY: base_mirror
-
-      # Push-strategi (tillåt force-with-lease på work-branchen)
-      AI_FORCE_PUSH: "1"
-
-      # Filpolicies
-      AI_TSX_GC: "0"          # rensa inte AI-TSX automatiskt
-      ICON_GC: "1"            # rensa oanvända SVG
-      STRICT_ICONS: "true"    # kräver att genererade ikoner används exakt 1 gång
-
-      # Arbetsbranch och PR
-      AI_WORK_BRANCH: ai/figma-work
-      AUTO_PR: "0"
-
-      # Git över SSH + identitet
-      GIT_REMOTE_URL: git@github.com:Remontada111/ai-suggestions-prototype.git
-      GIT_SSH_COMMAND: ssh -i /app/ssh/bot_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-      GIT_AUTHOR_NAME: AI Codegen
-      GIT_AUTHOR_EMAIL: ai-codegen@local
-      GIT_COMMITTER_NAME: AI Codegen
-      GIT_COMMITTER_EMAIL: ai-codegen@local
-
       TZ: Europe/Stockholm
     volumes:
       - ./backend:/app/backend
       - ./:/workspace
-      - ./secrets/deploy_key:/app/ssh/bot_key_src:ro   # <-- PRIVAT DEPLOY-KEY MÅSTE FINNAS HÄR
+      - ./secrets/deploy_key:/app/ssh/bot_key_src:ro
     restart: unless-stopped
     depends_on:
       - redis
       - backend
     init: true
+
+
 
   # ───────────── VS Code Dev Container (Node + TS + PNPM/NPM) ─────────────── #
   devcontainer:
