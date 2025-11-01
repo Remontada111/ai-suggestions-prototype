@@ -52,12 +52,14 @@ services:
               install -d -m 700 /app/ssh;
               install -D -m 600 /app/ssh/bot_key_src /app/ssh/bot_key;
               : > /app/ssh/known_hosts;
+              ssh-keyscan -T 5 -H github.com >> /app/ssh/known_hosts;
               exec /opt/venv/bin/celery -A backend.tasks.codegen:celery_app worker
               -l info -P solo --concurrency=1 --prefetch-multiplier=1 -Q write'
     env_file:
       - ./backend/.env
     environment:
       TZ: Europe/Stockholm
+      GIT_SSH_COMMAND: "ssh -i /app/ssh/bot_key -o IdentitiesOnly=yes -o UserKnownHostsFile=/app/ssh/known_hosts -o StrictHostKeyChecking=accept-new"
     volumes:
       - ./backend:/app/backend
       - ./:/workspace
@@ -67,8 +69,6 @@ services:
       - redis
       - backend
     init: true
-
-
 
   # ───────────── VS Code Dev Container (Node + TS + PNPM/NPM) ─────────────── #
   devcontainer:
