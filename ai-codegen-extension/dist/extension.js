@@ -70,6 +70,31 @@ const safeUrl = (u) => {
     }
 };
 const redactPath = (p) => (p ? p.replace(process.cwd() || "", ".") : p);
+// ── Logg: endast placement som skickas till backend
+function compactPlacementForLog(p) {
+    try {
+        if (!p || typeof p !== "object")
+            return p;
+        const keep = ["overlayStage", "rect", "bounds", "frame", "edges", "offsets", "ar", "sizePct", "scale", "rotation"];
+        const out = {};
+        for (const k of keep)
+            if (k in p)
+                out[k] = p[k];
+        if ((p === null || p === void 0 ? void 0 : p.meta) && typeof p.meta === "object") {
+            const metaKeep = ["id", "name", "type", "page", "timestamp", "version"];
+            const metaOut = {};
+            for (const mk of metaKeep)
+                if (mk in p.meta)
+                    metaOut[mk] = p.meta[mk];
+            if (Object.keys(metaOut).length)
+                out.meta = metaOut;
+        }
+        return out;
+    }
+    catch (_a) {
+        return p;
+    }
+}
 const nodeKey = (f, n) => `${f}:${n}`;
 let activeNodes = new Map();
 let lastDevUrl = null;
@@ -646,6 +671,12 @@ function ensurePanel(context) {
                         if (!fileKey || !nodeId)
                             throw new Error("Saknar fileKey/nodeId för jobbet.");
                         const url = new URL("/figma-hook", base).toString();
+                        // ── LOGG: exakt placement som skickas till backend
+                        log("POST /figma-hook ← placement", {
+                            fileKey,
+                            nodeId,
+                            placement: compactPlacementForLog(msg.payload),
+                        });
                         const resp = await postJson(url, { fileKey, nodeId, placement: msg.payload });
                         const taskId = resp === null || resp === void 0 ? void 0 : resp.task_id;
                         if (!taskId) {
@@ -1404,6 +1435,12 @@ async function triggerFigmaHookWithPlacement() {
     const placement = all === null || all === void 0 ? void 0 : all[id];
     try {
         const url = new URL("/figma-hook", base).toString();
+        // ── LOGG: exakt placement som skickas till backend via kommandot
+        log("POST /figma-hook ← placement", {
+            fileKey: chosen.fileKey,
+            nodeId: chosen.nodeId,
+            placement: compactPlacementForLog(placement),
+        });
         const resp = await postJson(url, {
             fileKey: chosen.fileKey,
             nodeId: chosen.nodeId,

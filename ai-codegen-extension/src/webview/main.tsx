@@ -27,6 +27,20 @@ import Loader from "./Loader";
 const vscode = getVsCodeApi();
 
 // ─────────────────────────────────────────────────────────
+// Logg-hjälpare
+// ─────────────────────────────────────────────────────────
+const LOG_SRC = "webview/main.tsx";
+function log(...a: any[]) {
+  try { console.log(`[${LOG_SRC}]`, ...a); } catch {}
+}
+function warn(...a: any[]) {
+  try { console.warn(`[${LOG_SRC}]`, ...a); } catch {}
+}
+function err(...a: any[]) {
+  try { console.error(`[${LOG_SRC}]`, ...a); } catch {}
+}
+
+// ─────────────────────────────────────────────────────────
 // Konstanter / utils
 // ─────────────────────────────────────────────────────────
 const PROJECT_BASE = { w: 1280, h: 800 };
@@ -335,6 +349,7 @@ function App() {
 
   const requestFullViewIfNeeded = useCallback(() => {
     if (!fullViewRequested.current) {
+      log("Begär enterFullView");
       vscode.postMessage({ cmd: "enterFullView" });
       fullViewRequested.current = true;
     }
@@ -375,6 +390,7 @@ function App() {
   useEffect(() => {
     const t = setTimeout(() => {
       if (!requestedProjectOnce && !devUrl && phase === "onboarding") {
+        log("Auto-accept kandidat i onboarding");
         vscode.postMessage({ cmd: "acceptCandidate" });
         setRequestedProjectOnce(true);
       }
@@ -388,9 +404,12 @@ function App() {
       const msg = ev.data as IncomingMsg;
       if (!msg || typeof msg !== "object") return;
 
+      log("Mottog message", msg?.type, msg);
+
       if (msg.type === "devurl") { setDevUrl(msg.url); return; }
 
       if (msg.type === "ui-phase") {
+        log("UI-phase →", msg.phase);
         setPhase(msg.phase);
         if (msg.phase === "onboarding") {
           setDevUrl(null);
@@ -407,6 +426,7 @@ function App() {
 
       if (msg.type === "add-node") {
         const id = idOf(msg.fileKey, msg.nodeId);
+        log("add-node", { id, fileKey: msg.fileKey, nodeId: msg.nodeId });
         setNodes(s => s[id] ? s : ({
           ...s,
           [id]: {
@@ -424,6 +444,7 @@ function App() {
 
       if (msg.type === "figma-image-url") {
         const id = idOf(msg.fileKey, msg.nodeId);
+        log("figma-image-url", { id, url: msg.url });
         setNodes(s => ({
           ...s,
           [id]: { ...(s[id] || { fileKey: msg.fileKey, nodeId: msg.nodeId, imgN: null, rect: null, deleted: false }), imgSrc: msg.url }
@@ -434,6 +455,7 @@ function App() {
 
       if (msg.type === "seed-placement" && msg.payload) {
         const id = idOf(msg.fileKey, msg.nodeId);
+        log("seed-placement mottagen", { id, payload: msg.payload });
         pendingSeeds.current[id] = msg.payload;
         setNodes(s => {
           const ns = s[id];
@@ -445,20 +467,23 @@ function App() {
           rect = withCenterResize(rect, rect.w, rect.w / ar);
           const clamped = clampOverlayToStage(rect, ar);
           delete pendingSeeds.current[id];
+          log("seed-placement applicerad", { id, rect: clamped });
           return { ...s, [id]: { ...ns, rect: clamped } };
         });
         return;
       }
 
-      if (msg.type === "ui-error") { setFigmaErr(msg.message || "Okänt fel."); return; }
+      if (msg.type === "ui-error") { err("ui-error", msg.message); setFigmaErr(msg.message || "Okänt fel."); return; }
 
       if (msg.type === "job-started") {
+        log("job-started", { taskId: msg.taskId, fileKey: msg.fileKey, nodeId: msg.nodeId });
         setJob({ status: "running", taskId: msg.taskId });
         setPhase("loading");
         return;
       }
 
       if (msg.type === "job-finished") {
+        log("job-finished", { status: msg.status, pr_url: msg.pr_url, error: msg.error });
         if (msg.status === "SUCCESS") {
           setJob({ status: "done" });
         } else if (msg.status === "CANCELLED") {
@@ -473,6 +498,7 @@ function App() {
 
     window.addEventListener("message", onMsg);
     if (!sentReadyRef.current) {
+      log("Skickar ready");
       vscode.postMessage({ type: "ready" });
       sentReadyRef.current = true;
     }
@@ -503,6 +529,7 @@ function App() {
         const h = round(Math.min(fitted.h, PROJECT_BASE.h));
         rect = { x: round((PROJECT_BASE.w - w) / 2), y: round((PROJECT_BASE.h - h) / 2), w, h };
       }
+      log("image onload", { id, natural, initialRect: rect });
       return { ...s, [id]: { ...ns, imgN: natural, rect } };
     });
 
@@ -515,6 +542,7 @@ function App() {
         rect = withCenterResize(rect, rect.w, rect.w / ar);
         const clamped = clampOverlayToStage(rect, ar);
         delete pendingSeeds.current[id];
+        log("seed-placement applicerad efter onload", { id, rect: clamped });
         return { ...s, [id]: { ...ns, rect: clamped } };
       });
     }
@@ -523,12 +551,16 @@ function App() {
   const onErrorFor = useCallback((id: NodeId) => () => {
     const att = (refreshAttempts.current[id] || 0) + 1;
     refreshAttempts.current[id] = att;
+    warn("image onerror", { id, attempt: att });
     if (att <= 3) {
       const delay = 500 * Math.pow(2, att - 1);
       setFigmaErr(`Kunde inte ladda bild (${att}/3)…`);
       setTimeout(() => {
         const ns = nodes[id];
-        if (ns) vscode.postMessage({ cmd: "refreshFigmaImage", nodeId: ns.nodeId });
+        if (ns) {
+          log("begär refreshFigmaImage", { nodeId: ns.nodeId, attempt: att });
+          vscode.postMessage({ cmd: "refreshFigmaImage", nodeId: ns.nodeId });
+        }
       }, delay);
     } else {
       setFigmaErr("Kunde inte ladda Figma-bilden efter flera försök.");
@@ -621,6 +653,13 @@ function App() {
         ts: Date.now(),
         source: "webview/main.tsx",
       };
+      log("placementPreview → extension.ts", {
+        fileKey: ns.fileKey,
+        nodeId: ns.nodeId,
+        overlayStage: payload.overlayStage,
+        norm: payload.norm,
+        ts: payload.ts
+      });
       vscode.postMessage({ type: "placementPreview", fileKey: ns.fileKey, nodeId: ns.nodeId, payload });
     };
 
@@ -872,6 +911,7 @@ function App() {
         changed = true;
       }
       if (e.key === "f" || e.key === "F") {
+        log("Begär enterFullView via tangentbord");
         vscode.postMessage({ cmd: "enterFullView" });
       }
 
@@ -909,6 +949,7 @@ function App() {
     if (job.status === "running") return;
     const id = selectedId; if (!id) return;
     const ns = nodes[id]; if (!ns?.rect || ns.deleted) return;
+    log("delete node", { id, fileKey: ns.fileKey, nodeId: ns.nodeId });
     setNodes(s => ({ ...s, [id]: { ...ns, deleted: true } }));
     setDeletedStack(stk => [id, ...stk]);
     setShowOverlay(false);
@@ -919,6 +960,7 @@ function App() {
   const handleUndoSelected = useCallback(() => {
     if (job.status === "running") return;
     const id = selectedId; if (!id) return;
+    log("undo selected", { id });
     setNodes(s => {
       const ns = s[id]; if (!ns) return s;
       return { ...s, [id]: { ...ns, deleted: false } };
@@ -931,6 +973,7 @@ function App() {
     setDeletedStack(stk => {
       if (!stk.length) return stk;
       const [restoreId, ...rest] = stk;
+      log("undo top", { id: restoreId });
       setNodes(s => {
         const ns = s[restoreId]; if (!ns) return s;
         return { ...s, [restoreId]: { ...ns, deleted: false } };
@@ -986,6 +1029,15 @@ function App() {
       ts: Date.now(),
       source: "webview/main.tsx",
     };
+
+    log("ACCEPT klickad");
+    log("placementAccepted → extension.ts", {
+      fileKey: ns.fileKey,
+      nodeId: ns.nodeId,
+      overlayStage: payload.overlayStage,
+      norm: payload.norm,
+      ts: payload.ts
+    });
 
     setJob({ status: "running" });
     setPhase("loading");
@@ -1325,7 +1377,10 @@ function App() {
                     const id = selectedId;
                     if (id) {
                       const ns = nodes[id];
-                      if (ns) vscode.postMessage({ cmd: "refreshFigmaImage", nodeId: ns.nodeId });
+                      if (ns) {
+                        log("Försök igen → refreshFigmaImage", { nodeId: ns.nodeId });
+                        vscode.postMessage({ cmd: "refreshFigmaImage", nodeId: ns.nodeId });
+                      }
                     }
                   }}
                 >
