@@ -33,6 +33,25 @@ const safeUrl = (u?: string | null) => {
 };
 const redactPath = (p?: string | null) => (p ? p.replace(process.cwd() || "", ".") : p);
 
+// ── Logg: endast placement som skickas till backend
+function compactPlacementForLog(p: any) {
+  try {
+    if (!p || typeof p !== "object") return p;
+    const keep = ["overlayStage", "rect", "bounds", "frame", "edges", "offsets", "ar", "sizePct", "scale", "rotation"];
+    const out: any = {};
+    for (const k of keep) if (k in p) out[k] = (p as any)[k];
+    if (p?.meta && typeof p.meta === "object") {
+      const metaKeep = ["id", "name", "type", "page", "timestamp", "version"];
+      const metaOut: any = {};
+      for (const mk of metaKeep) if (mk in p.meta) metaOut[mk] = p.meta[mk];
+      if (Object.keys(metaOut).length) out.meta = metaOut;
+    }
+    return out;
+  } catch {
+    return p;
+  }
+}
+
 // ─────────────────────────────────────────────────────────
 // Multi-node: håll alla importerade noder aktivt i minnet
 // ─────────────────────────────────────────────────────────
@@ -565,6 +584,14 @@ function ensurePanel(context: vscode.ExtensionContext): vscode.WebviewPanel {
             const nodeId: string | undefined  = msg.nodeId  ?? ([...activeNodes.values()][0]?.nodeId);
             if (!fileKey || !nodeId) throw new Error("Saknar fileKey/nodeId för jobbet.");
             const url = new URL("/figma-hook", base).toString();
+
+            // ── LOGG: exakt placement som skickas till backend
+            log("POST /figma-hook ← placement", {
+              fileKey,
+              nodeId,
+              placement: compactPlacementForLog(msg.payload),
+            });
+
             const resp = await postJson(url, { fileKey, nodeId, placement: msg.payload });
             const taskId: string | undefined = resp?.task_id;
             if (!taskId) {
@@ -1311,6 +1338,14 @@ async function triggerFigmaHookWithPlacement() {
 
   try {
     const url = new URL("/figma-hook", base).toString();
+
+    // ── LOGG: exakt placement som skickas till backend via kommandot
+    log("POST /figma-hook ← placement", {
+      fileKey: chosen!.fileKey,
+      nodeId: chosen!.nodeId,
+      placement: compactPlacementForLog(placement),
+    });
+
     const resp = await postJson(url, {
       fileKey: chosen!.fileKey,
       nodeId: chosen!.nodeId,

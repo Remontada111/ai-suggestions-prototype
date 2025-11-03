@@ -2,6 +2,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
 import Menud96dc2 from './components/ai/Menu-d96dc2';
+import Menufc7725 from './components/ai/Menu-fc7725';
 
 
 
@@ -38,7 +39,11 @@ function App() {
         <> {/* AI-TILE:./components/ai/Menu-d96dc2:BEGIN */}
         <div className="relative w-[1280px] h-[800px] overflow-hidden rounded-md ring-1 ring-black/10 bg-white">
         <Menud96dc2 />
-        </div> {/* AI-TILE:./components/ai/Menu-d96dc2:END */}</></div>
+        </div> {/* AI-TILE:./components/ai/Menu-d96dc2:END */}</>
+        <> {/* AI-TILE:./components/ai/Menu-fc7725:BEGIN */}
+        <div className="relative w-[1280px] h-[800px] overflow-hidden rounded-md ring-1 ring-black/10 bg-white">
+        <Menufc7725 />
+        </div> {/* AI-TILE:./components/ai/Menu-fc7725:END */}</></div>
         {/* AI-INJECT-MOUNT:END */}</div>
     </div>
   );

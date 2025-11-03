@@ -2202,6 +2202,15 @@ def integrate_figma_node(
 ) -> Dict[str, Any]:
     t0 = time.time()
     _safe_print("codegen.start", {"file_key": file_key, "node_id": node_id})
+    # ── NYA LOGGAR: visa om placement skickats in från frontend
+    try:
+        _safe_print("placement.input", {
+            "has_placement": isinstance(placement, dict),
+            "keys": sorted(list(placement.keys())) if isinstance(placement, dict) else [],
+        })
+    except Exception:
+        _safe_print("placement.input", {"has_placement": bool(placement), "note": "keys_unavailable"})
+
     figma_json = _fetch_figma_node(file_key, node_id)
     t1 = time.time()
 
@@ -2390,7 +2399,17 @@ def integrate_figma_node(
     main_abs = _safe_join(tmp_root, main_rel)
     mount["import_path"] = _rel_import_from_main(main_abs, target_path)
 
+    # ── NYA LOGGAR kring placement och beräknad overlay-position ──
     px = placement or {}
+    try:
+        _safe_print("placement.raw", {
+            "present": bool(px),
+            "projectBase": (px.get("projectBase") if isinstance(px.get("projectBase"), dict) else None),
+            "overlayStage": (px.get("overlayStage") if isinstance(px.get("overlayStage"), dict) else None),
+        })
+    except Exception as _e:
+        _safe_print("placement.raw.error", {"err": str(_e)})
+
     stage = px.get("projectBase") if isinstance(px, dict) else None
     ovl = px.get("overlayStage") if isinstance(px, dict) else None
     if isinstance(stage, dict) and isinstance(ovl, dict):
@@ -2405,6 +2424,12 @@ def integrate_figma_node(
         nw = _pct(ovl.get("w", stage.get("w", 1280)), stage.get("w", 1280))
         nh = _pct(ovl.get("h", stage.get("h", 800)),  stage.get("h", 800))
 
+        _safe_print("placement.computed", {
+            "stage_wh": {"w": stage.get("w"), "h": stage.get("h")},
+            "overlay_xywh": {"x": ovl.get("x"), "y": ovl.get("y"), "w": ovl.get("w"), "h": ovl.get("h")},
+            "percent": {"left": nx, "top": ny, "width": nw, "height": nh},
+        })
+
         mount["jsx"] = (
             f'<div className="absolute inset-0 w-full h-full pointer-events-none">'
             f'  <div className="absolute left-[{nx}%] top-[{ny}%] w-[{nw}%] h-[{nh}%] overflow-hidden pointer-events-auto">'
@@ -2413,7 +2438,18 @@ def integrate_figma_node(
             f'</div>'
         )
     else:
+        _safe_print("placement.using_default", {
+            "reason": "missing-stage-or-overlay",
+            "have_stage": isinstance(stage, dict),
+            "have_overlay": isinstance(ovl, dict),
+        })
         mount["jsx"] = f"<{mount['import_name']} />"
+
+    try:
+        dump_path = _dump_text_file("placement-jsx", node_id, mount["jsx"])
+        _safe_print("placement.jsx.dump", {"path": dump_path})
+    except Exception as _e:
+        _safe_print("placement.jsx.dump.error", {"err": str(_e)})
 
     # ── Applicering + commit som funktion för retry-scenariot ──
     def _apply_and_commit() -> None:

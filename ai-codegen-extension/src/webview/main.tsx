@@ -1,9 +1,11 @@
 // webview/main.tsx
-// Mål:
+// Mål (uppdaterad):
 // - 1280×800 stage som skalas i panelen.
 // - Stöd för flera Figma-noder samtidigt.
 // - Välj en nod → flytta/resize med mus, hjul och tangentbord.
-// - Papperskorg visas för vald nod. Efter borttagning visas Undo tills återställd.
+// - Smart guides (align + spacing) + snapping mot stage & andra noder.
+// - HUD: x/y samt w×h + ratio i tydlig pillerbox under drag/resize.
+// - Papperskorg för vald nod. Undo per nod & global LIFO.
 // - Figma-bild hämtas via extension per nod och renderas ovanför devUrl-iframe.
 // - Accept låser interaktion och visar central loader, döljer project preview.
 
@@ -25,6 +27,20 @@ import Loader from "./Loader";
 const vscode = getVsCodeApi();
 
 // ─────────────────────────────────────────────────────────
+// Logg-hjälpare
+// ─────────────────────────────────────────────────────────
+const LOG_SRC = "webview/main.tsx";
+function log(...a: any[]) {
+  try { console.log(`[${LOG_SRC}]`, ...a); } catch {}
+}
+function warn(...a: any[]) {
+  try { console.warn(`[${LOG_SRC}]`, ...a); } catch {}
+}
+function err(...a: any[]) {
+  try { console.error(`[${LOG_SRC}]`, ...a); } catch {}
+}
+
+// ─────────────────────────────────────────────────────────
 // Konstanter / utils
 // ─────────────────────────────────────────────────────────
 const PROJECT_BASE = { w: 1280, h: 800 };
@@ -32,6 +48,11 @@ const PREVIEW_MIN_SCALE = 0.3;
 const PREVIEW_MAX_SCALE = Number.POSITIVE_INFINITY;
 const CANVAS_MARGIN = 16;
 const BOTTOM_GAP = 16;
+
+// Guides/snapping
+const SNAP_PX = 8;              // tolerans i projekt-px
+const MIN_OVERLAP = 12;         // min överlapp för spacing-guider
+const MAX_SPACING_VIS = 600;    // undvik plotter
 
 type UiPhase = "default" | "onboarding" | "loading";
 type NodeId = string; // `${fileKey}:${nodeId}`
@@ -59,6 +80,10 @@ type NodeState = {
   deleted: boolean;
 };
 
+type Guide =
+  | { kind: "align"; axis: "x" | "y"; at: number } // oändlig linje över stage
+  | { kind: "spacing"; axis: "x" | "y"; from: number; to: number; at: number; label: string }; // kort segment + etikett
+
 function idOf(f: string, n: string): NodeId { return `${f}:${n}`; }
 function clamp(n: number, lo: number, hi: number) { return Math.max(lo, Math.min(hi, n)); }
 function round(n: number) { return Math.round(n); }
@@ -80,7 +105,6 @@ function nearEdges(n: { x: number; y: number; w: number; h: number }, tol = 0.02
   const right = n.x + n.w, bottom = n.y + n.h;
   return { left: n.x < tol, right: 1 - right < tol, top: n.y < tol, bottom: 1 - bottom < tol };
 }
-// Snabb pixel-scan för att hitta icke-transparent innehåll (kräver CORS på bild-URL)
 function computeContentBoundsPx(img: HTMLImageElement): { x: number; y: number; w: number; h: number } | null {
   try {
     const w = img.naturalWidth, h = img.naturalHeight;
@@ -112,7 +136,80 @@ function computeContentBoundsPx(img: HTMLImageElement): { x: number; y: number; 
 }
 
 // ─────────────────────────────────────────────────────────
-// UI: “Pick project”-kort
+// Smart-guide helpers
+// ─────────────────────────────────────────────────────────
+function buildSnapCandidates(selfId: NodeId, nodes: Record<NodeId, NodeState>) {
+  const xs: number[] = [0, PROJECT_BASE.w / 2, PROJECT_BASE.w];
+  const ys: number[] = [0, PROJECT_BASE.h / 2, PROJECT_BASE.h];
+
+  for (const [id, ns] of Object.entries(nodes)) {
+    if (id === selfId || !ns.rect || ns.deleted) continue;
+    const r = ns.rect;
+    xs.push(r.x, r.x + r.w, r.x + r.w / 2);
+    ys.push(r.y, r.y + r.h, r.y + r.h / 2);
+  }
+  return { xs, ys };
+}
+
+function nearestDelta(value: number, candidates: number[], tol = SNAP_PX) {
+  let best: { delta: number; at: number } | null = null;
+  for (const c of candidates) {
+    const d = c - value;
+    if (Math.abs(d) <= tol && (!best || Math.abs(d) < Math.abs(best.delta))) {
+      best = { delta: d, at: c };
+    }
+  }
+  return best;
+}
+
+function overlap1D(a1: number, a2: number, b1: number, b2: number) {
+  const start = Math.max(a1, b1);
+  const end = Math.min(a2, b2);
+  return { len: end - start, mid: (start + end) / 2, start, end };
+}
+
+function spacingCandidatesX(curr: Rect, other: Rect, minOverlap = MIN_OVERLAP) {
+  const ov = overlap1D(curr.y, curr.y + curr.h, other.y, other.y + other.h);
+  if (ov.len <= minOverlap) return [];
+  const res: { from: number; to: number; y: number; px: number }[] = [];
+  if (other.x + other.w <= curr.x) {
+    const px = curr.x - (other.x + other.w);
+    if (px <= MAX_SPACING_VIS) res.push({ from: other.x + other.w, to: curr.x, y: ov.mid, px });
+  }
+  if (curr.x + curr.w <= other.x) {
+    const px = other.x - (curr.x + curr.w);
+    if (px <= MAX_SPACING_VIS) res.push({ from: curr.x + curr.w, to: other.x, y: ov.mid, px });
+  }
+  return res;
+}
+
+function spacingCandidatesY(curr: Rect, other: Rect, minOverlap = MIN_OVERLAP) {
+  const ov = overlap1D(curr.x, curr.x + curr.w, other.x, other.x + other.w);
+  if (ov.len <= minOverlap) return [];
+  const res: { from: number; to: number; x: number; px: number }[] = [];
+  if (other.y + other.h <= curr.y) {
+    const px = curr.y - (other.y + other.h);
+    if (px <= MAX_SPACING_VIS) res.push({ from: other.y + other.h, to: curr.y, x: ov.mid, px });
+  }
+  if (curr.y + curr.h <= other.y) {
+    const px = other.y - (curr.y + curr.h);
+    if (px <= MAX_SPACING_VIS) res.push({ from: curr.y + curr.h, to: other.y, x: ov.mid, px });
+  }
+  return res;
+}
+
+function clampOverlayToStage(r: Rect, ar: number): Rect {
+  const minW = PROJECT_BASE.w * 0.15;
+  let w = clamp(r.w, minW, PROJECT_BASE.w);
+  let h = w / ar;
+  if (h > PROJECT_BASE.h) { h = PROJECT_BASE.h; w = h * ar; }
+  let x = clamp(r.x, 0, PROJECT_BASE.w - w);
+  let y = clamp(r.y, 0, PROJECT_BASE.h - h);
+  return { x: round(x), y: round(y), w: round(w), h: round(h) };
+}
+
+// ─────────────────────────────────────────────────────────
+// UI: “Pick project”-kort (oförändrat)
 // ─────────────────────────────────────────────────────────
 function ChooseProjectCard(props: { visible: boolean; compact?: boolean; busy?: boolean }) {
   const { visible, compact, busy } = props;
@@ -201,6 +298,7 @@ function App() {
 
   const [showOverlay, setShowOverlay] = useState(false);
   const spaceHeld = useRef(false);
+  const altHeld = useRef(false);
   const fullViewRequested = useRef(false);
   const refreshAttempts = useRef<Record<NodeId, number>>({});
 
@@ -209,6 +307,10 @@ function App() {
 
   // Jobbstatus
   const [job, setJob] = useState<{ status: "idle" | "running" | "done" | "error"; taskId?: string }>({ status: "idle" });
+
+  // Aktiva guider (align + spacing)
+  const [activeGuides, setActiveGuides] = useState<Guide[]>([]);
+  const clearGuidesSoon = useRef<number | null>(null);
 
   // editorstorlek: reservera plats för chatten
   useLayoutEffect(() => {
@@ -231,11 +333,6 @@ function App() {
   const sentReadyRef = useRef(false);
 
   const current = selectedId ? nodes[selectedId] || null : null;
-  const currentAR = useMemo(() => {
-    if (!current?.imgN) return PROJECT_BASE.w / PROJECT_BASE.h;
-    const ar = current.imgN.w / current.imgN.h;
-    return ar > 0 ? ar : PROJECT_BASE.w / PROJECT_BASE.h;
-  }, [current?.imgN]);
 
   // För global "Accept": välj första giltiga nod om ingen vald
   const firstEligibleId = useMemo(() => {
@@ -250,24 +347,15 @@ function App() {
   }, [selectedId, nodes]);
   const canAccept = !!firstEligibleId && job.status !== "running";
 
-  const clampOverlayToStage = useCallback((r: Rect, ar: number) => {
-    const minW = PROJECT_BASE.w * 0.15;
-    let w = clamp(r.w, minW, PROJECT_BASE.w);
-    let h = w / ar;
-    if (h > PROJECT_BASE.h) { h = PROJECT_BASE.h; w = h * ar; }
-    let x = clamp(r.x, 0, PROJECT_BASE.w - w);
-    let y = clamp(r.y, 0, PROJECT_BASE.h - h);
-    return { x: round(x), y: round(y), w: round(w), h: round(h) };
-  }, []);
-
   const requestFullViewIfNeeded = useCallback(() => {
     if (!fullViewRequested.current) {
+      log("Begär enterFullView");
       vscode.postMessage({ cmd: "enterFullView" });
       fullViewRequested.current = true;
     }
   }, []);
 
-  // persist bara små UI-flaggor
+  // persist små UI-flaggor
   const persistState = useCallback((extra?: Record<string, any>) => {
     const currentState = {
       showOverlay,
@@ -302,6 +390,7 @@ function App() {
   useEffect(() => {
     const t = setTimeout(() => {
       if (!requestedProjectOnce && !devUrl && phase === "onboarding") {
+        log("Auto-accept kandidat i onboarding");
         vscode.postMessage({ cmd: "acceptCandidate" });
         setRequestedProjectOnce(true);
       }
@@ -315,9 +404,12 @@ function App() {
       const msg = ev.data as IncomingMsg;
       if (!msg || typeof msg !== "object") return;
 
+      log("Mottog message", msg?.type, msg);
+
       if (msg.type === "devurl") { setDevUrl(msg.url); return; }
 
       if (msg.type === "ui-phase") {
+        log("UI-phase →", msg.phase);
         setPhase(msg.phase);
         if (msg.phase === "onboarding") {
           setDevUrl(null);
@@ -326,6 +418,7 @@ function App() {
           setSelectedId(null);
           setShowOverlay(false);
           setDeletedStack([]); // nollställ historik
+          setActiveGuides([]);
           persistState({ showOverlay: false, selectedId: null });
         }
         return;
@@ -333,6 +426,7 @@ function App() {
 
       if (msg.type === "add-node") {
         const id = idOf(msg.fileKey, msg.nodeId);
+        log("add-node", { id, fileKey: msg.fileKey, nodeId: msg.nodeId });
         setNodes(s => s[id] ? s : ({
           ...s,
           [id]: {
@@ -350,6 +444,7 @@ function App() {
 
       if (msg.type === "figma-image-url") {
         const id = idOf(msg.fileKey, msg.nodeId);
+        log("figma-image-url", { id, url: msg.url });
         setNodes(s => ({
           ...s,
           [id]: { ...(s[id] || { fileKey: msg.fileKey, nodeId: msg.nodeId, imgN: null, rect: null, deleted: false }), imgSrc: msg.url }
@@ -360,33 +455,35 @@ function App() {
 
       if (msg.type === "seed-placement" && msg.payload) {
         const id = idOf(msg.fileKey, msg.nodeId);
+        log("seed-placement mottagen", { id, payload: msg.payload });
         pendingSeeds.current[id] = msg.payload;
-        // Om naturliga mått redan finns så applicera direkt
         setNodes(s => {
           const ns = s[id];
           if (!ns?.imgN) return s;
           const p = pendingSeeds.current[id];
           if (!p?.overlayStage) return s;
           let rect = { ...p.overlayStage };
-          // Justera mot aktuell bild-AR
           const ar = ns.imgN.w / ns.imgN.h;
           rect = withCenterResize(rect, rect.w, rect.w / ar);
           const clamped = clampOverlayToStage(rect, ar);
           delete pendingSeeds.current[id];
+          log("seed-placement applicerad", { id, rect: clamped });
           return { ...s, [id]: { ...ns, rect: clamped } };
         });
         return;
       }
 
-      if (msg.type === "ui-error") { setFigmaErr(msg.message || "Okänt fel."); return; }
+      if (msg.type === "ui-error") { err("ui-error", msg.message); setFigmaErr(msg.message || "Okänt fel."); return; }
 
       if (msg.type === "job-started") {
+        log("job-started", { taskId: msg.taskId, fileKey: msg.fileKey, nodeId: msg.nodeId });
         setJob({ status: "running", taskId: msg.taskId });
-        setPhase("loading"); // försäkran
+        setPhase("loading");
         return;
       }
 
       if (msg.type === "job-finished") {
+        log("job-finished", { status: msg.status, pr_url: msg.pr_url, error: msg.error });
         if (msg.status === "SUCCESS") {
           setJob({ status: "done" });
         } else if (msg.status === "CANCELLED") {
@@ -394,7 +491,6 @@ function App() {
         } else {
           setJob({ status: "error" });
         }
-        // Återgå till preview
         setPhase("default");
         return;
       }
@@ -402,13 +498,14 @@ function App() {
 
     window.addEventListener("message", onMsg);
     if (!sentReadyRef.current) {
+      log("Skickar ready");
       vscode.postMessage({ type: "ready" });
       sentReadyRef.current = true;
     }
     return () => window.removeEventListener("message", onMsg);
-  }, [clampOverlayToStage, persistState]);
+  }, [persistState]);
 
-  // Auto-återställ jobbstatus från done/error → idle
+  // Auto-återställ jobbstatus
   useEffect(() => {
     if (job.status === "done" || job.status === "error") {
       const t = setTimeout(() => setJob({ status: "idle" }), 1800);
@@ -432,10 +529,10 @@ function App() {
         const h = round(Math.min(fitted.h, PROJECT_BASE.h));
         rect = { x: round((PROJECT_BASE.w - w) / 2), y: round((PROJECT_BASE.h - h) / 2), w, h };
       }
+      log("image onload", { id, natural, initialRect: rect });
       return { ...s, [id]: { ...ns, imgN: natural, rect } };
     });
 
-    // Seed som väntat
     const p = pendingSeeds.current[id];
     if (p?.overlayStage) {
       setNodes(s => {
@@ -445,20 +542,25 @@ function App() {
         rect = withCenterResize(rect, rect.w, rect.w / ar);
         const clamped = clampOverlayToStage(rect, ar);
         delete pendingSeeds.current[id];
+        log("seed-placement applicerad efter onload", { id, rect: clamped });
         return { ...s, [id]: { ...ns, rect: clamped } };
       });
     }
-  }, [clampOverlayToStage]);
+  }, []);
 
   const onErrorFor = useCallback((id: NodeId) => () => {
     const att = (refreshAttempts.current[id] || 0) + 1;
     refreshAttempts.current[id] = att;
+    warn("image onerror", { id, attempt: att });
     if (att <= 3) {
       const delay = 500 * Math.pow(2, att - 1);
       setFigmaErr(`Kunde inte ladda bild (${att}/3)…`);
       setTimeout(() => {
         const ns = nodes[id];
-        if (ns) vscode.postMessage({ cmd: "refreshFigmaImage", nodeId: ns.nodeId });
+        if (ns) {
+          log("begär refreshFigmaImage", { nodeId: ns.nodeId, attempt: att });
+          vscode.postMessage({ cmd: "refreshFigmaImage", nodeId: ns.nodeId });
+        }
       }, delay);
     } else {
       setFigmaErr("Kunde inte ladda Figma-bilden efter flera försök.");
@@ -473,6 +575,7 @@ function App() {
       if (!keep) {
         setSelectedId(null);
         setShowOverlay(false);
+        setActiveGuides([]);
         persistState({ showOverlay: false, selectedId: null });
       }
     }
@@ -486,6 +589,7 @@ function App() {
     mode: "move" | "nw" | "ne" | "se" | "sw" | null;
     startPt: Vec2;
     startRect: StageRect;
+    alt: boolean;
   } | null>(null);
 
   const beginInteraction = useCallback((id: NodeId, e?: React.PointerEvent) => {
@@ -502,7 +606,11 @@ function App() {
       if (!spaceHeld.current && !selectedRef.current) {
         setTimeout(() => { setShowOverlay(false); persistState({ showOverlay: false }); }, 80);
       }
+      // rensa guider lite efteråt
+      if (clearGuidesSoon.current) cancelAnimationFrame(clearGuidesSoon.current);
+      clearGuidesSoon.current = requestAnimationFrame(() => setActiveGuides([]));
 
+      // Skicka placement preview
       const ns = selectedRef.current ? nodes[selectedRef.current] : null;
       if (!ns || !ns.rect || !ns.imgN || ns.deleted) return;
 
@@ -545,7 +653,13 @@ function App() {
         ts: Date.now(),
         source: "webview/main.tsx",
       };
-      // Endast preview under drag/resize – inget jobb triggas.
+      log("placementPreview → extension.ts", {
+        fileKey: ns.fileKey,
+        nodeId: ns.nodeId,
+        overlayStage: payload.overlayStage,
+        norm: payload.norm,
+        ts: payload.ts
+      });
       vscode.postMessage({ type: "placementPreview", fileKey: ns.fileKey, nodeId: ns.nodeId, payload });
     };
 
@@ -553,13 +667,125 @@ function App() {
     window.addEventListener("pointercancel", end, { once: true });
   }, [nodes, persistState, requestFullViewIfNeeded]);
 
+  // Bygg align- och spacing-guider + applicera snapping
+  function computeGuidesAndSnap(selfId: NodeId, rect: Rect, mode: "move" | "nw" | "ne" | "se" | "sw" | null, allowSnap: boolean) {
+    const cand = buildSnapCandidates(selfId, nodes);
+    const guides: Guide[] = [];
+
+    let next = { ...rect };
+
+    // Align snapping
+    if (allowSnap) {
+      // X-axeln: välj relevanta kanter beroende på mode
+      const considerCenterX = mode === "move";
+      const deltasX: Array<{ delta: number; at: number; apply: () => void }> = [];
+
+      const left = nearestDelta(next.x, cand.xs);
+      if (left) deltasX.push({
+        delta: left.delta, at: left.at,
+        apply: () => { next.x += left.delta; }
+      });
+
+      const right = nearestDelta(next.x + next.w, cand.xs);
+      if (right) deltasX.push({
+        delta: right.delta, at: right.at,
+        apply: () => { next.x += right.delta; }
+      });
+
+      if (considerCenterX) {
+        const cx = next.x + next.w / 2;
+        const c = nearestDelta(cx, cand.xs);
+        if (c) deltasX.push({
+          delta: c.delta, at: c.at,
+          apply: () => { next.x += c.delta; }
+        });
+      }
+
+      // Behåll minsta delta på X
+      if (deltasX.length) {
+        deltasX.sort((a, b) => Math.abs(a.delta) - Math.abs(b.delta));
+        const chosen = deltasX[0];
+        if (Math.abs(chosen.delta) <= SNAP_PX) {
+          chosen.apply();
+          guides.push({ kind: "align", axis: "x", at: chosen.at });
+        }
+      }
+
+      // Y-axeln
+      const considerCenterY = mode === "move";
+      const deltasY: Array<{ delta: number; at: number; apply: () => void }> = [];
+
+      const top = nearestDelta(next.y, cand.ys);
+      if (top) deltasY.push({
+        delta: top.delta, at: top.at,
+        apply: () => { next.y += top.delta; }
+      });
+
+      const bottom = nearestDelta(next.y + next.h, cand.ys);
+      if (bottom) deltasY.push({
+        delta: bottom.delta, at: bottom.at,
+        apply: () => { next.y += bottom.delta; }
+      });
+
+      if (considerCenterY) {
+        const cy = next.y + next.h / 2;
+        const c = nearestDelta(cy, cand.ys);
+        if (c) deltasY.push({
+          delta: c.delta, at: c.at,
+          apply: () => { next.y += c.delta; }
+        });
+      }
+
+      if (deltasY.length) {
+        deltasY.sort((a, b) => Math.abs(a.delta) - Math.abs(b.delta));
+        const chosen = deltasY[0];
+        if (Math.abs(chosen.delta) <= SNAP_PX) {
+          chosen.apply();
+          guides.push({ kind: "align", axis: "y", at: chosen.at });
+        }
+      }
+    }
+
+    // Spacing-guider mot andra noder
+    const spacing: Guide[] = [];
+    for (const [oid, ons] of Object.entries(nodes)) {
+      if (oid === selfId || !ons.rect || ons.deleted) continue;
+      for (const g of spacingCandidatesX(next, ons.rect)) {
+        spacing.push({ kind: "spacing", axis: "x", at: (g.from + g.to) / 2, from: g.from, to: g.to, label: `${Math.round(g.px)} px` });
+      }
+      for (const g of spacingCandidatesY(next, ons.rect)) {
+        spacing.push({ kind: "spacing", axis: "y", at: (g.from + g.to) / 2, from: g.from, to: g.to, label: `${Math.round(g.px)} px` });
+      }
+    }
+    // Spacing mot stage som ”granne”
+    const stageLeft: Rect = { x: 0, y: next.y, w: 0, h: next.h };
+    const stageRight: Rect = { x: PROJECT_BASE.w, y: next.y, w: 0, h: next.h };
+    spacingCandidatesX(next, stageLeft).forEach(g => spacing.push({ kind: "spacing", axis: "x", at: (g.from + g.to) / 2, from: g.from, to: g.to, label: `${Math.round(g.px)} px` }));
+    spacingCandidatesX(next, stageRight).forEach(g => spacing.push({ kind: "spacing", axis: "x", at: (g.from + g.to) / 2, from: g.from, to: g.to, label: `${Math.round(g.px)} px` }));
+
+    const stageTop: Rect = { x: next.x, y: 0, w: next.w, h: 0 };
+    const stageBottom: Rect = { x: next.x, y: PROJECT_BASE.h, w: next.w, h: 0 };
+    spacingCandidatesY(next, stageTop).forEach(g => spacing.push({ kind: "spacing", axis: "y", at: (g.from + g.to) / 2, from: g.from, to: g.to, label: `${Math.round(g.px)} px` }));
+    spacingCandidatesY(next, stageBottom).forEach(g => spacing.push({ kind: "spacing", axis: "y", at: (g.from + g.to) / 2, from: g.from, to: g.to, label: `${Math.round(g.px)} px` }));
+
+    // Minska plotter: välj max 2 per axis (kortaste gaps först)
+    const pickClosest = (arr: Guide[], axis: "x" | "y") => {
+      const same = arr.filter(a => a.kind === "spacing" && a.axis === axis) as Extract<Guide, { kind: "spacing" }>[];
+      same.sort((a, b) => Math.abs((a.to - a.from)) - Math.abs((b.to - b.from)));
+      return same.slice(0, 2);
+    };
+    const spacingPicked = [...pickClosest(spacing, "x"), ...pickClosest(spacing, "y")];
+
+    return { rect: next, guides: [...guides, ...spacingPicked] };
+  }
+
   // Flytt/resize-handlers
   const onOverlayPointerDown = useCallback((id: NodeId) => (e: React.PointerEvent) => {
     if (job.status === "running") return;
     const ns = nodes[id];
     if (!ns?.rect || ns.deleted) return;
     beginInteraction(id, e);
-    dragState.current = { id, mode: "move", startPt: { x: e.clientX, y: e.clientY }, startRect: { ...ns.rect } };
+    dragState.current = { id, mode: "move", startPt: { x: e.clientX, y: e.clientY }, startRect: { ...ns.rect }, alt: !!e.altKey };
   }, [nodes, beginInteraction, job.status]);
 
   const onOverlayPointerMove = useCallback((e: React.PointerEvent) => {
@@ -575,14 +801,12 @@ function App() {
     const dy = dyPx / stageDims.scale;
 
     const ar = ns.imgN.w / ns.imgN.h;
+    let next: Rect;
 
     if (st.mode === "move") {
-      const next = clampOverlayToStage(
-        { ...st.startRect, x: st.startRect.x + dx, y: st.startRect.y + dy },
-        ar
-      );
-      setNodes(s => ({ ...s, [st.id]: { ...ns, rect: next } }));
+      next = clampOverlayToStage({ ...st.startRect, x: st.startRect.x + dx, y: st.startRect.y + dy }, ar);
     } else {
+      // Resize med bibehållen AR
       let { x, y, w, h } = st.startRect;
       if (st.mode === "nw") {
         const newW = st.startRect.w - dx; const newH = newW / ar;
@@ -602,10 +826,16 @@ function App() {
         const fitted = clampOverlayToStage({ x, y, w: newW, h: newH }, ar); w = fitted.w; h = fitted.h;
         x = st.startRect.x + (st.startRect.w - w);
       }
-      const next = clampOverlayToStage({ x, y, w, h }, ar);
-      setNodes(s => ({ ...s, [st.id]: { ...ns, rect: next } }));
+      next = clampOverlayToStage({ x, y, w, h }, ar);
     }
-  }, [nodes, stageDims.scale, clampOverlayToStage, job.status]);
+
+    // Snap + guides
+    const allowSnap = !(st.alt || e.altKey);
+    const { rect: snapped, guides } = computeGuidesAndSnap(st.id, next, st.mode, allowSnap);
+
+    setNodes(s => ({ ...s, [st.id]: { ...ns, rect: snapped } }));
+    setActiveGuides(guides);
+  }, [nodes, stageDims.scale, job.status]);
 
   const startResize = useCallback((id: NodeId, mode: "nw" | "ne" | "se" | "sw") =>
     (e: React.PointerEvent) => {
@@ -614,7 +844,7 @@ function App() {
       if (!ns?.rect || ns.deleted) return;
       e.stopPropagation();
       beginInteraction(id, e);
-      dragState.current = { id, mode, startPt: { x: e.clientX, y: e.clientY }, startRect: { ...ns.rect } };
+      dragState.current = { id, mode, startPt: { x: e.clientX, y: e.clientY }, startRect: { ...ns.rect }, alt: !!e.altKey };
     }, [nodes, beginInteraction, job.status]);
 
   // wheel = resize runt centrum
@@ -629,12 +859,14 @@ function App() {
     const newW = ns.rect.w * factor;
     const newH = newW / ar;
     const sized = clampOverlayToStage(withCenterResize(ns.rect, newW, newH), ar);
-    setNodes(s => ({ ...s, [id]: { ...ns, rect: sized } }));
+    const { rect: snapped, guides } = computeGuidesAndSnap(id, sized, "move", !e.altKey);
+    setNodes(s => ({ ...s, [id]: { ...ns, rect: snapped } }));
+    setActiveGuides(guides);
     setShowOverlay(true);
     persistState({ showOverlay: true });
-  }, [nodes, selectedId, clampOverlayToStage, persistState, job.status]);
+  }, [nodes, selectedId, persistState, job.status]);
 
-  // tangentbord när valt
+  // tangentbord när valt (snapping + HUD)
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if (job.status === "running") { e.preventDefault(); return; }
@@ -648,6 +880,7 @@ function App() {
         e.preventDefault();
         return;
       }
+      if (e.key === "Alt") altHeld.current = true;
 
       const step = e.shiftKey ? 10 : 1;
       let changed = false;
@@ -678,12 +911,15 @@ function App() {
         changed = true;
       }
       if (e.key === "f" || e.key === "F") {
+        log("Begär enterFullView via tangentbord");
         vscode.postMessage({ cmd: "enterFullView" });
       }
 
       if (changed) {
         next = clampOverlayToStage(next, ar);
-        setNodes(s => ({ ...s, [id]: { ...ns, rect: next } }));
+        const { rect: snapped, guides } = computeGuidesAndSnap(id, next, "move", !altHeld.current);
+        setNodes(s => ({ ...s, [id]: { ...ns, rect: snapped } }));
+        setActiveGuides(guides);
         setShowOverlay(true);
         e.preventDefault();
       }
@@ -698,6 +934,7 @@ function App() {
         }
         e.preventDefault();
       }
+      if (e.key === "Alt") altHeld.current = false;
     }
     window.addEventListener("keydown", onKeyDown, { capture: true });
     window.addEventListener("keyup", onKeyUp, { capture: true });
@@ -705,23 +942,25 @@ function App() {
       window.removeEventListener("keydown", onKeyDown, { capture: true } as any);
       window.removeEventListener("keyup", onKeyUp, { capture: true } as any);
     };
-  }, [nodes, selectedId, clampOverlayToStage, persistState, job.status]);
+  }, [nodes, selectedId, persistState, job.status]);
 
   // Delete/Undo
   const handleDelete = useCallback(() => {
     if (job.status === "running") return;
     const id = selectedId; if (!id) return;
     const ns = nodes[id]; if (!ns?.rect || ns.deleted) return;
+    log("delete node", { id, fileKey: ns.fileKey, nodeId: ns.nodeId });
     setNodes(s => ({ ...s, [id]: { ...ns, deleted: true } }));
-    setDeletedStack(stk => [id, ...stk]); // push LIFO
+    setDeletedStack(stk => [id, ...stk]);
     setShowOverlay(false);
+    setActiveGuides([]);
     persistState({ showOverlay: false });
   }, [nodes, selectedId, persistState, job.status]);
 
-  // Undo endast för vald nod
   const handleUndoSelected = useCallback(() => {
     if (job.status === "running") return;
     const id = selectedId; if (!id) return;
+    log("undo selected", { id });
     setNodes(s => {
       const ns = s[id]; if (!ns) return s;
       return { ...s, [id]: { ...ns, deleted: false } };
@@ -729,12 +968,12 @@ function App() {
     setDeletedStack(stk => stk.filter(x => x !== id));
   }, [selectedId, job.status]);
 
-  // Global LIFO-undo
   const handleUndoTop = useCallback(() => {
     if (job.status === "running") return;
     setDeletedStack(stk => {
       if (!stk.length) return stk;
       const [restoreId, ...rest] = stk;
+      log("undo top", { id: restoreId });
       setNodes(s => {
         const ns = s[restoreId]; if (!ns) return s;
         return { ...s, [restoreId]: { ...ns, deleted: false } };
@@ -791,12 +1030,21 @@ function App() {
       source: "webview/main.tsx",
     };
 
+    log("ACCEPT klickad");
+    log("placementAccepted → extension.ts", {
+      fileKey: ns.fileKey,
+      nodeId: ns.nodeId,
+      overlayStage: payload.overlayStage,
+      norm: payload.norm,
+      ts: payload.ts
+    });
+
     setJob({ status: "running" });
-    setPhase("loading"); // döljer preview direkt
+    setPhase("loading");
     vscode.postMessage({ type: "placementAccepted", fileKey: ns.fileKey, nodeId: ns.nodeId, payload });
   }, [firstEligibleId, nodes]);
 
-  // Beräkna pixelpositioner för vald overlay (ankra knappar)
+  // Beräkna pixelpositioner för vald overlay (ankra knappar/HUD)
   const rootPadding = (!devUrl) ? CANVAS_MARGIN : 0;
   const selRectPx = useMemo(() => {
     if (!selectedId) return null;
@@ -815,6 +1063,17 @@ function App() {
   // Flagga om preview ska visas
   const showPreview = phase !== "loading" && !!devUrl;
 
+  // HUD rendering helpers
+  const hudData = useMemo(() => {
+    if (!current?.rect) return null;
+    const r = current.rect;
+    const ar = r.w / r.h;
+    return {
+      x: r.x, y: r.y, w: r.w, h: r.h,
+      ratio: `${(ar >= 1 ? ar : 1 / ar).toFixed(3)}:${(ar >= 1 ? 1 : 1).toFixed(0)}`
+    };
+  }, [current?.rect]);
+
   return (
     <div
       ref={rootRef}
@@ -822,7 +1081,7 @@ function App() {
       style={{ position: "fixed", inset: 0, padding: rootPadding }}
       onWheel={onWheel}
     >
-      {/* Laptop-UI: visas endast när inte loading */}
+      {/* Laptop-UI */}
       {showPreview && (
         <div
           className="laptop-shell"
@@ -881,6 +1140,59 @@ function App() {
               pointerEvents: "none",
             }}
           >
+            {/* SVG-guides (överst, men klick transparent) */}
+            <svg
+              width={PROJECT_BASE.w}
+              height={PROJECT_BASE.h}
+              style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 50 }}
+            >
+              {activeGuides.map((g, i) => {
+                if (g.kind === "align" && g.axis === "x") {
+                  return <line key={`gx${i}`} x1={g.at} x2={g.at} y1={0} y2={PROJECT_BASE.h} stroke="var(--accent)" strokeWidth={1} opacity={0.9} />;
+                }
+                if (g.kind === "align" && g.axis === "y") {
+                  return <line key={`gy${i}`} x1={0} x2={PROJECT_BASE.w} y1={g.at} y2={g.at} stroke="var(--accent)" strokeWidth={1} opacity={0.9} />;
+                }
+                if (g.kind === "spacing" && g.axis === "x") {
+                  const mid = g.at;
+                  const labelW = 56, labelH = 18;
+                  return (
+                    <g key={`spx${i}`}>
+                      <line x1={g.from} x2={g.to} y1={mid} y2={mid} stroke="var(--accent)" strokeWidth={1} />
+                      <foreignObject x={(g.from + g.to) / 2 - labelW / 2} y={mid - labelH - 4} width={labelW} height={labelH}>
+                        <div style={{
+                          fontSize: 11, lineHeight: `${labelH}px`, textAlign: "center",
+                          background: "var(--vscode-editorWidget-background)",
+                          border: "1px solid var(--border)", borderRadius: 999,
+                          color: "var(--foreground)", padding: "0 6px",
+                          boxShadow: "0 2px 8px rgba(0,0,0,.15)"
+                        }}>{g.label}</div>
+                      </foreignObject>
+                    </g>
+                  );
+                }
+                if (g.kind === "spacing" && g.axis === "y") {
+                  const mid = g.at;
+                  const labelW = 56, labelH = 18;
+                  return (
+                    <g key={`spy${i}`}>
+                      <line x1={mid} x2={mid} y1={g.from} y2={g.to} stroke="var(--accent)" strokeWidth={1} />
+                      <foreignObject x={mid - labelW / 2} y={(g.from + g.to) / 2 - labelH / 2} width={labelW} height={labelH}>
+                        <div style={{
+                          fontSize: 11, lineHeight: `${labelH}px`, textAlign: "center",
+                          background: "var(--vscode-editorWidget-background)",
+                          border: "1px solid var(--border)", borderRadius: 999,
+                          color: "var(--foreground)", padding: "0 6px",
+                          boxShadow: "0 2px 8px rgba(0,0,0,.15)"
+                        }}>{g.label}</div>
+                      </foreignObject>
+                    </g>
+                  );
+                }
+                return null;
+              })}
+            </svg>
+
             {Object.entries(nodes).map(([id, ns]) => {
               if (!ns.imgSrc || !ns.rect || ns.deleted) return null;
               const isSelected = selectedId === id;
@@ -973,27 +1285,27 @@ function App() {
                 </div>
               );
             })}
-          </div>
 
-          {/* Dolda probes för de noder som saknar imgN */}
-          {Object.entries(nodes).map(([id, ns]) => {
-            if (!ns.imgSrc || ns.imgN) return null;
-            return (
-              <img
-                key={`probe-${id}`}
-                src={ns.imgSrc}
-                alt=""
-                crossOrigin="anonymous"
-                onLoad={onLoadFor(id)}
-                onError={onErrorFor(id)}
-                style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
-              />
-            );
-          })}
+            {/* Dolda probes */}
+            {Object.entries(nodes).map(([id, ns]) => {
+              if (!ns.imgSrc || ns.imgN) return null;
+              return (
+                <img
+                  key={`probe-${id}`}
+                  src={ns.imgSrc}
+                  alt=""
+                  crossOrigin="anonymous"
+                  onLoad={onLoadFor(id)}
+                  onError={onErrorFor(id)}
+                  style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
+                />
+              );
+            })}
+          </div>
         </div>
       )}
 
-      {/* Central loader under kodgenerering: döljer preview */}
+      {/* Central loader */}
       {phase === "loading" && (
         <div
           style={{
@@ -1065,7 +1377,10 @@ function App() {
                     const id = selectedId;
                     if (id) {
                       const ns = nodes[id];
-                      if (ns) vscode.postMessage({ cmd: "refreshFigmaImage", nodeId: ns.nodeId });
+                      if (ns) {
+                        log("Försök igen → refreshFigmaImage", { nodeId: ns.nodeId });
+                        vscode.postMessage({ cmd: "refreshFigmaImage", nodeId: ns.nodeId });
+                      }
                     }
                   }}
                 >
@@ -1104,7 +1419,7 @@ function App() {
         </div>
       )}
 
-      {/* Chat längst ned. Rapporterar höjd för att reservera yta. */}
+      {/* Chat längst ned */}
       <ChatBar
         onSend={(text) => vscode.postMessage({ cmd: "chat", text })}
         onStop={() => vscode.postMessage({ cmd: "stopChat" })}
@@ -1124,7 +1439,45 @@ function App() {
             .fx-btn[disabled] { opacity:.7; cursor:default }
           `}</style>
 
-          {/* Per-nod action: Trash för vald icke-raderad nod */}
+          {/* HUD – piller med X/Y och W×H (med AR) */}
+          {showOverlay && selRectPx && hudData && (
+            <div
+              data-keep-selection="1"
+              style={{
+                position: "absolute",
+                left: Math.max(CANVAS_MARGIN, Math.round(selRectPx.left)),
+                top: Math.max(CANVAS_MARGIN, Math.round(selRectPx.top - 34)),
+                zIndex: 70,
+                pointerEvents: "none",
+              }}
+            >
+              <div style={{
+                display: "inline-flex",
+                gap: 8,
+                alignItems: "center",
+                padding: "6px 10px",
+                borderRadius: 999,
+                border: "1px solid var(--border)",
+                background: "var(--vscode-editorWidget-background)",
+                color: "var(--foreground)",
+                fontSize: 12,
+                boxShadow: "0 6px 18px rgba(0,0,0,.18)",
+                opacity: 0.98
+              }}>
+                <span style={{ fontWeight: 700 }}>X</span><span>{hudData.x}</span>
+                <span style={{ opacity: .45 }}>·</span>
+                <span style={{ fontWeight: 700 }}>Y</span><span>{hudData.y}</span>
+                <span style={{ opacity: .45 }}>｜</span>
+                <span style={{ fontWeight: 700 }}>W</span><span>{hudData.w}</span>
+                <span style={{ fontWeight: 700, marginLeft: 2 }}>×</span>
+                <span style={{ fontWeight: 700 }}>H</span><span>{hudData.h}</span>
+                <span style={{ opacity: .45 }}>·</span>
+                <span style={{ fontWeight: 700 }}>AR</span><span>{(hudData.w / hudData.h).toFixed(3)}</span>
+              </div>
+            </div>
+          )}
+
+          {/* Per-nod action: Trash */}
           {selectedId && selRectPx && nodes[selectedId] && !nodes[selectedId].deleted && (
             <button
               data-keep-selection="1"
@@ -1148,7 +1501,7 @@ function App() {
             </button>
           )}
 
-          {/* Per-nod action: Undo för vald raderad nod */}
+          {/* Per-nod action: Undo vald */}
           {selectedId && selRectPx && nodes[selectedId] && nodes[selectedId].deleted && (
             <button
               data-keep-selection="1"
@@ -1172,7 +1525,7 @@ function App() {
             </button>
           )}
 
-          {/* Global multi-stegs Undo (LIFO). Dölj när en icke-raderad nod är vald. */}
+          {/* Global LIFO-Undo */}
           {deletedStack.length > 0 && !(selectedId && nodes[selectedId] && !nodes[selectedId].deleted) && (
             <button
               data-keep-selection="1"
