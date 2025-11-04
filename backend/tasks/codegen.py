@@ -8,9 +8,9 @@ Uppdateringar i denna version:
 - Push: ingen rebase i worker. Vid non-fast-forward görs explicit ls-remote + fetch av exakt ref + reset --hard origin/<AI_WORK_BRANCH> om den finns, annars origin/<BASE_BRANCH> → applicera igen → push. Loopad retry med backoff.
 - Append-läge: AI_MOUNT_MODE=append lämnar mount-regionen orörd (ingen clear), replace rensar.
 - Idempotens: hoppa injektion om samma tile redan finns.
-- Branch-lås: seriell åtkomst till AI_WORK_BRANCH via Redis-lås runt apply+commit+push.
+- Branch-lås: seriell åtkomst till AI_WORK_BRANCH via Redis-lås runt checkout+apply+commit+push.
 - Bas-prune och GC: läser raderingslista från origin/<BASE_BRANCH>:.ai/prune.json, tar bort motsv. imports/tiles/filer, samt städar orefererade AI-komponenter (och ev. oanvända SVG).
-- Host-manifest: workern väljer host-fil i denna ordning: ai-manifest.tsx → main.tsx → första ALLOW_PATCH-post.
+- Dedupe: droppa parallella körningar för samma (file_key,node_id) i 10 min.
 """
 
 # + högst upp
@@ -52,13 +52,9 @@ RESULT_BACKEND = (os.getenv("CELERY_RESULT_BACKEND") or BROKER_URL).strip()
 TARGET_COMPONENT_DIR = (
     os.getenv("TARGET_COMPONENT_DIR", "frontendplay/src/components/ai").strip().rstrip("/")
 )
-
-# DEFAULT uppdaterad: inkludera ai-manifest.tsx först, sedan main.tsx.
-# (Ev. ALLOW_PATCH i .env läggs ovanpå som lägre prio.)
-_default_allow = "frontendplay/src/ai-manifest.tsx;frontendplay/src/main.tsx"
 ALLOW_PATCH = [
     p.strip().replace("\\", "/")
-    for p in (os.getenv("ALLOW_PATCH", _default_allow).split(";"))
+    for p in (os.getenv("ALLOW_PATCH", "frontendplay/src/main.tsx").split(";"))
     if p.strip()
 ]
 
@@ -121,6 +117,7 @@ app.conf.update(
     broker_connection_retry_on_startup=True,
     broker_connection_timeout=3,
     redis_socket_timeout=3,
+    task_track_started=True,  # NY: se STARTED istället för PENDING
     # Viktigt: standardkö ska vara "write"
     task_default_queue="write",
     task_queues=(Queue("write", routing_key="write"),),
@@ -575,7 +572,7 @@ def _icon_size_ok(w: float, h: float) -> bool:
     return (ICON_MIN <= iw <= ICON_MAX) and (ICON_MIN <= ih <= ICON_MAX) and _aspect_ok(iw, ih)
 
 # ─────────────────────────────────────────────────────────
-# Hjälpare för relativ import till host (main/manifest).tsx
+# Hjälpare för relativ import till main.tsx
 # ─────────────────────────────────────────────────────────
 
 _ANCHOR_SINGLE = "AI-INJECT-MOUNT"
@@ -608,7 +605,7 @@ def _derive_import_name(source: str | None) -> str:
     return name
 
 # ─────────────────────────────────────────────────────────
-# AST-injektion (host tsx) och säkert ankare
+# AST-injektion (main.tsx) och säkert ankare
 # ─────────────────────────────────────────────────────────
 
 def _has_pair_markers(src: str) -> bool:
@@ -693,7 +690,7 @@ def _ensure_anchor_in_main(main_tsx: Path) -> None:
     main_tsx.write_text(src, encoding="utf-8")
 
 # ─────────────────────────────────────────────────────────
-# Ghost-preflight för host tsx (robust och icke-invasiv)
+# Ghost-preflight för main.tsx (robust och icke-invasiv)
 # + rensa bara i replace-läge
 # ─────────────────────────────────────────────────────────
 
@@ -764,7 +761,7 @@ def _clear_mount_region(main_tsx: Path) -> None:
 
 def _prune_ghosts_in_main(repo_root: Path, main_rel: str) -> None:
     """
-    Rensar bort “ghost” imports och deras tiles i host-filen innan typecheck/commit:
+    Rensar bort “ghost” imports och deras tiles i main.tsx innan typecheck/commit:
       1) Tar bort relativa modul-importer vars målfil saknas. Bevarar side-effect assets (t.ex. index.css).
       2) Tar bort AI-tiles i mount-regionen som refererar till icke-importerade komponenter.
       3) Återställer import "./index.css" om filen finns men importen saknas.
@@ -872,7 +869,7 @@ def _prune_ghosts_in_main(repo_root: Path, main_rel: str) -> None:
     _safe_print("main.prune.done", {"path": str(main_tsx)})
 
 # ─────────────────────────────────────────────────────────
-# Snapshot/logg av host tsx AI-läge
+# Snapshot/logg av main.tsx AI-läge
 # ─────────────────────────────────────────────────────────
 
 _AI_IMPORT_RE = re.compile(r'^\s*import\s+[^;]*\s+from\s+[\'"](?P<spec>[^\'"]+)[\'"]\s*;?', re.M)
@@ -2198,47 +2195,6 @@ def _push_ff_with_retry(repo, work_branch: str, apply_again_fn, tries: int = 5, 
     raise HTTPException(500, "Push misslyckades efter flera försök")
 
 # ─────────────────────────────────────────────────────────
-# VÄLJ HOST-FIL (manifest → main → ALLOW_PATCH)
-# ─────────────────────────────────────────────────────────
-
-def _dedup(seq: List[str]) -> List[str]:
-    seen = set()
-    out = []
-    for s in seq:
-        if s not in seen:
-            seen.add(s); out.append(s)
-    return out
-
-def _choose_host_rel(repo_root: Path) -> str:
-    """
-    Välj host-fil att injicera i:
-      1) frontendplay/src/ai-manifest.tsx om den finns
-      2) frontendplay/src/main.tsx om den finns
-      3) första ALLOW_PATCH-post
-    """
-    prio = [
-        "frontendplay/src/ai-manifest.tsx",
-        "frontendplay/src/main.tsx",
-        *ALLOW_PATCH,
-    ]
-    prio = [p.replace("\\", "/") for p in prio]
-    prio = _dedup(prio)
-
-    for rel in prio:
-        try:
-            p = _safe_join(repo_root, rel)
-            if p.exists():
-                _safe_print("host.pick", {"picked": rel, "exists": True})
-                return rel
-        except Exception:
-            pass
-
-    # Fallback till första i listan även om den inte finns (kan skapas i repo)
-    fallback = prio[0]
-    _safe_print("host.pick", {"picked": fallback, "exists": False})
-    return fallback
-
-# ─────────────────────────────────────────────────────────
 # Celery-task
 # ─────────────────────────────────────────────────────────
 
@@ -2248,14 +2204,16 @@ def integrate_figma_node(
 ) -> Dict[str, Any]:
     t0 = time.time()
     _safe_print("codegen.start", {"file_key": file_key, "node_id": node_id})
-    # ── NYA LOGGAR: visa om placement skickats in från frontend
+
+    # NY: Dedupe – droppa parallella körningar för samma nod under TTL
     try:
-        _safe_print("placement.input", {
-            "has_placement": isinstance(placement, dict),
-            "keys": sorted(list(placement.keys())) if isinstance(placement, dict) else [],
-        })
-    except Exception:
-        _safe_print("placement.input", {"has_placement": bool(placement), "note": "keys_unavailable"})
+        r = _redis_client()
+        dedupe_key = f"dedupe:figma:{file_key}:{node_id}"
+        if not r.set(dedupe_key, "1", nx=True, ex=600):
+            _safe_print("job.skip", {"reason": "duplicate", "file_key": file_key, "node_id": node_id})
+            return {"status": "SKIPPED", "reason": "duplicate"}
+    except Exception as _e:
+        _safe_print("job.dedupe.warn", {"err": str(_e)})
 
     figma_json = _fetch_figma_node(file_key, node_id)
     t1 = time.time()
@@ -2310,40 +2268,7 @@ def integrate_figma_node(
     tmp_root = Path(tmp_dir)
     _safe_print("repo.clone", {"root": tmp_dir})
 
-    # Start/checkout: fjärrsanning via ls-remote, explicit fetch av exakta refs, checkout korrekt bas
-    work_branch = AI_WORK_BRANCH
-    origin = repo.remotes.origin
-
-    # 1) Kolla mot fjärren om arbetsgrenen finns (sanningen från GitHub)
-    try:
-        has_remote_work = bool(repo.git.ls_remote("--heads", "origin", work_branch).strip())
-    except GitCommandError:
-        has_remote_work = False
-
-    # 2) Hämta explicit de ref:ar vi behöver, oavsett refspec i klonen
-    try:
-        origin.fetch(f"+refs/heads/{work_branch}:refs/remotes/origin/{work_branch}", prune=True)
-    except Exception:
-        pass
-        origin.fetch(f"+refs/heads/{BASE_BRANCH}:refs/remotes/origin/{BASE_BRANCH}", prune=True)
-
-    # 3) Checka ut korrekt bas
-    exists_remote = has_remote_work
-    try:
-        if exists_remote:
-            repo.git.checkout("-B", work_branch, f"origin/{work_branch}")
-            mode = "from-remote"
-        else:
-            try:
-                repo.git.rev_parse("--verify", f"refs/remotes/origin/{BASE_BRANCH}")
-                repo.git.checkout("-B", work_branch, f"origin/{BASE_BRANCH}")
-                mode = "from-base-remote"
-            except GitCommandError:
-                repo.git.checkout("-B", work_branch, BASE_BRANCH)
-                mode = "from-base-local"
-    except GitCommandError as e:
-        raise HTTPException(500, f"Git checkout error: {e.stderr or e}")
-    _safe_print("git.branch", {"name": work_branch, "mode": mode})
+    # (Checkout flyttas in i branch-låset nedan)
 
     for ic in icon_nodes:
         nid = ic["id"]
@@ -2358,15 +2283,13 @@ def integrate_figma_node(
 
         fname = _icon_filename(ic["name_slug"], nid)
         disk_rel = f"{ICON_DIR}/{fname}".replace("\\", "/")
-        abs_path = _safe_join(tmp_root, disk_rel)
-        abs_path.parent.mkdir(parents=True, exist_ok=True)
-        abs_path.write_text(svg, encoding="utf-8")
 
         vite_spec = disk_rel
         parts = vite_spec.split("/src/", 1)
         if len(parts) == 2:
             vite_spec = "/src/" + parts[1]
 
+        # Spara endast metadata + SVG-innehållet. Ingen skrivning ännu.
         icon_assets.append({
             "id": nid,
             "name": ic.get("name") or ic["name_slug"],
@@ -2374,12 +2297,9 @@ def integrate_figma_node(
             "fs_path": disk_rel,
             "w": int(round(w)),
             "h": int(round(h)),
+            "svg": svg,
         })
     _safe_print("icons.collected", {"count": len(icon_assets)})
-
-    created_svg_types_rel = _ensure_svg_types(tmp_root)
-    if created_svg_types_rel:
-        _safe_print("icons.types.create", {"rel": created_svg_types_rel})
 
     _ensure_node_modules(tmp_root)
 
@@ -2440,22 +2360,12 @@ def integrate_figma_node(
     returned_primary_path = target_rel
     _safe_print("write.component.plan", {"path": returned_primary_path})
 
-    # ── Välj HOST (manifest → main → ALLOW_PATCH)
-    host_rel = _choose_host_rel(tmp_root)
-    main_abs = _safe_join(tmp_root, host_rel)
+    main_candidates = [p for p in ALLOW_PATCH if p.endswith("main.tsx")]
+    main_rel = main_candidates[0] if main_candidates else "frontendplay/src/main.tsx"
+    main_abs = _safe_join(tmp_root, main_rel)
     mount["import_path"] = _rel_import_from_main(main_abs, target_path)
 
-    # ── NYA LOGGAR kring placement och beräknad overlay-position ──
     px = placement or {}
-    try:
-        _safe_print("placement.raw", {
-            "present": bool(px),
-            "projectBase": (px.get("projectBase") if isinstance(px.get("projectBase"), dict) else None),
-            "overlayStage": (px.get("overlayStage") if isinstance(px.get("overlayStage"), dict) else None),
-        })
-    except Exception as _e:
-        _safe_print("placement.raw.error", {"err": str(_e)})
-
     stage = px.get("projectBase") if isinstance(px, dict) else None
     ovl = px.get("overlayStage") if isinstance(px, dict) else None
     if isinstance(stage, dict) and isinstance(ovl, dict):
@@ -2470,12 +2380,6 @@ def integrate_figma_node(
         nw = _pct(ovl.get("w", stage.get("w", 1280)), stage.get("w", 1280))
         nh = _pct(ovl.get("h", stage.get("h", 800)),  stage.get("h", 800))
 
-        _safe_print("placement.computed", {
-            "stage_wh": {"w": stage.get("w"), "h": stage.get("h")},
-            "overlay_xywh": {"x": ovl.get("x"), "y": ovl.get("y"), "w": ovl.get("w"), "h": ovl.get("h")},
-            "percent": {"left": nx, "top": ny, "width": nw, "height": nh},
-        })
-
         mount["jsx"] = (
             f'<div className="absolute inset-0 w-full h-full pointer-events-none">'
             f'  <div className="absolute left-[{nx}%] top-[{ny}%] w-[{nw}%] h-[{nh}%] overflow-hidden pointer-events-auto">'
@@ -2484,48 +2388,51 @@ def integrate_figma_node(
             f'</div>'
         )
     else:
-        _safe_print("placement.using_default", {
-            "reason": "missing-stage-or-overlay",
-            "have_stage": isinstance(stage, dict),
-            "have_overlay": isinstance(ovl, dict),
-        })
         mount["jsx"] = f"<{mount['import_name']} />"
 
-    try:
-        dump_path = _dump_text_file("placement-jsx", node_id, mount["jsx"])
-        _safe_print("placement.jsx.dump", {"path": dump_path})
-    except Exception as _e:
-        _safe_print("placement.jsx.dump.error", {"err": str(_e)})
-
     # ── Applicering + commit som funktion för retry-scenariot ──
+    created_svg_types_rel: str | None = None
     def _apply_and_commit() -> None:
+        nonlocal created_svg_types_rel
+
         # Preemptiv synk mot fjärren om work-branch finns och vi ligger bakom
         try:
-            has_remote_work = bool(repo.git.ls_remote("--heads", "origin", work_branch).strip())
+            has_remote_work = bool(repo.git.ls_remote("--heads", "origin", AI_WORK_BRANCH).strip())
         except GitCommandError:
             has_remote_work = False
         if has_remote_work:
             try:
-                origin.fetch(f"+refs/heads/{work_branch}:refs/remotes/origin/{work_branch}", prune=True)
+                repo.remotes.origin.fetch(f"+refs/heads/{AI_WORK_BRANCH}:refs/remotes/origin/{AI_WORK_BRANCH}", prune=True)
             except Exception:
                 pass
             try:
-                diff_counts = repo.git.rev_list("--left-right", "--count", f"{work_branch}...origin/{work_branch}").strip()
+                diff_counts = repo.git.rev_list("--left-right", "--count", f"{AI_WORK_BRANCH}...origin/{AI_WORK_BRANCH}").strip()
                 left, right = [int(x) for x in diff_counts.split()]
                 if right > 0:
-                    repo.git.reset("--hard", f"origin/{work_branch}")
-                    _safe_print("git.reset", {"branch": work_branch, "to": f"origin/{work_branch}", "pre_commit_guard": True})
+                    repo.git.reset("--hard", f"origin/{AI_WORK_BRANCH}")
+                    _safe_print("git.reset", {"branch": AI_WORK_BRANCH, "to": f"origin/{AI_WORK_BRANCH}", "pre_commit_guard": True})
             except Exception as _:
                 pass
 
         # NY: Engångs-reset från BASE om AI_SYNC_POLICY=base_mirror
         if AI_SYNC_POLICY == "base_mirror":
             try:
-                origin.fetch(f"+refs/heads/{BASE_BRANCH}:refs/remotes/origin/{BASE_BRANCH}", prune=True)
+                repo.remotes.origin.fetch(f"+refs/heads/{BASE_BRANCH}:refs/remotes/origin/{BASE_BRANCH}", prune=True)
             except Exception:
                 pass
-            repo.git.checkout("-B", work_branch, f"origin/{BASE_BRANCH}")
+            repo.git.checkout("-B", AI_WORK_BRANCH, f"origin/{BASE_BRANCH}")
             _safe_print("ai.reset", {"from": f"origin/{BASE_BRANCH}"})
+
+        # Skriv ikonfilerna nu (efter reset) och säkerställ type-stub
+        for ia in icon_assets:
+            p = _safe_join(tmp_root, ia["fs_path"])
+            p.parent.mkdir(parents=True, exist_ok=True)
+            svg_txt = _strip_svg_meta(ia.get("svg") or "")
+            p.write_text(svg_txt, encoding="utf-8")
+
+        created_svg_types_rel = _ensure_svg_types(tmp_root)
+        if created_svg_types_rel:
+            _safe_print("icons.types.create", {"rel": created_svg_types_rel})
 
         # Skriv komponentfil
         target_path.write_text(cleaned, encoding="utf-8")
@@ -2546,7 +2453,7 @@ def integrate_figma_node(
         to_remove_abs = {(_safe_join(tmp_root, r)).resolve() for r in to_remove_rel}
         if to_remove_abs:
             _prune_ai_imports_by_abs_paths(main_abs, to_remove_abs)
-            _prune_ghosts_in_main(tmp_root, host_rel)
+            _prune_ghosts_in_main(tmp_root, main_rel)
         if to_remove_rel:
             _unlink_many(tmp_root, to_remove_rel)
 
@@ -2604,7 +2511,7 @@ def integrate_figma_node(
                 str(mount["import_name"]),
                 str(mount["import_path"]),
                 str(jsx_tmp),
-                mode_arg,  # explicit läge som sista arg (injektorn ignorerar replace och kör append-only)
+                mode_arg,  # explicit läge som sista arg
             ]
             _safe_print("ai.inject.cmd.mode", {"mode": mode_arg})
 
@@ -2635,11 +2542,11 @@ def integrate_figma_node(
 
         # Ghost-preflight efter injektion
         _snapshot_main(main_abs, "before_prune")
-        _prune_ghosts_in_main(tmp_root, host_rel)
+        _prune_ghosts_in_main(tmp_root, main_rel)
 
         # Valfri AI-TSX-GC och ikon-GC
         if AI_TSX_GC:
-            _prune_unreferenced_ai_tsx(tmp_root, host_rel, TARGET_COMPONENT_DIR, keep_extra={returned_primary_path})
+            _prune_unreferenced_ai_tsx(tmp_root, main_rel, TARGET_COMPONENT_DIR, keep_extra={returned_primary_path})
         if ICON_GC:
             _gc_unused_svgs(tmp_root, ICON_DIR)
 
@@ -2660,26 +2567,56 @@ def integrate_figma_node(
         repo.index.commit(commit_msg)
         _safe_print("git.commit", {"msg": commit_msg})
 
-    # ── Kritisk sektion: serialisera apply+push med branch-lås ──
+    # ── Kritisk sektion: serialisera checkout+apply+push med branch-lås ──
     LOCK_TTL = int(os.getenv("AI_WORK_BRANCH_LOCK_TTL", "300"))
     with branch_lock(AI_WORK_BRANCH, ttl=LOCK_TTL):
-        # Första appliceringen i den lokala klonen
+        # 0) Checkout under lås
+        work_branch = AI_WORK_BRANCH
+        origin = repo.remotes.origin
+
+        try:
+            has_remote_work = bool(repo.git.ls_remote("--heads", "origin", work_branch).strip())
+        except GitCommandError:
+            has_remote_work = False
+
+        try:
+            try:
+                origin.fetch(f"+refs/heads/{work_branch}:refs/remotes/origin/{work_branch}", prune=True)
+            except Exception:
+                origin.fetch(f"+refs/heads/{BASE_BRANCH}:refs/remotes/origin/{BASE_BRANCH}", prune=True)
+
+            if has_remote_work:
+                repo.git.checkout("-B", work_branch, f"origin/{work_branch}")
+                mode = "from-remote"
+            else:
+                try:
+                    repo.git.rev_parse("--verify", f"refs/remotes/origin/{BASE_BRANCH}")
+                    repo.git.checkout("-B", work_branch, f"origin/{BASE_BRANCH}")
+                    mode = "from-base-remote"
+                except GitCommandError:
+                    repo.git.checkout("-B", work_branch, BASE_BRANCH)
+                    mode = "from-base-local"
+        except GitCommandError as e:
+            raise HTTPException(500, f"Git checkout error: {e.stderr or e}")
+        _safe_print("git.branch", {"name": work_branch, "mode": mode})
+
+        # 1) Applicera och committa ändringarna
         _apply_and_commit()
 
-        # Push-strategi
+        # 2) Push med FF-retry och ev. force-with-lease fallback
         TRIES = int(os.getenv("AI_PUSH_TRIES", "8"))
         SLEEP_MAX = int(os.getenv("AI_PUSH_SLEEP_MAX", "10"))
 
-        if AI_FORCE_PUSH:
-            try:
+        try:
+            if AI_FORCE_PUSH:
                 repo.git.push("--force-with-lease", "--set-upstream", "origin", work_branch)
                 _safe_print("git.push.ok", {"force": True})
-            except GitCommandError as e:
-                msg = ((e.stderr or "") + "\n" + (e.stdout or "")).strip()
-                raise HTTPException(500, f"Git push error (force): {msg or e}")
-        else:
-            _push_ff_with_retry(repo, work_branch, _apply_and_commit, tries=TRIES, sleep_max=SLEEP_MAX)
-            _safe_print("git.push.ok", {"force": False})
+            else:
+                _push_ff_with_retry(repo, work_branch, _apply_and_commit, tries=TRIES, sleep_max=SLEEP_MAX)
+                _safe_print("git.push.ok", {"force": False})
+        except GitCommandError as e:
+            msg = ((e.stderr or "") + "\n" + (e.stdout or "")).strip()
+            raise HTTPException(500, f"Git push error: {msg or e}")
 
     # Valfri PR
     if AUTO_PR:
@@ -2692,7 +2629,7 @@ def integrate_figma_node(
     changed_paths: List[str] = []
     changed_paths.append(returned_primary_path)
     if main_abs.exists():
-        changed_paths.append(host_rel)
+        changed_paths.append(main_rel)
 
     assets: List[Dict[str, Any]] = []
 
