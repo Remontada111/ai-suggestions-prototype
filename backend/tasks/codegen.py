@@ -10,6 +10,7 @@ Uppdateringar i denna version:
 - Idempotens: hoppa injektion om samma tile redan finns.
 - Branch-lås: seriell åtkomst till AI_WORK_BRANCH via Redis-lås runt apply+commit+push.
 - Bas-prune och GC: läser raderingslista från origin/<BASE_BRANCH>:.ai/prune.json, tar bort motsv. imports/tiles/filer, samt städar orefererade AI-komponenter (och ev. oanvända SVG).
+- Host-manifest: workern väljer host-fil i denna ordning: ai-manifest.tsx → main.tsx → första ALLOW_PATCH-post.
 """
 
 # + högst upp
@@ -51,9 +52,13 @@ RESULT_BACKEND = (os.getenv("CELERY_RESULT_BACKEND") or BROKER_URL).strip()
 TARGET_COMPONENT_DIR = (
     os.getenv("TARGET_COMPONENT_DIR", "frontendplay/src/components/ai").strip().rstrip("/")
 )
+
+# DEFAULT uppdaterad: inkludera ai-manifest.tsx först, sedan main.tsx.
+# (Ev. ALLOW_PATCH i .env läggs ovanpå som lägre prio.)
+_default_allow = "frontendplay/src/ai-manifest.tsx;frontendplay/src/main.tsx"
 ALLOW_PATCH = [
     p.strip().replace("\\", "/")
-    for p in (os.getenv("ALLOW_PATCH", "frontendplay/src/main.tsx").split(";"))
+    for p in (os.getenv("ALLOW_PATCH", _default_allow).split(";"))
     if p.strip()
 ]
 
@@ -570,7 +575,7 @@ def _icon_size_ok(w: float, h: float) -> bool:
     return (ICON_MIN <= iw <= ICON_MAX) and (ICON_MIN <= ih <= ICON_MAX) and _aspect_ok(iw, ih)
 
 # ─────────────────────────────────────────────────────────
-# Hjälpare för relativ import till main.tsx
+# Hjälpare för relativ import till host (main/manifest).tsx
 # ─────────────────────────────────────────────────────────
 
 _ANCHOR_SINGLE = "AI-INJECT-MOUNT"
@@ -603,7 +608,7 @@ def _derive_import_name(source: str | None) -> str:
     return name
 
 # ─────────────────────────────────────────────────────────
-# AST-injektion (main.tsx) och säkert ankare
+# AST-injektion (host tsx) och säkert ankare
 # ─────────────────────────────────────────────────────────
 
 def _has_pair_markers(src: str) -> bool:
@@ -688,7 +693,7 @@ def _ensure_anchor_in_main(main_tsx: Path) -> None:
     main_tsx.write_text(src, encoding="utf-8")
 
 # ─────────────────────────────────────────────────────────
-# Ghost-preflight för main.tsx (robust och icke-invasiv)
+# Ghost-preflight för host tsx (robust och icke-invasiv)
 # + rensa bara i replace-läge
 # ─────────────────────────────────────────────────────────
 
@@ -759,7 +764,7 @@ def _clear_mount_region(main_tsx: Path) -> None:
 
 def _prune_ghosts_in_main(repo_root: Path, main_rel: str) -> None:
     """
-    Rensar bort “ghost” imports och deras tiles i main.tsx innan typecheck/commit:
+    Rensar bort “ghost” imports och deras tiles i host-filen innan typecheck/commit:
       1) Tar bort relativa modul-importer vars målfil saknas. Bevarar side-effect assets (t.ex. index.css).
       2) Tar bort AI-tiles i mount-regionen som refererar till icke-importerade komponenter.
       3) Återställer import "./index.css" om filen finns men importen saknas.
@@ -867,7 +872,7 @@ def _prune_ghosts_in_main(repo_root: Path, main_rel: str) -> None:
     _safe_print("main.prune.done", {"path": str(main_tsx)})
 
 # ─────────────────────────────────────────────────────────
-# Snapshot/logg av main.tsx AI-läge
+# Snapshot/logg av host tsx AI-läge
 # ─────────────────────────────────────────────────────────
 
 _AI_IMPORT_RE = re.compile(r'^\s*import\s+[^;]*\s+from\s+[\'"](?P<spec>[^\'"]+)[\'"]\s*;?', re.M)
@@ -2193,6 +2198,47 @@ def _push_ff_with_retry(repo, work_branch: str, apply_again_fn, tries: int = 5, 
     raise HTTPException(500, "Push misslyckades efter flera försök")
 
 # ─────────────────────────────────────────────────────────
+# VÄLJ HOST-FIL (manifest → main → ALLOW_PATCH)
+# ─────────────────────────────────────────────────────────
+
+def _dedup(seq: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for s in seq:
+        if s not in seen:
+            seen.add(s); out.append(s)
+    return out
+
+def _choose_host_rel(repo_root: Path) -> str:
+    """
+    Välj host-fil att injicera i:
+      1) frontendplay/src/ai-manifest.tsx om den finns
+      2) frontendplay/src/main.tsx om den finns
+      3) första ALLOW_PATCH-post
+    """
+    prio = [
+        "frontendplay/src/ai-manifest.tsx",
+        "frontendplay/src/main.tsx",
+        *ALLOW_PATCH,
+    ]
+    prio = [p.replace("\\", "/") for p in prio]
+    prio = _dedup(prio)
+
+    for rel in prio:
+        try:
+            p = _safe_join(repo_root, rel)
+            if p.exists():
+                _safe_print("host.pick", {"picked": rel, "exists": True})
+                return rel
+        except Exception:
+            pass
+
+    # Fallback till första i listan även om den inte finns (kan skapas i repo)
+    fallback = prio[0]
+    _safe_print("host.pick", {"picked": fallback, "exists": False})
+    return fallback
+
+# ─────────────────────────────────────────────────────────
 # Celery-task
 # ─────────────────────────────────────────────────────────
 
@@ -2394,9 +2440,9 @@ def integrate_figma_node(
     returned_primary_path = target_rel
     _safe_print("write.component.plan", {"path": returned_primary_path})
 
-    main_candidates = [p for p in ALLOW_PATCH if p.endswith("main.tsx")]
-    main_rel = main_candidates[0] if main_candidates else "frontendplay/src/main.tsx"
-    main_abs = _safe_join(tmp_root, main_rel)
+    # ── Välj HOST (manifest → main → ALLOW_PATCH)
+    host_rel = _choose_host_rel(tmp_root)
+    main_abs = _safe_join(tmp_root, host_rel)
     mount["import_path"] = _rel_import_from_main(main_abs, target_path)
 
     # ── NYA LOGGAR kring placement och beräknad overlay-position ──
@@ -2500,7 +2546,7 @@ def integrate_figma_node(
         to_remove_abs = {(_safe_join(tmp_root, r)).resolve() for r in to_remove_rel}
         if to_remove_abs:
             _prune_ai_imports_by_abs_paths(main_abs, to_remove_abs)
-            _prune_ghosts_in_main(tmp_root, main_rel)
+            _prune_ghosts_in_main(tmp_root, host_rel)
         if to_remove_rel:
             _unlink_many(tmp_root, to_remove_rel)
 
@@ -2558,7 +2604,7 @@ def integrate_figma_node(
                 str(mount["import_name"]),
                 str(mount["import_path"]),
                 str(jsx_tmp),
-                mode_arg,  # explicit läge som sista arg
+                mode_arg,  # explicit läge som sista arg (injektorn ignorerar replace och kör append-only)
             ]
             _safe_print("ai.inject.cmd.mode", {"mode": mode_arg})
 
@@ -2589,11 +2635,11 @@ def integrate_figma_node(
 
         # Ghost-preflight efter injektion
         _snapshot_main(main_abs, "before_prune")
-        _prune_ghosts_in_main(tmp_root, main_rel)
+        _prune_ghosts_in_main(tmp_root, host_rel)
 
         # Valfri AI-TSX-GC och ikon-GC
         if AI_TSX_GC:
-            _prune_unreferenced_ai_tsx(tmp_root, main_rel, TARGET_COMPONENT_DIR, keep_extra={returned_primary_path})
+            _prune_unreferenced_ai_tsx(tmp_root, host_rel, TARGET_COMPONENT_DIR, keep_extra={returned_primary_path})
         if ICON_GC:
             _gc_unused_svgs(tmp_root, ICON_DIR)
 
@@ -2646,7 +2692,7 @@ def integrate_figma_node(
     changed_paths: List[str] = []
     changed_paths.append(returned_primary_path)
     if main_abs.exists():
-        changed_paths.append(main_rel)
+        changed_paths.append(host_rel)
 
     assets: List[Dict[str, Any]] = []
 
