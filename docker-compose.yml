@@ -60,15 +60,16 @@ services:
     environment:
       TZ: Europe/Stockholm
       GIT_SSH_COMMAND: "ssh -i /app/ssh/bot_key -o IdentitiesOnly=yes -o UserKnownHostsFile=/app/ssh/known_hosts -o StrictHostKeyChecking=accept-new"
+      GIT_TERMINAL_PROMPT: "0"     # (valfritt) undvik interaktiva git prompts
     volumes:
       - ./backend:/app/backend
-      - ./:/workspace
       - ./secrets/deploy_key:/app/ssh/bot_key_src:ro
     restart: unless-stopped
     depends_on:
       - redis
       - backend
     init: true
+
 
   # ───────────── VS Code Dev Container (Node + TS + PNPM/NPM) ─────────────── #
   devcontainer:

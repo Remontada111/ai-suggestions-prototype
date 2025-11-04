@@ -1,16 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
-
-
-
-
-
-
-
-
-
-
+import AIMount from "./ai-manifest";
 
 const VP = { w: 1280, h: 800 };
 
@@ -31,8 +22,9 @@ function App() {
           overflow: "hidden",
         }}
       >
-        {/* AI-INJECT-MOUNT:BEGIN */}
-        {/* AI-INJECT-MOUNT:END */}</div>
+        {/* AI-komponenter renderas här via manifestet */}
+        <AIMount />
+      </div>
     </div>
   );
 }
