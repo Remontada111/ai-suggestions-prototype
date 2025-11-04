@@ -1,5 +1,6 @@
 // ÄGS AV BOTTEN – ändra inte för hand.
-import React from "react";
+import "./index.css";
+
 
 // OBS: markörer används av botten för att veta var append ska ske.
 // Använd EXAKT samma markörnamen som ditt system redan letar efter.
@@ -8,7 +9,7 @@ export default function AIMount() {
   return (
     <>
        {/* AI-INJECT-MOUNT:BEGIN */}
-        {/* AI-INJECT-MOUNT:END */}
+       {/* AI-INJECT-MOUNT:END */}
     </>
   );
 }
