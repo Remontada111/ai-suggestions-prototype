@@ -1,0 +1,4 @@
+frontendplay/src/ai-manifest.tsx        merge=ours
+frontendplay/src/components/ai/*         merge=ours
+frontendplay/src/assets/icons/*          merge=ours
+frontendplay/src/types/svg.d.ts          merge=ours

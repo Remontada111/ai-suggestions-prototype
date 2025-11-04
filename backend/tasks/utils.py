@@ -2,11 +2,12 @@
 """
 Gemensamma hjälpfunktioner för Celery-workern:
 
-* Läser miljövariabler och räknar ut Git-URL:er
-* Klonar mål-repositoriet till en temporär katalog
-* Skapar unika branch-namn
-* Öppnar Pull Requests via GitHub REST-API
-* Skannar projektet efter befintliga React-komponenter (default-exports)
+- Läser miljövariabler och räknar ut Git-URL:er
+- Klonar mål-repositoriet till en temporär katalog
+- Skapar unika branch-namn (om du vill ha per-körning-branchar)
+- Öppnar Pull Requests via GitHub REST-API
+- Auto-mergar en arbetsgren in i basgrenen via GitHub REST-API
+- Skannar projektet efter befintliga React-komponenter (default-exports)
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ def _safe_print(tag: str, payload: Any) -> None:
         except Exception:
             pass
 
+
 # ─────────────────────────── 1) Miljö & Git ───────────────────────────
 
 GH_TOKEN: str | None = os.getenv("GH_TOKEN")
@@ -48,7 +50,10 @@ if not (GH_TOKEN and TARGET_REPO):
     )
 
 # Preferera SSH om GIT_REMOTE_URL är satt. Annars PAT över HTTPS.
-REMOTE_URL = (os.getenv("GIT_REMOTE_URL") or f"https://x-access-token:{GH_TOKEN}@github.com/{TARGET_REPO}.git").strip()
+REMOTE_URL = (
+    os.getenv("GIT_REMOTE_URL")
+    or f"https://x-access-token:{GH_TOKEN}@github.com/{TARGET_REPO}.git"
+).strip()
 
 
 def unique_branch(node_id: str) -> str:
@@ -82,7 +87,6 @@ def _force_origin_to_ssh(repo: Repo) -> None:
         except Exception:
             repo.git.remote("set-url", "origin", REMOTE_URL)
 
-    # Logga efter
     try:
         after = repo.remotes.origin.url
     except Exception:
@@ -93,11 +97,13 @@ def _force_origin_to_ssh(repo: Repo) -> None:
 def clone_repo() -> Tuple[str, Repo]:
     """
     Klonar `TARGET_REPO` till en temporär katalog.
+
     Krav:
       - Inte single-branch. Vi vill kunna hämta alla heads.
       - Sätt refspec till +refs/heads/*:refs/remotes/origin/* direkt efter klon.
       - Kör fetch --prune så att remote-tracking refs matchar GitHub.
       - Fallback: om BASE_BRANCH inte finns, klona utan 'branch=' och försök igen.
+
     Returnerar (temp_dir_path, Repo-objekt).
     """
     tmp_dir = tempfile.mkdtemp(prefix="ai-pr-bot-")
@@ -220,6 +226,38 @@ def create_pr(repo: Repo, branch: str, title: str, body: str | None = None) -> s
     url = pr_resp.json().get("html_url", "")
     _safe_print("git.pr.opened", {"url": url, "branch": branch})
     return url
+
+
+def auto_merge_to_base(head: str, base: str) -> None:
+    """
+    Försöker auto-merga `head` → `base` via GitHub "Create a merge".
+    Lyckas endast om konflikten är 0; annars 409.
+    """
+    resp = requests.post(
+        f"https://api.github.com/repos/{TARGET_REPO}/merges",
+        headers={
+            "Authorization": f"token {GH_TOKEN}",
+            "Accept": "application/vnd.github+json",
+        },
+        json={
+            "base": base,
+            "head": head,
+            "commit_message": f"Merge {head} into {base} by bot",
+        },
+        timeout=20,
+    )
+
+    if resp.status_code in (201, 204):
+        _safe_print("git.merge", {"base": base, "head": head, "status": resp.status_code})
+        return
+
+    if resp.status_code == 409:
+        # Konflikt. Låt uppringaren avgöra om ett replace-run ska triggas.
+        _safe_print("git.merge.conflict", {"base": base, "head": head, "detail": resp.text[:500]})
+        raise HTTPException(409, f"Auto-merge conflict {head} → {base}: {resp.text}")
+
+    raise HTTPException(502, f"GitHub merge API error ({resp.status_code}): {resp.text}")
+
 
 # ───────────────── 2) Komponent-scanner (förkompilerad TSX) ───────────────
 

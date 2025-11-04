@@ -38,7 +38,7 @@ from git.exc import GitCommandError  # NY: för branch/push-fel
 
 from . import figma_ir as FIR
 from .det_codegen import generate_tsx_component
-from .utils import clone_repo, list_components, create_pr  # NY: create_pr, tar bort unique_branch
+from .utils import clone_repo, list_components, create_pr, auto_merge_to_base  # + auto_merge_to_base
 
 # ─────────────────────────────────────────────────────────
 # Miljö & konfiguration
@@ -2674,12 +2674,28 @@ def integrate_figma_node(
             try:
                 repo.git.push("--force-with-lease", "--set-upstream", "origin", work_branch)
                 _safe_print("git.push.ok", {"force": True})
+                # Auto-merge till bas om möjligt
+                if AI_WORK_BRANCH != BASE_BRANCH:
+                    try:
+                        auto_merge_to_base(AI_WORK_BRANCH, BASE_BRANCH)
+                    except HTTPException:
+                        raise
+                    except Exception as e:
+                        _safe_print("git.merge.warn", {"err": str(e)})
             except GitCommandError as e:
                 msg = ((e.stderr or "") + "\n" + (e.stdout or "")).strip()
                 raise HTTPException(500, f"Git push error (force): {msg or e}")
         else:
             _push_ff_with_retry(repo, work_branch, _apply_and_commit, tries=TRIES, sleep_max=SLEEP_MAX)
             _safe_print("git.push.ok", {"force": False})
+            # Auto-merge till bas om möjligt
+            if AI_WORK_BRANCH != BASE_BRANCH:
+                try:
+                    auto_merge_to_base(AI_WORK_BRANCH, BASE_BRANCH)
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    _safe_print("git.merge.warn", {"err": str(e)})
 
     # Valfri PR
     if AUTO_PR:
